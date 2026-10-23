@@ -55,6 +55,16 @@
             android:screenOrientation="unspecified"
             android:theme="@style/AppTheme" />
 
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
         <!-- 后台播放通知上的暂停/停止按钮：只在应用内用，不导出 -->
         <receiver
             android:name=".PlaybackReceiver"

@@ -665,13 +665,13 @@ class Prefs(ctx: Context) {
         get() = sp.getString("latest_release_url", "") ?: ""
         set(v) = sp.edit().putString("latest_release_url", v).apply()
 
-    var updateDownloadId: Long
-        get() = sp.getLong("update_download_id", -1L)
-        set(v) = sp.edit().putLong("update_download_id", v).apply()
+    var updateApkPath: String
+        get() = sp.getString("update_apk_path", "") ?: ""
+        set(v) = sp.edit().putString("update_apk_path", v).apply()
 
-    var pendingUpdateInstallId: Long
-        get() = sp.getLong("pending_update_install_id", -1L)
-        set(v) = sp.edit().putLong("pending_update_install_id", v).apply()
+    var updateInstallPending: Boolean
+        get() = sp.getBoolean("update_install_pending", false)
+        set(v) = sp.edit().putBoolean("update_install_pending", v).apply()
     /** 远端最新 tag（空表示已是最新或还没检查过） */
     var latestTag: String
         get() = sp.getString("latest_tag", "") ?: ""

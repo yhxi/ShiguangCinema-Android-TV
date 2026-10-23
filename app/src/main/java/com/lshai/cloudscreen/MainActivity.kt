@@ -2,13 +2,10 @@ package com.lshai.cloudscreen
 
 import android.app.Activity
 import android.app.AlertDialog
-import android.app.DownloadManager
-import android.content.BroadcastReceiver
-import android.content.Context
 import android.content.pm.ActivityInfo
+import android.content.ClipData
 import android.content.res.Configuration
 import android.content.Intent
-import android.content.IntentFilter
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
@@ -40,6 +37,7 @@ import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import androidx.core.content.FileProvider
 import androidx.recyclerview.widget.GridLayoutManager
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
@@ -54,6 +52,11 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
+import java.io.File
+import java.io.FileOutputStream
+import java.io.IOException
+import java.net.HttpURLConnection
+import java.net.URL
 
 /** 首页 RecyclerView 的两种 item：整块头部、海报格子 */
 private const val TYPE_HEADER = 0
@@ -91,14 +94,12 @@ class MainActivity : Activity() {
     private var updateBadgeBar: LinearLayout? = null
     private var updateBadge: TextView? = null
     private var manualUpdateCheckInProgress = false
-    private var updateDownloadReceiverRegistered = false
-    private val updateDownloadReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context, intent: Intent) {
-            if (intent.action != DownloadManager.ACTION_DOWNLOAD_COMPLETE) return
-            val id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L)
-            if (id >= 0 && id == prefs.updateDownloadId) handleUpdateDownload(id)
-        }
-    }
+    @Volatile private var updateDownloadCancelled = false
+    @Volatile private var updateDownloadConnection: HttpURLConnection? = null
+    @Volatile private var updateDownloadThread: Thread? = null
+    private var updateProgressDialog: AlertDialog? = null
+    private var updateProgressBar: ProgressBar? = null
+    private var updateProgressText: TextView? = null
 
     /**
      * 按用途分槽的请求登记表。
@@ -352,34 +353,13 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        cancelUpdateDownload(showMessage = false)
         homeMaintenanceJob?.cancel()
         favoriteCheckJob?.cancel()
         hotSearchJob?.cancel()
         qrServer?.stop()
         scope.cancel()
         super.onDestroy()
-    }
-
-    override fun onStart() {
-        super.onStart()
-        if (!updateDownloadReceiverRegistered) {
-            val filter = IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE)
-            if (Build.VERSION.SDK_INT >= 33) {
-                registerReceiver(updateDownloadReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
-            } else {
-                @Suppress("DEPRECATION")
-                registerReceiver(updateDownloadReceiver, filter)
-            }
-            updateDownloadReceiverRegistered = true
-        }
-    }
-
-    override fun onStop() {
-        if (updateDownloadReceiverRegistered) {
-            unregisterReceiver(updateDownloadReceiver)
-            updateDownloadReceiverRegistered = false
-        }
-        super.onStop()
     }
 
     override fun onPause() {
@@ -393,7 +373,6 @@ class MainActivity : Activity() {
         super.onResume()
         hideSystemUi()
         resumePendingUpdateInstall()
-        if (prefs.updateDownloadId >= 0) handleUpdateDownload(prefs.updateDownloadId, notifyWhenRunning = false)
         // 从播放器返回时刷新首页，刚写入的续播记录立即可见。
         if (::root.isInitialized && currentScreen == "recommend" && recommendItems.isNotEmpty()) {
             showRecommend()
@@ -491,6 +470,7 @@ class MainActivity : Activity() {
             "serversettings" -> showSetup()
             "detail", "live", "setup", "history" -> showRecommend()
             "sources" -> if (sourcesOrigin == "setup") showSetup() else showRecommend()
+            "vodsources" -> showSources()
             "home", "recommend" -> super.onBackPressed()
             // 导入流程内的页面：逐级退回上一级，而不是退出 App
             "input" -> showAddSource()
@@ -1147,10 +1127,14 @@ class MainActivity : Activity() {
     }
 
     private fun seedLiveFromServer(st: AppStatus) {
-        if (prefs.liveUrls().isEmpty() && st.defaultLiveSources.isNotEmpty()) {
-            prefs.saveLiveUrls(st.defaultLiveSources)
-            prefs.activeLiveUrl = st.defaultLiveSources.first()
-        }
+        ensureBuiltInLiveSources(st.defaultLiveSources)
+    }
+
+    private fun ensureBuiltInLiveSources(serverDefaults: List<String> = emptyList()) {
+        val existing = prefs.liveUrls()
+        val combined = (BuiltInLiveSources.ALL + serverDefaults + existing).distinct()
+        if (combined != existing) prefs.saveLiveUrls(combined)
+        if (prefs.activeLiveUrl !in combined) prefs.activeLiveUrl = combined.firstOrNull().orEmpty()
     }
 
     /** 首次拉内置片源在后台进行，不阻塞服务端登录和首页展示。 */
@@ -1578,91 +1562,222 @@ class MainActivity : Activity() {
             openReleasePage(prefs.latestReleaseUrl.ifEmpty { "https://github.com/yhxi/ShiguangCinema-Android-TV/releases" })
             return
         }
-        val manager = getSystemService(DownloadManager::class.java)
-        val existingId = prefs.updateDownloadId
-        if (existingId >= 0) {
-            val query = DownloadManager.Query().setFilterById(existingId)
-            manager.query(query)?.use { cursor ->
-                if (cursor.moveToFirst()) {
-                    when (cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))) {
-                        DownloadManager.STATUS_PENDING, DownloadManager.STATUS_RUNNING, DownloadManager.STATUS_PAUSED -> {
-                            toast("更新正在下载")
-                            return
+        if (updateDownloadThread?.isAlive == true) {
+            toast("更新正在下载")
+            return
+        }
+        val savedFile = prefs.updateApkPath.takeIf { it.isNotBlank() }?.let(::File)
+        if (savedFile?.isFile == true && validateUpdateApk(savedFile) == null) {
+            showUpdateReady(savedFile, tag)
+            return
+        }
+        prefs.updateApkPath = ""
+        updateDownloadCancelled = false
+        val progress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 100
+            isIndeterminate = true
+        }
+        val progressText = TextView(this).apply {
+            text = "正在连接 GitHub…"
+            setTextColor(BRIGHTER_TEXT)
+            setTextSize(14f)
+            setPadding(0, 0, 0, dp(12))
+        }
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(24), dp(12), dp(24), dp(8))
+            addView(progressText)
+            addView(progress, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(8)))
+        }
+        updateProgressBar = progress
+        updateProgressText = progressText
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("下载更新 $tag")
+            .setView(content)
+            .setNegativeButton("取消", null)
+            .create()
+        updateProgressDialog = dialog
+        dialog.setOnCancelListener { cancelUpdateDownload() }
+        dialog.setOnCancelListener { cancelUpdateDownload() }
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener {
+                cancelUpdateDownload()
+                dialog.dismiss()
+            }
+        }
+        dialog.show()
+
+        val fileName = "ShiguangCinema-${tag.replace(Regex("[^A-Za-z0-9._-]"), "_")}.apk"
+        val folder = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: cacheDir
+        val destination = File(folder, fileName)
+        val partial = File(folder, "$fileName.part")
+        val worker = Thread {
+            try {
+                val connection = (URL(uri.toString()).openConnection() as HttpURLConnection).apply {
+                    connectTimeout = 15_000
+                    readTimeout = 20_000
+                    instanceFollowRedirects = true
+                    requestMethod = "GET"
+                    setRequestProperty("User-Agent", "ShiguangCinema-Android-TV")
+                    setRequestProperty("Accept", "application/vnd.android.package-archive, application/octet-stream")
+                }
+                updateDownloadConnection = connection
+                connection.connect()
+                if (connection.url.protocol != "https") throw IOException("下载地址未使用 HTTPS")
+                if (connection.responseCode != HttpURLConnection.HTTP_OK) {
+                    throw IOException("GitHub 返回 HTTP ${connection.responseCode}")
+                }
+                val total = connection.getHeaderField("Content-Length")?.toLongOrNull() ?: -1L
+                var downloaded = 0L
+                var lastUiUpdate = 0L
+                connection.inputStream.use { input ->
+                    FileOutputStream(partial).use { output ->
+                        val buffer = ByteArray(DEFAULT_BUFFER_SIZE * 4)
+                        while (true) {
+                            if (updateDownloadCancelled || Thread.currentThread().isInterrupted) throw InterruptedException()
+                            val count = input.read(buffer)
+                            if (count < 0) break
+                            output.write(buffer, 0, count)
+                            downloaded += count
+                            val now = System.currentTimeMillis()
+                            if (now - lastUiUpdate >= 150 || (total > 0 && downloaded >= total)) {
+                                lastUiUpdate = now
+                                val percent = if (total > 0) ((downloaded * 100) / total).toInt().coerceIn(0, 100) else -1
+                                runOnUiThread { updateDownloadProgress(downloaded, total, percent) }
+                            }
                         }
-                        DownloadManager.STATUS_SUCCESSFUL -> {
-                            handleUpdateDownload(existingId)
-                            return
-                        }
+                        output.fd.sync()
+                    }
+                }
+                if (total > 0 && downloaded != total) throw IOException("文件未下载完整（$downloaded / $total 字节）")
+                if (!partial.renameTo(destination)) {
+                    partial.copyTo(destination, overwrite = true)
+                    partial.delete()
+                }
+                val invalid = validateUpdateApk(destination)
+                if (invalid != null) throw IOException(invalid)
+                prefs.updateApkPath = destination.absolutePath
+                runOnUiThread { showUpdateReady(destination, tag) }
+            } catch (_: InterruptedException) {
+                partial.delete()
+                destination.delete()
+            } catch (error: Exception) {
+                partial.delete()
+                destination.delete()
+                if (!updateDownloadCancelled) {
+                    runOnUiThread {
+                        updateProgressDialog?.dismiss()
+                        updateProgressDialog = null
+                        updateDownloadThread = null
+                        toast("更新下载失败：${error.message ?: "请检查网络后重试"}")
+                    }
+                }
+            } finally {
+                updateDownloadConnection?.disconnect()
+                updateDownloadConnection = null
+                if (Thread.currentThread().isInterrupted || updateDownloadCancelled) {
+                    runOnUiThread {
+                        updateProgressDialog?.dismiss()
+                        updateProgressDialog = null
+                        updateDownloadThread = null
                     }
                 }
             }
-            prefs.updateDownloadId = -1L
-        }
-        val request = DownloadManager.Request(uri)
-            .setTitle("时光影院更新")
-            .setDescription("正在下载 $tag")
-            .setMimeType("application/vnd.android.package-archive")
-            .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-            .setDestinationInExternalFilesDir(this, Environment.DIRECTORY_DOWNLOADS, "ShiguangCinema-$tag.apk")
-            .setAllowedOverMetered(true)
-            .setAllowedOverRoaming(false)
-        val id = runCatching { manager.enqueue(request) }.getOrElse {
-            toast("无法开始下载：${it.message ?: "请稍后重试"}")
-            return
-        }
-        prefs.pendingUpdateInstallId = -1L
-        prefs.updateDownloadId = id
-        toast("已开始下载 $tag，可在通知栏查看进度")
+        }.apply { name = "ShiguangUpdateDownload" }
+        updateDownloadThread = worker
+        worker.start()
     }
 
-    private fun handleUpdateDownload(id: Long, notifyWhenRunning: Boolean = true) {
-        val manager = getSystemService(DownloadManager::class.java)
-        manager.query(DownloadManager.Query().setFilterById(id))?.use { cursor ->
-            if (!cursor.moveToFirst()) {
-                if (prefs.updateDownloadId == id) prefs.updateDownloadId = -1L
-                return
-            }
-            when (cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))) {
-                DownloadManager.STATUS_SUCCESSFUL -> installDownloadedUpdate(id)
-                DownloadManager.STATUS_FAILED -> {
-                    val reason = cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_REASON))
-                    prefs.updateDownloadId = -1L
-                    toast("更新下载失败（错误 $reason），请检查网络后重试")
-                }
-                else -> if (notifyWhenRunning) toast("更新仍在下载中")
-            }
+    private fun updateDownloadProgress(downloaded: Long, total: Long, percent: Int) {
+        if (updateProgressDialog?.isShowing != true) return
+        updateProgressBar?.isIndeterminate = total <= 0
+        if (percent >= 0) updateProgressBar?.progress = percent
+        updateProgressText?.text = if (total > 0) {
+            "${formatFileSize(downloaded)} / ${formatFileSize(total)}（$percent%）"
+        } else {
+            "已下载 ${formatFileSize(downloaded)}"
         }
     }
 
-    private fun installDownloadedUpdate(id: Long) {
-        val manager = getSystemService(DownloadManager::class.java)
-        val apkUri = manager.getUriForDownloadedFile(id)
-        if (apkUri == null) {
-            prefs.updateDownloadId = -1L
-            toast("找不到已下载的安装包，请重新下载")
+    private fun formatFileSize(bytes: Long): String = when {
+        bytes >= 1024L * 1024L -> String.format("%.1f MB", bytes / (1024.0 * 1024.0))
+        bytes >= 1024L -> String.format("%.0f KB", bytes / 1024.0)
+        else -> "$bytes B"
+    }
+
+    private fun cancelUpdateDownload(showMessage: Boolean = true) {
+        updateDownloadCancelled = true
+        updateDownloadConnection?.disconnect()
+        updateDownloadThread?.interrupt()
+        if (showMessage) toast("已取消更新下载")
+    }
+
+    private fun validateUpdateApk(file: File): String? {
+        val info = packageManager.getPackageArchiveInfo(file.absolutePath, 0)
+            ?: return "安装包无效，请重新下载"
+        if (info.packageName != packageName) return "安装包不是时光影院"
+        val versionCode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) info.longVersionCode else @Suppress("DEPRECATION") info.versionCode.toLong()
+        if (versionCode <= BuildConfig.VERSION_CODE) return "安装包版本不高于当前版本"
+        return null
+    }
+
+    private fun showUpdateReady(file: File, tag: String) {
+        updateDownloadThread = null
+        updateProgressDialog?.dismiss()
+        updateProgressDialog = null
+        updateProgressBar = null
+        updateProgressText = null
+        if (isFinishing || isDestroyed) return
+        AlertDialog.Builder(this)
+            .setTitle("更新包已下载")
+            .setMessage("时光影院 $tag 已下载完成（${formatFileSize(file.length())}）。现在交给系统安装器完成覆盖更新。")
+            .setNegativeButton("稍后安装", null)
+            .setPositiveButton("立即安装") { _, _ -> installDownloadedUpdate(file) }
+            .show()
+    }
+
+    private fun installDownloadedUpdate(file: File) {
+        val invalid = validateUpdateApk(file)
+        if (invalid != null) {
+            prefs.updateApkPath = ""
+            file.delete()
+            toast(invalid)
             return
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !packageManager.canRequestPackageInstalls()) {
-            prefs.pendingUpdateInstallId = id
+            prefs.updateApkPath = file.absolutePath
+            prefs.updateInstallPending = true
             runCatching {
                 startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName")))
-            }.onFailure { toast("请在系统设置中允许此应用安装未知应用") }
+            }.onFailure {
+                prefs.updateInstallPending = false
+                toast("请在系统设置中允许此应用安装未知应用")
+            }
+            return
+        }
+        val apkUri = runCatching { FileProvider.getUriForFile(this, "$packageName.fileprovider", file) }.getOrElse {
+            toast("无法安全打开安装包：${it.message ?: "文件共享配置错误"}")
             return
         }
         val intent = Intent(Intent.ACTION_VIEW).apply {
             setDataAndType(apkUri, "application/vnd.android.package-archive")
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            clipData = ClipData.newUri(contentResolver, "时光影院更新包", apkUri)
         }
         runCatching { startActivity(intent) }
-            .onSuccess { prefs.pendingUpdateInstallId = -1L; prefs.updateDownloadId = -1L }
             .onFailure { toast("无法打开系统安装器：${it.message ?: "请检查安装权限"}") }
     }
 
     private fun resumePendingUpdateInstall() {
-        val id = prefs.pendingUpdateInstallId
-        if (id < 0 || Build.VERSION.SDK_INT < Build.VERSION_CODES.O || !packageManager.canRequestPackageInstalls()) return
-        prefs.pendingUpdateInstallId = -1L
-        installDownloadedUpdate(id)
+        if (!prefs.updateInstallPending) return
+        prefs.updateInstallPending = false
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !packageManager.canRequestPackageInstalls()) {
+            toast("允许此应用安装未知应用后，再点“检查更新”即可继续安装")
+            return
+        }
+        val file = prefs.updateApkPath.takeIf { it.isNotBlank() }?.let(::File)
+        if (file?.isFile == true) installDownloadedUpdate(file)
+        else toast("找不到已下载的更新包，请重新下载")
     }
 
     /** 把任意文本渲染成二维码位图（复用 ZXing） */
@@ -2119,7 +2234,7 @@ class MainActivity : Activity() {
             })
         }
         section("观影设置")
-        row("sources", "片源管理", "点播源 ${prefs.sources().count { it.enabled }} 个已启用 · 管理可用线路") { showSources() }
+        row("sources", "片源管理", "点播源 ${prefs.sources().size} 个 · 直播源 ${prefs.liveUrls().size} 个 · 管理") { showSources() }
         row("tv", "播放设置", "续播、画质、缓冲与跳过片头片尾") { showPlaySettings() }
         row("setup", "切换服务端", "选择预设服务端，输入密码连接") { showServerSettings() }
         section("维护工具")
@@ -2333,11 +2448,70 @@ class MainActivity : Activity() {
             }
         }
 
-    /** 片源管理：列表为主，导入走独立页面；每条可编辑/停用/上移下移/测试/删除 */
+    /** 片源入口：点播与直播分开显示，避免把两类来源混在同一份长列表里。 */
     private fun showSources() {
-        // 记录来源：从设置页进来的，返回时回设置；从首页进来的回首页
-        sourcesOrigin = if (currentScreen == "setup") "setup" else "home"
+        if (currentScreen !in setOf("sources", "vodsources", "addsource", "import", "qradd")) {
+            sourcesOrigin = if (currentScreen == "setup") "setup" else "home"
+        }
         currentScreen = "sources"
+        ensureBuiltInLiveSources()
+        val vodSources = prefs.sources()
+        val liveSources = prefs.liveUrls()
+        val enabledVodCount = vodSources.count { it.enabled }
+        val col = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(pagePad(40), dp(20), pagePad(40), dp(16))
+        }
+        col.addView(topBar())
+        col.addView(titleText("片源管理", 20f))
+        col.addView(hintText("点播源和直播源分开管理"))
+        fun category(title: String, detail: String, action: () -> Unit) {
+            val card = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(18), dp(12), dp(18), dp(12))
+                background = GradientDrawable().apply {
+                    setColor(Color.WHITE)
+                    cornerRadius = dp(14).toFloat()
+                    setStroke(dp(1), 0xFFE0EAE4.toInt())
+                }
+                isFocusable = true
+                isFocusableInTouchMode = true
+                setOnClickListener { action() }
+                onFocusChangeListener = View.OnFocusChangeListener { view, focused ->
+                    (view.background as? GradientDrawable)?.setStroke(dp(if (focused) 3 else 1), if (focused) ACCENT else 0xFFE0EAE4.toInt())
+                }
+            }
+            val textColumn = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+            textColumn.addView(TextView(this).apply {
+                text = "▸  $title"
+                setTextColor(ACCENT)
+                setTextSize(if (isTvDevice) 19f else 16f)
+                setTypeface(null, Typeface.BOLD)
+            })
+            textColumn.addView(TextView(this).apply {
+                text = detail
+                setTextColor(BRIGHTER_TEXT)
+                setTextSize(if (isTvDevice) 14f else 12f)
+                setPadding(0, dp(3), 0, 0)
+            })
+            card.addView(textColumn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            card.addView(TextView(this).apply {
+                text = "›"
+                setTextColor(ACCENT)
+                setTextSize(27f)
+            })
+            col.addView(card, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(if (isTvDevice) 80 else 72)).apply { bottomMargin = dp(10) })
+        }
+        category("点播源 ${vodSources.size} 个 · 管理", "已启用 $enabledVodCount 个 · 影视采集站", ::showVodSources)
+        category("直播源 ${liveSources.size} 个 · 管理", "IPTV 频道 · 默认使用第一个直播源", ::showLive)
+        col.addView(button("返回") { if (sourcesOrigin == "setup") showSetup() else showRecommend() })
+        setScreen(col)
+    }
+
+    /** 点播源的详细列表与检测状态。 */
+    private fun showVodSources() {
+        currentScreen = "vodsources"
         val sources = prefs.sources()
         val enabledCount = sources.count { it.enabled }
         // 复选框多选：勾选后可批量启用/停用（直播源上线后沿用同一套交互）
@@ -2348,9 +2522,10 @@ class MainActivity : Activity() {
             setPadding(pagePad(40), dp(20), pagePad(40), dp(16))
         }
         col.addView(topBar())
-        col.addView(titleText("片源管理 · ${sources.size} 个（启用 $enabledCount）", 18f))
+        col.addView(titleText("点播源 · ${sources.size} 个（启用 $enabledCount）", 18f))
 
         val bar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        bar.addView(button("返回片源分类") { showSources() })
         bar.addView(button("添加片源", primary = true) { showAddSource() })
         bar.addView(button("全部测试") { runAllSourceTests() })
         bar.addView(button("停用失败源") { disableFailedSources() })
@@ -2363,7 +2538,7 @@ class MainActivity : Activity() {
                 checked.addAll(sources.map { it.url })
                 toast("已选 ${checked.size} 个")
             }
-            showSources()
+            showVodSources()
         })
         bar.addView(button("批量启用") {
             applyBatchEnable(checked, true)
@@ -2383,7 +2558,7 @@ class MainActivity : Activity() {
                 .setPositiveButton("全部删除") { _, _ ->
                     prefs.saveSources(emptyList())
                     toast("已删除全部片源")
-                    showSources()
+                    showVodSources()
                 }
                 .setNegativeButton("取消", null)
                 .show()
@@ -2445,12 +2620,11 @@ class MainActivity : Activity() {
             ).apply { topMargin = dp(4); bottomMargin = dp(6) })
         }
 
-        val liveCount = prefs.liveUrls().size
         val rows = sources
         val listView = newList()
         sourcesListView = listView
         listView.adapter = object : BaseAdapter() {
-            override fun getCount(): Int = rows.size + 1
+            override fun getCount(): Int = rows.size
 
             override fun getItem(position: Int): Any = position
 
@@ -2463,15 +2637,6 @@ class MainActivity : Activity() {
                     setPadding(dp(8), dp(14), dp(8), dp(14))
                 }
                 row.removeAllViews()
-                if (position >= rows.size) {
-                    // 末尾一行：直播源入口
-                    row.addView(TextView(this@MainActivity).apply {
-                        text = "  ▸  直播源 $liveCount 个 · 管理"
-                        setTextColor(ACCENT)
-                        setTextSize(16f)
-                    })
-                    return row
-                }
                 val s = rows[position]
                 val cb = android.widget.CheckBox(this@MainActivity).apply {
                     isChecked = s.url in checked
@@ -2532,7 +2697,7 @@ class MainActivity : Activity() {
             }
         }
         listView.setOnItemClickListener { _, _, position, _ ->
-            if (position >= rows.size) showLive() else sourceActions(position)
+            sourceActions(position)
         }
         listView.setOnItemLongClickListener { _, _, position, _ ->
             val list = prefs.sources()
@@ -2540,7 +2705,7 @@ class MainActivity : Activity() {
                 list[position] = list[position].copy(enabled = !list[position].enabled)
                 prefs.saveSources(list)
                 toast(if (list[position].enabled) "已启用「${list[position].name}」" else "已停用「${list[position].name}」")
-                showSources()
+                showVodSources()
             }
             true
         }
@@ -2571,7 +2736,7 @@ class MainActivity : Activity() {
                 val urls = failed.map { it.url }.toHashSet()
                 prefs.saveSources(list.map { if (it.url in urls) it.copy(enabled = false) else it })
                 toast("已停用 ${failed.size} 个失败源")
-                showSources()
+                showVodSources()
             }
             .setNegativeButton("取消", null)
             .show()
@@ -2597,7 +2762,7 @@ class MainActivity : Activity() {
                     prefs.sources().map { if (it.url in urls) it.copy(enabled = enable) else it },
                 )
                 toast("已$act $n 个片源")
-                showSources()
+                showVodSources()
             }
             .setNegativeButton("取消", null)
             .show()
@@ -2613,7 +2778,7 @@ class MainActivity : Activity() {
         toast("正在测试 ${list.size} 个片源…")
         testingUrls.clear()
         list.forEach { testingUrls.add(it.url) }
-        showSources()
+        showVodSources()
         scope.launch {
             var failed = 0
             // 并发测、但限 4 路：串行时 20 个源按超时算要一两分钟；并发太多又会把公共采集站打挂
@@ -2633,10 +2798,10 @@ class MainActivity : Activity() {
                 }
                 testingUrls.remove(s.url)
             }
-            if (currentScreen == "sources") {
+        if (currentScreen == "vodsources") {
                 // 只刷新行内容，不重建整页：否则每测完一个源，列表都重画一次、焦点乱跳
                 val lv = sourcesListView
-                if (lv != null) (lv.adapter as? BaseAdapter)?.notifyDataSetChanged() else showSources()
+                if (lv != null) (lv.adapter as? BaseAdapter)?.notifyDataSetChanged() else showVodSources()
                 toast(if (failed > 0) "测试完成：$failed 个不可用" else "测试完成：全部可用")
             }
         }
@@ -2662,7 +2827,7 @@ class MainActivity : Activity() {
                     0 -> {
                         cur[index] = cur[index].copy(enabled = !cur[index].enabled)
                         prefs.saveSources(cur)
-                        showSources()
+                        showVodSources()
                     }
                     1 -> editSourceField(index, name = true)
                     2 -> editSourceField(index, name = false)
@@ -2672,7 +2837,7 @@ class MainActivity : Activity() {
                     6 -> {
                         prefs.saveSources(cur.filterIndexed { i, _ -> i != index })
                         toast("已删除")
-                        showSources()
+                        showVodSources()
                     }
                 }
             }
@@ -2689,7 +2854,7 @@ class MainActivity : Activity() {
         list[a] = list[b]
         list[b] = tmp
         prefs.saveSources(list)
-        showSources()
+        showVodSources()
     }
 
     private fun editSourceField(index: Int, name: Boolean) {
@@ -2715,7 +2880,7 @@ class MainActivity : Activity() {
                             if (name) list[index].copy(name = v) else list[index].copy(url = v)
                         prefs.saveSources(list)
                     }
-                    showSources()
+                    showVodSources()
                 }
             }
             .setNegativeButton("取消", null)
@@ -2804,15 +2969,13 @@ class MainActivity : Activity() {
         )
 
         // 行模型：String = 分区标题（不可点），Triple = 可点选项。
-        // 点播源与直播源分区展示：现有所有导入方式都是点播源，直播源后续单独支持。
         val firstOptionIndex = 1
         val rows: List<Any> = listOf(
             "点播源 · 影视采集站（电影 / 剧集）",
         ) + options + listOf(
-            "直播源 · IPTV / m3u（开发中）",
-            Triple("导入直播源", "直播源与点播源分开存放，功能开发中", {
-                toast("直播源导入即将支持，敬请期待")
-            }),
+            "直播源 · IPTV / M3U（已内置 ${BuiltInLiveSources.ALL.size} 个）",
+            Triple("管理直播源", "第一个直播源默认启用，也可切换备用源", { showLive() }),
+            Triple("添加其他直播源", "输入公开可访问的 M3U / M3U8 地址", { addLiveDialog() }),
         )
 
         val col = LinearLayout(this).apply {
@@ -2821,7 +2984,7 @@ class MainActivity : Activity() {
         }
         col.addView(topBar())
         col.addView(titleText("添加片源", 20f))
-        col.addView(hintText("点播源走上面 · 直播源支持开发中"))
+        col.addView(hintText("点播源和直播源分开管理"))
 
         val listView = newList()
         listView.adapter = object : BaseAdapter() {
@@ -4035,6 +4198,7 @@ class MainActivity : Activity() {
     /* --------------------------------------------------------------- 直播页 */
 
     private fun showLive() {
+        ensureBuiltInLiveSources()
         currentScreen = "live"
         val urls = prefs.liveUrls()
         if (urls.isEmpty()) {
@@ -4078,7 +4242,7 @@ class MainActivity : Activity() {
                     .show()
             },
         )
-        bar.addView(button("返回") { showRecommend() })
+        bar.addView(button("返回分类") { showSources() })
         col.addView(hScroll(bar))
 
         val sorted = shown.sortedWith(compareBy({ it.group }, { it.name }))
@@ -4102,7 +4266,7 @@ class MainActivity : Activity() {
         }
         AlertDialog.Builder(this)
             .setTitle("选择直播源")
-            .setItems(urls.toTypedArray()) { _, which ->
+            .setItems(urls.map(BuiltInLiveSources::label).toTypedArray()) { _, which ->
                 prefs.activeLiveUrl = urls[which]
                 liveChannels = emptyList()
                 liveChannelSource = ""
