@@ -1,0 +1,27 @@
+# Android / Gradle
+build/
+.gradle/
+local.properties
+*.iml
+.idea/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# 交付物（APK 不入库，走 Releases）
+dist/
+
+# 本机调试用的截图（真机/模拟器现场图）
+docs/adb-*.png
+
+# 系统
+.DS_Store
+Thumbs.db
+# 正式签名：密钥库与口令绝不入库
+keystore.properties
+keystore/
+*.jks
+
+# 本机预设服务端密码（不入库）
+server-presets.properties
+*.apk

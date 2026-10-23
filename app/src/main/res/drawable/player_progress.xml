@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  播放进度条。
+
+  以前是 3dp 直角 + 中灰轨道 + 纯蓝填充，压在彩色画面上像贴了根塑料管。
+  现在：更细的 4dp 圆角轨道、20% 白的轨道底、品牌绿（和首页主按钮同一个颜色）的填充，
+  和全站「深色底 + 浅绿强调色」统一。
+-->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:id="@android:id/background">
+        <shape>
+            <solid android:color="#33FFFFFF" />
+            <corners android:radius="2dp" />
+            <size android:height="4dp" />
+        </shape>
+    </item>
+    <item android:id="@android:id/secondaryProgress">
+        <clip>
+            <shape>
+                <solid android:color="#66FFFFFF" />
+                <corners android:radius="2dp" />
+                <size android:height="4dp" />
+            </shape>
+        </clip>
+    </item>
+    <item android:id="@android:id/progress">
+        <clip>
+            <shape>
+                <gradient
+                    android:angle="0"
+                    android:endColor="#2CB5A8"
+                    android:startColor="#0F766E" />
+                <corners android:radius="2dp" />
+                <size android:height="4dp" />
+            </shape>
+        </clip>
+    </item>
+</layer-list>

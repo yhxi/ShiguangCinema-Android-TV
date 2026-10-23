@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="AppTheme" parent="@android:style/Theme.Material.NoActionBar.Fullscreen">
+        <item name="android:windowBackground">#F5F7F1</item>
+        <item name="android:colorPrimary">#0F766E</item>
+        <item name="android:colorPrimaryDark">#0D4D46</item>
+        <item name="android:colorAccent">#0F766E</item>
+        <item name="android:colorBackground">#F5F7F1</item>
+        <item name="android:textColorPrimary">#173B35</item>
+        <item name="android:textColorSecondary">#617A70</item>
+        <item name="android:windowActionBar">false</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:alertDialogTheme">@style/AppDialog</item>
+    </style>
+
+    <!--
+      对话框主题：白底卡片 + 深色文字。
+
+      注意 parent 必须是 **Light**：之前用 Theme.Material.Dialog.Alert（深色），
+      背景却被改成白色，深色主题下列表项文字是白色 —— 白底白字，
+      「更多操作」里只看得到标题和「关闭」按钮。改成 Light 后文字自动变深。
+    -->
+    <style name="AppDialog" parent="@android:style/Theme.Material.Light.Dialog.Alert">
+        <item name="android:windowBackground">@drawable/dialog_bg</item>
+        <item name="android:colorBackground">#FFFFFF</item>
+        <item name="android:textColorPrimary">#173B35</item>
+        <item name="android:textColorSecondary">#617A70</item>
+        <!-- 列表项（setItems）文字颜色单独指定，Light 主题下默认已是深色，这里再兜一层 -->
+        <item name="android:textColorAlertDialogListItem">#173B35</item>
+        <item name="android:colorAccent">#0F766E</item>
+        <item name="android:colorControlHighlight">#DCEFE9</item>
+        <item name="android:divider">#DFE8E2</item>
+        <item name="android:dividerHeight">1dp</item>
+    </style>
+</resources>
