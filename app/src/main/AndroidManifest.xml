@@ -18,7 +18,7 @@
     <application
         android:allowBackup="false"
         android:banner="@drawable/cloudscreen_banner"
-        android:icon="@drawable/cloudscreen_icon"
+        android:icon="@drawable/app_icon_clock"
         android:label="@string/app_name"
         android:supportsRtl="true"
         android:theme="@style/AppTheme"

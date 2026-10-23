@@ -83,6 +83,7 @@ class MainActivity : Activity() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var updateBadgeBar: LinearLayout? = null
     private var updateBadge: TextView? = null
+    private var manualUpdateCheckInProgress = false
 
     /**
      * 按用途分槽的请求登记表。
@@ -1387,6 +1388,38 @@ class MainActivity : Activity() {
         }
     }
 
+    /** 设置页手动检查，不受 6 小时自动检查间隔限制。 */
+    private fun checkForUpdatesManually() {
+        if (manualUpdateCheckInProgress) {
+            toast("正在检查更新…")
+            return
+        }
+        manualUpdateCheckInProgress = true
+        toast("正在检查更新…")
+        UpdateChecker.check { info ->
+            manualUpdateCheckInProgress = false
+            prefs.lastUpdateCheck = System.currentTimeMillis()
+            if (info == null) {
+                toast("检查更新失败，请检查网络后重试")
+                return@check
+            }
+            if (UpdateChecker.isNewer(info.tag, BuildConfig.VERSION_NAME)) {
+                prefs.latestTag = info.tag
+                prefs.latestNotes = info.notes
+                prefs.latestUrl = info.url
+                prefs.updateBannerSeen = ""
+                toast("发现新版本 ${info.tag}")
+                showUpdateDetail(returnToRecommend = false)
+            } else {
+                prefs.latestTag = ""
+                prefs.latestNotes = ""
+                prefs.latestUrl = ""
+                toast("已是最新版本 v${BuildConfig.VERSION_NAME}")
+                refreshUpdateBadge()
+            }
+        }
+    }
+
     private fun refreshUpdateBadge() {
         if (currentScreen != "recommend") return
         val bar = updateBadgeBar ?: return
@@ -1410,7 +1443,7 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun showUpdateDetail() {
+    private fun showUpdateDetail(returnToRecommend: Boolean = true) {
         val notes = prefs.latestNotes.ifEmpty { "（这个版本没有提供更新说明）" }
         val url = prefs.latestUrl.ifEmpty { "https://github.com/yhxi/ShiguangCinema-Android-TV/releases" }
 
@@ -1475,7 +1508,7 @@ class MainActivity : Activity() {
                     toast("无法打开下载链接")
                 }
             }
-            .setPositiveButton("知道了") { _, _ -> showRecommend() }
+            .setPositiveButton("知道了") { _, _ -> if (returnToRecommend) showRecommend() }
             .show()
     }
 
@@ -1941,6 +1974,7 @@ class MainActivity : Activity() {
         row("search", "网络诊断", "检测连接和片源响应") {
             startActivity(Intent(this, NetDiagActivity::class.java))
         }
+        row("history", "检查更新", "立即检查 GitHub 上的最新版本") { checkForUpdatesManually() }
         val hasCrash = CrashLog.read(this).isNotEmpty()
         row("history", "崩溃日志", if (hasCrash) "有记录，可复制排查" else "暂无记录") { showCrashLog() }
         col.addView(githubFooter())

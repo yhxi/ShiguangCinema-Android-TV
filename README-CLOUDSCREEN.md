@@ -8,6 +8,11 @@
 
 构建：安装 JDK 25 与 Android SDK API 37.0，在项目根目录执行 `gradlew.bat :app:assembleDebug`。产物位于 `app/build/outputs/apk/debug/app-debug.apk`。
 
+## 1.0.3 变更（公开发布）
+
+- 设置页「维护工具」新增「检查更新」，可随时手动检查 GitHub Releases；有新版本显示说明和下载按钮，当前已是最新或网络失败会提示结果。
+- 版本号更新为 1.0.3（versionCode 32）；正式版不内置服务器密码。
+
 ## 1.0.2 变更（公开发布）
 
 - 更新详情新增「下载更新」按钮，可直接打开 GitHub APK 下载地址。
