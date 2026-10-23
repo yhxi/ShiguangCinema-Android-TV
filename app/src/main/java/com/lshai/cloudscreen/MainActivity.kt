@@ -1468,6 +1468,13 @@ class MainActivity : Activity() {
         AlertDialog.Builder(this)
             .setTitle("新版本 " + prefs.latestTag + "（当前 " + BuildConfig.VERSION_NAME + "）")
             .setView(row)
+            .setNegativeButton("下载更新") { _, _ ->
+                runCatching {
+                    startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url)))
+                }.onFailure {
+                    toast("无法打开下载链接")
+                }
+            }
             .setPositiveButton("知道了") { _, _ -> showRecommend() }
             .show()
     }
@@ -1956,8 +1963,16 @@ class MainActivity : Activity() {
 
         // 输入框先创建、稍后再挂到页面上 —— 预设卡片要显示在最上面，
         // 但点卡片时需要能直接改这两个框的内容。
-        val urlField = field("请输入网址", "")
-        val pwdField = field("请输入密码", "", password = true)
+        val urlField = field("请输入网址", prefs.serverUrl)
+        val currentServer = prefs.serverUrl.trimEnd('/')
+        val currentProfile = prefs.savedServers().firstOrNull {
+            it.url.trimEnd('/').equals(currentServer, ignoreCase = true)
+        }
+        val pwdField = field(
+            "请输入密码",
+            currentProfile?.password?.takeIf { it.isNotEmpty() } ?: prefs.password,
+            password = true,
+        )
 
         // 登录逻辑在下面定义（要用到输入框），先占个位让卡片能调用
         var doLogin: () -> Unit = {}
@@ -1984,8 +1999,12 @@ class MainActivity : Activity() {
                 setOnFocusChangeListener { v, focused -> v.background = cardBg(focused) }
                 setOnClickListener {
                     urlField.setText(preset.url)
-                    pwdField.setText(preset.password)
-                    if (preset.password.isNotEmpty()) doLogin()
+                    val savedPassword = prefs.savedServers().firstOrNull {
+                        it.url.trimEnd('/').equals(preset.url.trimEnd('/'), ignoreCase = true)
+                    }?.password.orEmpty()
+                    val password = preset.password.ifEmpty { savedPassword }
+                    pwdField.setText(password)
+                    if (password.isNotEmpty()) doLogin()
                     else {
                         pwdField.requestFocus()
                         toast("请输入服务端密码后连接")
@@ -2004,7 +2023,10 @@ class MainActivity : Activity() {
             })
             card.addView(words, LinearLayout.LayoutParams(0, -2, 1f))
             card.addView(TextView(this).apply {
-                text = if (current) "已连接" else if (preset.password.isEmpty()) "填写密码 ›" else "一键登录 ›"
+                val hasSavedPassword = prefs.savedServers().any {
+                    it.url.trimEnd('/').equals(preset.url.trimEnd('/'), ignoreCase = true) && it.password.isNotEmpty()
+                }
+                text = if (current) "已连接" else if (preset.password.isEmpty() && !hasSavedPassword) "填写密码 ›" else "一键登录 ›"
                 setTextColor(ACCENT)
                 setTextSize(14f)
             })
@@ -2029,17 +2051,26 @@ class MainActivity : Activity() {
                 return
             }
             val candidate = Api(url)
-            val storedCookie = if (url.trimEnd('/') == prefs.serverUrl) prefs.cookie
-                else prefs.savedServers().firstOrNull { it.url == url.trimEnd('/') }?.cookie.orEmpty()
+            val normalizedUrl = url.trimEnd('/')
+            val profile = prefs.savedServers().firstOrNull {
+                it.url.trimEnd('/').equals(normalizedUrl, ignoreCase = true)
+            }
+            val effectivePassword = pwd.ifEmpty {
+                profile?.password.orEmpty().ifEmpty {
+                    if (normalizedUrl.equals(prefs.serverUrl.trimEnd('/'), ignoreCase = true)) prefs.password else ""
+                }
+            }
+            val storedCookie = if (normalizedUrl.equals(prefs.serverUrl.trimEnd('/'), ignoreCase = true)) prefs.cookie
+                else profile?.cookie.orEmpty()
             candidate.restoreCookie(storedCookie)
             runApiK("connect", "正在连接…", {
                 val st = candidate.status()
                 val verified = if (st.passwordRequired && !st.verified) {
-                    candidate.login(pwd).verified
+                    candidate.login(effectivePassword).verified
                 } else {
                     st.verified
                 }
-                Triple(st, verified, pwd)
+                Triple(st, verified, effectivePassword)
             }, { (st, verified, pw) ->
                 if (st.passwordRequired && !verified) {
                     toast("密码未通过验证，请检查后重试")
