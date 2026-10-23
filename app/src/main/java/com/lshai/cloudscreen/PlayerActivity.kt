@@ -1788,10 +1788,12 @@ class PlayerActivity : Activity() {
         val base = when (prefs.decodeMode) {
             1 -> "强制软解"
             2 -> "强制硬解"
+            3 -> "硬解优先"
             else -> "自动"
         }
         // 让用户看得见「本剧走了软解」这件事，否则他会以为自己设的自动失效了
-        return if (prefs.decodeMode == 0 && prefs.softDecodeFor(skipKey())) "$base（本剧软解）" else base
+        val autoPick = prefs.decodeMode == 0 || prefs.decodeMode == 3
+        return if (autoPick && prefs.softDecodeFor(skipKey())) "$base（本剧软解）" else base
     }
 
     private fun updateSpeedAction() {
@@ -1824,11 +1826,14 @@ class PlayerActivity : Activity() {
     }
 
     private fun showDecodeMenu() {
-        val names = arrayOf("自动（推荐）", "强制软解", "强制硬解")
+        // 索引和 decodeMode 的取值不是一一对应，靠 values 映射，避免以后加档位时错位
+        val names = arrayOf("硬解优先（推荐）", "自动", "强制软解", "强制硬解")
+        val values = intArrayOf(3, 0, 1, 2)
+        val checked = values.indexOf(prefs.decodeMode.coerceIn(0, 3)).coerceAtLeast(0)
         android.app.AlertDialog.Builder(this)
             .setTitle("解码方式（下次打开视频生效）")
-            .setSingleChoiceItems(names, prefs.decodeMode.coerceIn(0, 2)) { d, which ->
-                prefs.decodeMode = which
+            .setSingleChoiceItems(names, checked) { d, which ->
+                prefs.decodeMode = values[which]
                 d.dismiss()
                 toast("已设为：${names[which]}，重新打开视频生效")
             }
@@ -3085,19 +3090,24 @@ class PlayerActivity : Activity() {
     }
 
 
-    /** 解码方式：0 自动 / 1 强制软解 / 2 强制硬解 */
+    /** 解码方式：0 自动 / 1 强制软解 / 2 强制硬解 / 3 硬解优先（默认） */
     private fun buildRenderers(): DefaultRenderersFactory {
         val factory = DefaultRenderersFactory(this).setEnableDecoderFallback(true)
-        // 全局设置优先；此外「这部剧以前硬解失败过」也走软解（只影响这一部）
+        // 全局设置优先；此外「这部剧以前硬解失败过」也走软解（只影响这一部）。
+        // 0 和 3 都属于「会自动挑硬解」的档位，所以要一并让本剧软解标记生效，
+        // 否则默认档改成 3 之后，历史标记会被忽略、每次进这一集都重新撞一次硬解失败。
         var mode = prefs.decodeMode
-        if (mode == 0 && prefs.softDecodeFor(skipKey())) mode = 1
+        if ((mode == 0 || mode == 3) && prefs.softDecodeFor(skipKey())) mode = 1
         if (mode != 0) {
             factory.setMediaCodecSelector { mime, secure, tunneling ->
                 val all = MediaCodecUtil.getDecoderInfos(mime, secure, tunneling)
-                if (mode == 1) {
-                    all.filterNot { it.hardwareAccelerated }
-                } else {
-                    all.filter { it.hardwareAccelerated }.ifEmpty { all }
+                when (mode) {
+                    1 -> all.filterNot { it.hardwareAccelerated }
+                    2 -> all.filter { it.hardwareAccelerated }.ifEmpty { all }
+                    // 3 硬解优先：只是排序，软解仍留在候选里。
+                    // 硬解初始化失败时 setEnableDecoderFallback 会顺着列表换到下一个解码器，
+                    // 也就是软解，全程在播放器内部完成 —— 不报错、不闪屏、不重建 Activity。
+                    else -> all.sortedByDescending { it.hardwareAccelerated }
                 }
             }
         }

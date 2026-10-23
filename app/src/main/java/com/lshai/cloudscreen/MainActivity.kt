@@ -2025,7 +2025,7 @@ class MainActivity : Activity() {
             "自动连播下一集    ${if (prefs.autoNext) "开" else "关"}",
             "记住播放进度      ${if (prefs.resumeEnabled) "开" else "关"}",
             "续播起始位置      超过 ${prefs.resumeThresholdSeconds} 秒",
-            "解码方式          " + when (prefs.decodeMode) { 1 -> "强制软解"; 2 -> "强制硬解"; else -> "自动" },
+            "解码方式          " + when (prefs.decodeMode) { 1 -> "强制软解"; 2 -> "强制硬解"; 3 -> "硬解优先"; else -> "自动" },
             "播放缓存上限      " + when (prefs.cacheLimitMb) {
                 512 -> "512 MB"
                 1024 -> "1 GB"
@@ -2061,9 +2061,16 @@ class MainActivity : Activity() {
                     3 -> chooseOption("续播起始位置", listOf("超过 5 秒", "超过 30 秒", "超过 60 秒"),
                         listOf(5, 30, 60).indexOf(prefs.resumeThresholdSeconds).coerceAtLeast(0)
                     ) { i -> prefs.resumeThresholdSeconds = listOf(5, 30, 60)[i]; refresh() }
-                    4 -> chooseOption("解码方式（下次播放生效）", listOf("自动", "强制软解", "强制硬解"),
-                        prefs.decodeMode.coerceIn(0, 2)
-                    ) { i -> prefs.decodeMode = i; refresh() }
+                    4 -> {
+                        // 索引与 decodeMode 取值靠 decodeValues 映射，UI 顺序可以随便排
+                        val decodeNames = listOf("硬解优先（推荐）", "自动", "强制软解", "强制硬解")
+                        val decodeValues = listOf(3, 0, 1, 2)
+                        chooseOption(
+                            "解码方式（下次播放生效）",
+                            decodeNames,
+                            decodeValues.indexOf(prefs.decodeMode.coerceIn(0, 3)).coerceAtLeast(0),
+                        ) { i -> prefs.decodeMode = decodeValues[i]; refresh() }
+                    }
                     5 -> chooseOption(
                         "播放缓存上限",
                         listOf("512 MB", "1 GB", "2 GB", "4 GB"),

@@ -530,10 +530,18 @@ class Prefs(ctx: Context) {
         get() = sp.getFloat("player_brightness", -1f)
         set(v) = sp.edit().putFloat("player_brightness", v).apply()
 
-    /** 解码方式：0 自动 / 1 强制软解 / 2 强制硬解（下次打开播放器生效） */
+    /**
+     * 解码方式（下次打开播放器生效）：
+     * 0 自动（交给 ExoPlayer 默认顺序）/ 1 强制软解 / 2 强制硬解 / 3 硬解优先。
+     *
+     * 3 是默认档：selector 把硬解排在前面、软解留在后面，硬解失败时由
+     * [androidx.media3.exoplayer.DefaultRenderersFactory.setEnableDecoderFallback] 在
+     * 播放器内部直接换到软解，不抛错、不重建播放页。省电是这里的主要目的：
+     * 软解吃 CPU，1080p 的功耗通常是硬解的 3~10 倍。
+     */
     var decodeMode: Int
-        get() = sp.getInt("decode_mode", 0)
-        set(v) = sp.edit().putInt("decode_mode", v).apply()
+        get() = sp.getInt("decode_mode", 3).coerceIn(0, 3)
+        set(v) = sp.edit().putInt("decode_mode", v.coerceIn(0, 3)).apply()
 
     /**
      * 「这部剧硬解不了，以后都走软解」的按剧标记。
