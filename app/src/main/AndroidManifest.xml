@@ -3,6 +3,7 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <!-- 后台播放时显示常驻通知（Android 13+ 需要用户授权，拒绝也不影响播放） -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- 内置文件浏览器用：电视/投影仪常常没有 DocumentsUI，无法调系统文件选择器 -->

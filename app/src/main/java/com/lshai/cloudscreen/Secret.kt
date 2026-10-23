@@ -50,19 +50,16 @@ object Secret {
         }
     }.getOrNull()
 
-    /** 加密；失败时返回原文（宁可弱一点，也不能让用户存不进去） */
+    /** 加密失败时中止保存，绝不将敏感值以明文写入偏好设置。 */
     fun encrypt(plain: String): String {
         if (plain.isEmpty()) return ""
-        if (plain.startsWith(PREFIX)) return plain
-        val k = key() ?: return plain
-        return runCatching {
-            val cipher = Cipher.getInstance(TRANSFORM)
-            cipher.init(Cipher.ENCRYPT_MODE, k)
-            val ct = cipher.doFinal(plain.toByteArray(Charsets.UTF_8))
-            PREFIX +
-                Base64.encodeToString(cipher.iv, Base64.NO_WRAP) + ":" +
-                Base64.encodeToString(ct, Base64.NO_WRAP)
-        }.getOrDefault(plain)
+        val k = key() ?: throw IllegalStateException("Android Keystore 不可用，无法安全保存凭据")
+        val cipher = Cipher.getInstance(TRANSFORM)
+        cipher.init(Cipher.ENCRYPT_MODE, k)
+        val ct = cipher.doFinal(plain.toByteArray(Charsets.UTF_8))
+        return PREFIX +
+            Base64.encodeToString(cipher.iv, Base64.NO_WRAP) + ":" +
+            Base64.encodeToString(ct, Base64.NO_WRAP)
     }
 
     /** 解密；不是密文就原样返回，解不开就返回空串（当作没配过） */

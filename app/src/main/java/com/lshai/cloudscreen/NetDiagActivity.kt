@@ -422,12 +422,10 @@ class NetDiagActivity : Activity() {
                 api = candidate
                 serverHost = runCatching { URL(preset.url).host }.getOrDefault("")
                 prefs.serverUrl = preset.url.trimEnd('/')
-                prefs.password = preset.password
-                prefs.cookie = candidate.currentCookie().orEmpty()
-                prefs.rememberServer(preset.url, preset.password, prefs.cookie)
+                val savedSecurely = prefs.rememberServer(preset.url, preset.password, candidate.currentCookie().orEmpty())
                 ui {
                     subtitleTv.text = subtitleText()
-                    Toast.makeText(this, "已启用 ${preset.name}", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this, if (savedSecurely) "已启用 ${preset.name}" else "已启用 ${preset.name}，但密码未能安全保存", Toast.LENGTH_SHORT).show()
                 }
             }.onFailure {
                 ui { Toast.makeText(this, "启用失败：${it.message}", Toast.LENGTH_SHORT).show() }

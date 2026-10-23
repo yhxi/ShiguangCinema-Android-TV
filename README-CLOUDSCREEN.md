@@ -8,6 +8,14 @@
 
 构建：安装 JDK 25 与 Android SDK API 37.0，在项目根目录执行 `gradlew.bat :app:assembleDebug`。产物位于 `app/build/outputs/apk/debug/app-debug.apk`。
 
+## 1.0.4 变更（公开发布）
+
+- 应用图标改为 512px WebP，减少 APK 体积。
+- 下载更新改为应用内使用系统下载管理器；下载完成后调起系统安装器覆盖安装，首次可能需要允许本应用安装未知应用。
+- 更新检查提示区分网络故障、GitHub 限流、HTTP 错误和无效响应。
+- Android Keystore 不可用时不再降级为明文保存服务器密码；无法安全保存时会提示下次需重新输入。
+- 版本号更新为 1.0.4（versionCode 33）；正式版不内置服务器密码。
+
 ## 1.0.3 变更（公开发布）
 
 - 设置页「维护工具」新增「检查更新」，可随时手动检查 GitHub Releases；有新版本显示说明和下载按钮，当前已是最新或网络失败会提示结果。

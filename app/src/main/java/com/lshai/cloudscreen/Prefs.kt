@@ -39,6 +39,13 @@ class Prefs(ctx: Context) {
     private val sp = ctx.applicationContext.getSharedPreferences("cloudscreen", Context.MODE_PRIVATE)
     private fun scoped(key: String): String = "$key:${serverUrl.hashCode()}"
 
+    private fun saveEncrypted(key: String, value: String) {
+        val encrypted = runCatching { Secret.encrypt(value) }.getOrNull()
+        val editor = sp.edit()
+        if (encrypted == null) editor.remove(key) else editor.putString(key, encrypted)
+        editor.apply()
+    }
+
     var serverUrl: String
         get() = sp.getString("server_url", "") ?: ""
         set(v) = sp.edit().putString("server_url", v.trim().trimEnd('/')).apply()
@@ -46,12 +53,12 @@ class Prefs(ctx: Context) {
     /** 访问密码：落盘前用 AndroidKeyStore 的 AES-GCM 加密（兼容旧的明文值） */
     var password: String
         get() = Secret.decrypt(sp.getString("password", "") ?: "")
-        set(v) = sp.edit().putString("password", Secret.encrypt(v)).apply()
+        set(v) = saveEncrypted("password", v)
 
     /** 会话 Cookie：同上是敏感凭据，加密存 */
     var cookie: String
         get() = Secret.decrypt(sp.getString("cookie", "") ?: "")
-        set(v) = sp.edit().putString("cookie", Secret.encrypt(v)).apply()
+        set(v) = saveEncrypted("cookie", v)
 
     fun savedServers(): List<ServerProfile> = try {
         val arr = JSONArray(Secret.decrypt(sp.getString("server_profiles", "[]") ?: "[]"))
@@ -65,19 +72,37 @@ class Prefs(ctx: Context) {
         emptyList()
     }
 
-    fun rememberServer(url: String, password: String, cookie: String) {
+    fun rememberServer(url: String, password: String, cookie: String): Boolean {
         val normalized = url.trim().trimEnd('/')
-        val profiles = savedServers().filterNot { it.url == normalized }.toMutableList()
-        profiles.add(0, ServerProfile(normalized, password, cookie))
-        val arr = JSONArray()
-        profiles.take(8).forEach { profile ->
-            arr.put(JSONObject().apply {
-                put("url", profile.url)
-                put("password", profile.password)
-                put("cookie", profile.cookie)
-            })
+        return try {
+            val profiles = savedServers().filterNot { it.url == normalized }.toMutableList()
+            profiles.add(0, ServerProfile(normalized, password, cookie))
+            val arr = JSONArray()
+            profiles.take(8).forEach { profile ->
+                arr.put(JSONObject().apply {
+                    put("url", profile.url)
+                    put("password", profile.password)
+                    put("cookie", profile.cookie)
+                })
+            }
+            val encryptedProfiles = Secret.encrypt(arr.toString())
+            val encryptedPassword = Secret.encrypt(password)
+            val encryptedCookie = Secret.encrypt(cookie)
+            sp.edit()
+                .putString("server_profiles", encryptedProfiles)
+                .putString("password", encryptedPassword)
+                .putString("cookie", encryptedCookie)
+                .commit()
+        } catch (_: Exception) {
+            // If secure storage fails, clear the credential slots rather than leaving
+            // legacy/plaintext values behind or silently weakening protection.
+            sp.edit()
+                .remove("server_profiles")
+                .remove("password")
+                .remove("cookie")
+                .apply()
+            false
         }
-        sp.edit().putString("server_profiles", Secret.encrypt(arr.toString())).apply()
     }
 
     fun sources(): MutableList<SourceConfig> {
@@ -635,6 +660,18 @@ class Prefs(ctx: Context) {
     var latestUrl: String
         get() = sp.getString("latest_url", "") ?: ""
         set(v) = sp.edit().putString("latest_url", v).apply()
+
+    var latestReleaseUrl: String
+        get() = sp.getString("latest_release_url", "") ?: ""
+        set(v) = sp.edit().putString("latest_release_url", v).apply()
+
+    var updateDownloadId: Long
+        get() = sp.getLong("update_download_id", -1L)
+        set(v) = sp.edit().putLong("update_download_id", v).apply()
+
+    var pendingUpdateInstallId: Long
+        get() = sp.getLong("pending_update_install_id", -1L)
+        set(v) = sp.edit().putLong("pending_update_install_id", v).apply()
     /** 远端最新 tag（空表示已是最新或还没检查过） */
     var latestTag: String
         get() = sp.getString("latest_tag", "") ?: ""

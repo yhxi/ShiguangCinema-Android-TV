@@ -2,15 +2,22 @@ package com.lshai.cloudscreen
 
 import android.app.Activity
 import android.app.AlertDialog
+import android.app.DownloadManager
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.pm.ActivityInfo
 import android.content.res.Configuration
 import android.content.Intent
+import android.content.IntentFilter
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.InsetDrawable
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
+import android.net.Uri
+import android.provider.Settings
 import android.text.InputType
 import android.view.Gravity
 import android.view.KeyEvent
@@ -84,6 +91,14 @@ class MainActivity : Activity() {
     private var updateBadgeBar: LinearLayout? = null
     private var updateBadge: TextView? = null
     private var manualUpdateCheckInProgress = false
+    private var updateDownloadReceiverRegistered = false
+    private val updateDownloadReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action != DownloadManager.ACTION_DOWNLOAD_COMPLETE) return
+            val id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L)
+            if (id >= 0 && id == prefs.updateDownloadId) handleUpdateDownload(id)
+        }
+    }
 
     /**
      * 按用途分槽的请求登记表。
@@ -306,6 +321,7 @@ class MainActivity : Activity() {
             prefs.latestTag = ""
             prefs.latestNotes = ""
             prefs.latestUrl = ""
+            prefs.latestReleaseUrl = ""
             prefs.lastUpdateCheck = 0L
         }
         api = Api(prefs.serverUrl.ifEmpty { BuildConfig.DEFAULT_URL })
@@ -344,6 +360,28 @@ class MainActivity : Activity() {
         super.onDestroy()
     }
 
+    override fun onStart() {
+        super.onStart()
+        if (!updateDownloadReceiverRegistered) {
+            val filter = IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE)
+            if (Build.VERSION.SDK_INT >= 33) {
+                registerReceiver(updateDownloadReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            } else {
+                @Suppress("DEPRECATION")
+                registerReceiver(updateDownloadReceiver, filter)
+            }
+            updateDownloadReceiverRegistered = true
+        }
+    }
+
+    override fun onStop() {
+        if (updateDownloadReceiverRegistered) {
+            unregisterReceiver(updateDownloadReceiver)
+            updateDownloadReceiverRegistered = false
+        }
+        super.onStop()
+    }
+
     override fun onPause() {
         homeMaintenanceJob?.cancel()
         favoriteCheckJob?.cancel()
@@ -354,6 +392,8 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         hideSystemUi()
+        resumePendingUpdateInstall()
+        if (prefs.updateDownloadId >= 0) handleUpdateDownload(prefs.updateDownloadId, notifyWhenRunning = false)
         // 从播放器返回时刷新首页，刚写入的续播记录立即可见。
         if (::root.isInitialized && currentScreen == "recommend" && recommendItems.isNotEmpty()) {
             showRecommend()
@@ -1370,21 +1410,28 @@ class MainActivity : Activity() {
     private fun maybeCheckUpdate() {
         val now = System.currentTimeMillis()
         if (now - prefs.lastUpdateCheck < 6 * 3600_000L) return
-        UpdateChecker.check { info ->
+        UpdateChecker.check { result ->
             prefs.lastUpdateCheck = now
-            if (info == null) return@check
-            if (UpdateChecker.isNewer(info.tag, BuildConfig.VERSION_NAME)) {
-                val firstSeen = prefs.latestTag != info.tag
-                prefs.latestTag = info.tag
-                prefs.latestNotes = info.notes
-                prefs.latestUrl = info.url
-                if (firstSeen) toast("发现新版本 ${info.tag}，首页右上角可查看")
-            } else {
-                prefs.latestTag = ""
-                prefs.latestNotes = ""
-                prefs.latestUrl = ""
+            when (result) {
+                is UpdateChecker.CheckResult.Success -> {
+                    val info = result.release
+                    if (UpdateChecker.isNewer(info.tag, BuildConfig.VERSION_NAME)) {
+                        val firstSeen = prefs.latestTag != info.tag
+                        prefs.latestTag = info.tag
+                        prefs.latestNotes = info.notes
+                        prefs.latestUrl = info.apkUrl
+                        prefs.latestReleaseUrl = info.releaseUrl
+                        if (firstSeen) toast("发现新版本 ${info.tag}，首页右上角可查看")
+                    } else {
+                        prefs.latestTag = ""
+                        prefs.latestNotes = ""
+                        prefs.latestUrl = ""
+                        prefs.latestReleaseUrl = ""
+                    }
+                    refreshUpdateBadge()
+                }
+                is UpdateChecker.CheckResult.Failure -> Unit
             }
-            refreshUpdateBadge()
         }
     }
 
@@ -1396,26 +1443,35 @@ class MainActivity : Activity() {
         }
         manualUpdateCheckInProgress = true
         toast("正在检查更新…")
-        UpdateChecker.check { info ->
+        UpdateChecker.check { result ->
             manualUpdateCheckInProgress = false
             prefs.lastUpdateCheck = System.currentTimeMillis()
-            if (info == null) {
-                toast("检查更新失败，请检查网络后重试")
-                return@check
-            }
-            if (UpdateChecker.isNewer(info.tag, BuildConfig.VERSION_NAME)) {
-                prefs.latestTag = info.tag
-                prefs.latestNotes = info.notes
-                prefs.latestUrl = info.url
-                prefs.updateBannerSeen = ""
-                toast("发现新版本 ${info.tag}")
-                showUpdateDetail(returnToRecommend = false)
-            } else {
-                prefs.latestTag = ""
-                prefs.latestNotes = ""
-                prefs.latestUrl = ""
-                toast("已是最新版本 v${BuildConfig.VERSION_NAME}")
-                refreshUpdateBadge()
+            when (result) {
+                is UpdateChecker.CheckResult.Success -> {
+                    val info = result.release
+                    if (UpdateChecker.isNewer(info.tag, BuildConfig.VERSION_NAME)) {
+                        prefs.latestTag = info.tag
+                        prefs.latestNotes = info.notes
+                        prefs.latestUrl = info.apkUrl
+                        prefs.latestReleaseUrl = info.releaseUrl
+                        prefs.updateBannerSeen = ""
+                        toast("发现新版本 ${info.tag}")
+                        showUpdateDetail(returnToRecommend = false)
+                    } else {
+                        prefs.latestTag = ""
+                        prefs.latestNotes = ""
+                        prefs.latestUrl = ""
+                        prefs.latestReleaseUrl = ""
+                        toast("已是最新版本 v${BuildConfig.VERSION_NAME}")
+                        refreshUpdateBadge()
+                    }
+                }
+                is UpdateChecker.CheckResult.Failure -> toast(when (result.reason) {
+                    UpdateChecker.FailureReason.NETWORK -> "网络连接失败，请检查网络后重试"
+                    UpdateChecker.FailureReason.RATE_LIMITED -> "GitHub 检查次数达到限制，请稍后再试"
+                    UpdateChecker.FailureReason.HTTP_ERROR -> "GitHub 暂时无法提供更新信息（HTTP ${result.httpCode ?: "?"}）"
+                    UpdateChecker.FailureReason.INVALID_RESPONSE -> "GitHub 返回的版本信息无法读取"
+                })
             }
         }
     }
@@ -1445,7 +1501,8 @@ class MainActivity : Activity() {
 
     private fun showUpdateDetail(returnToRecommend: Boolean = true) {
         val notes = prefs.latestNotes.ifEmpty { "（这个版本没有提供更新说明）" }
-        val url = prefs.latestUrl.ifEmpty { "https://github.com/yhxi/ShiguangCinema-Android-TV/releases" }
+        val releasePage = prefs.latestReleaseUrl.ifEmpty { "https://github.com/yhxi/ShiguangCinema-Android-TV/releases" }
+        val url = prefs.latestUrl.ifEmpty { releasePage }
 
         // 左栏：更新说明，内容长时可滚动
         val notesView = TextView(this).apply {
@@ -1484,7 +1541,7 @@ class MainActivity : Activity() {
                 setPadding(0, dp(12), 0, 0)
             })
             addView(TextView(this@MainActivity).apply {
-                setText(url)
+                setText(releasePage)
                 setTextColor(0xFF38BDF8.toInt())
                 setTextSize(11f)
                 setPadding(0, dp(6), 0, 0)
@@ -1502,14 +1559,110 @@ class MainActivity : Activity() {
             .setTitle("新版本 " + prefs.latestTag + "（当前 " + BuildConfig.VERSION_NAME + "）")
             .setView(row)
             .setNegativeButton("下载更新") { _, _ ->
-                runCatching {
-                    startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url)))
-                }.onFailure {
-                    toast("无法打开下载链接")
-                }
+                if (prefs.latestUrl.isNotBlank()) startUpdateDownload(prefs.latestUrl, prefs.latestTag)
+                else openReleasePage(releasePage)
             }
             .setPositiveButton("知道了") { _, _ -> if (returnToRecommend) showRecommend() }
             .show()
+    }
+
+    private fun openReleasePage(url: String) {
+        runCatching { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
+            .onFailure { toast("无法打开 GitHub 发布页") }
+    }
+
+    private fun startUpdateDownload(url: String, tag: String) {
+        val uri = runCatching { Uri.parse(url) }.getOrNull()
+        if (uri?.scheme != "https" || uri.host != "github.com") {
+            toast("更新下载地址无效，请打开 GitHub 发布页手动下载")
+            openReleasePage(prefs.latestReleaseUrl.ifEmpty { "https://github.com/yhxi/ShiguangCinema-Android-TV/releases" })
+            return
+        }
+        val manager = getSystemService(DownloadManager::class.java)
+        val existingId = prefs.updateDownloadId
+        if (existingId >= 0) {
+            val query = DownloadManager.Query().setFilterById(existingId)
+            manager.query(query)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    when (cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))) {
+                        DownloadManager.STATUS_PENDING, DownloadManager.STATUS_RUNNING, DownloadManager.STATUS_PAUSED -> {
+                            toast("更新正在下载")
+                            return
+                        }
+                        DownloadManager.STATUS_SUCCESSFUL -> {
+                            handleUpdateDownload(existingId)
+                            return
+                        }
+                    }
+                }
+            }
+            prefs.updateDownloadId = -1L
+        }
+        val request = DownloadManager.Request(uri)
+            .setTitle("时光影院更新")
+            .setDescription("正在下载 $tag")
+            .setMimeType("application/vnd.android.package-archive")
+            .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+            .setDestinationInExternalFilesDir(this, Environment.DIRECTORY_DOWNLOADS, "ShiguangCinema-$tag.apk")
+            .setAllowedOverMetered(true)
+            .setAllowedOverRoaming(false)
+        val id = runCatching { manager.enqueue(request) }.getOrElse {
+            toast("无法开始下载：${it.message ?: "请稍后重试"}")
+            return
+        }
+        prefs.pendingUpdateInstallId = -1L
+        prefs.updateDownloadId = id
+        toast("已开始下载 $tag，可在通知栏查看进度")
+    }
+
+    private fun handleUpdateDownload(id: Long, notifyWhenRunning: Boolean = true) {
+        val manager = getSystemService(DownloadManager::class.java)
+        manager.query(DownloadManager.Query().setFilterById(id))?.use { cursor ->
+            if (!cursor.moveToFirst()) {
+                if (prefs.updateDownloadId == id) prefs.updateDownloadId = -1L
+                return
+            }
+            when (cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))) {
+                DownloadManager.STATUS_SUCCESSFUL -> installDownloadedUpdate(id)
+                DownloadManager.STATUS_FAILED -> {
+                    val reason = cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_REASON))
+                    prefs.updateDownloadId = -1L
+                    toast("更新下载失败（错误 $reason），请检查网络后重试")
+                }
+                else -> if (notifyWhenRunning) toast("更新仍在下载中")
+            }
+        }
+    }
+
+    private fun installDownloadedUpdate(id: Long) {
+        val manager = getSystemService(DownloadManager::class.java)
+        val apkUri = manager.getUriForDownloadedFile(id)
+        if (apkUri == null) {
+            prefs.updateDownloadId = -1L
+            toast("找不到已下载的安装包，请重新下载")
+            return
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !packageManager.canRequestPackageInstalls()) {
+            prefs.pendingUpdateInstallId = id
+            runCatching {
+                startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName")))
+            }.onFailure { toast("请在系统设置中允许此应用安装未知应用") }
+            return
+        }
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(apkUri, "application/vnd.android.package-archive")
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        runCatching { startActivity(intent) }
+            .onSuccess { prefs.pendingUpdateInstallId = -1L; prefs.updateDownloadId = -1L }
+            .onFailure { toast("无法打开系统安装器：${it.message ?: "请检查安装权限"}") }
+    }
+
+    private fun resumePendingUpdateInstall() {
+        val id = prefs.pendingUpdateInstallId
+        if (id < 0 || Build.VERSION.SDK_INT < Build.VERSION_CODES.O || !packageManager.canRequestPackageInstalls()) return
+        prefs.pendingUpdateInstallId = -1L
+        installDownloadedUpdate(id)
     }
 
     /** 把任意文本渲染成二维码位图（复用 ZXing） */
@@ -2114,9 +2267,8 @@ class MainActivity : Activity() {
                 // 只换 Api 绑定，保留已下载的海报缓存（重建 loader 会白下一遍图）
                 imageLoader.updateApi(candidate)
                 prefs.serverUrl = url
-                prefs.password = pw
-                prefs.cookie = candidate.currentCookie().orEmpty()
-                prefs.rememberServer(url, pw, prefs.cookie)
+                val savedSecurely = prefs.rememberServer(url, pw, candidate.currentCookie().orEmpty())
+                if (!savedSecurely) toast("已连接，但设备无法安全保存密码，下次连接需重新输入")
                 toast(if (verified) "已连接 v${st.version}" else "已连接，但登录未生效")
                 seedLiveFromServer(st)
                 seedDefaultSourcesAsync(st)
