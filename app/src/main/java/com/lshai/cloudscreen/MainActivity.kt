@@ -820,9 +820,9 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(16), dp(9), dp(20), dp(9))
             background = GradientDrawable().apply {
-                setColor(0xF21F2430.toInt())
+                setColor(Color.WHITE)
                 cornerRadius = dp(22).toFloat()
-                setStroke(dp(1), 0x33FFFFFF)
+                setStroke(dp(1), BORDER)
             }
             visibility = View.GONE
             addView(
@@ -3963,40 +3963,60 @@ class MainActivity : Activity() {
         }
         // 详情页以前只有 BACK 键能回去，遥控器用户进来就「出不去」了
         col.addView(topBar())
-        // 封面 + 文字信息做成头部：电视上纯文字太干，有封面能一眼确认是不是要找的那部片
+        // 手机只在封面旁放标题和摘要；长文本放到下方，避免把选集列表挤出屏幕。
         val header = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         val cover = ImageView(this).apply {
             scaleType = ImageView.ScaleType.CENTER_CROP
             setBackgroundColor(Color.parseColor("#1a2233"))
         }
-        header.addView(cover, LinearLayout.LayoutParams(dp(150), dp(220)))
+        header.addView(cover, LinearLayout.LayoutParams(dp(if (compact) 108 else 150), dp(if (compact) 158 else 220)))
 
         val info = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(24), 0, 0, 0)
+            setPadding(dp(if (compact) 14 else 24), 0, 0, 0)
         }
-        info.addView(titleText(detail.info.title.ifEmpty { item.name }, 24f))
+        info.addView(titleText(detail.info.title.ifEmpty { item.name }, if (compact) 21f else 24f).apply {
+            maxLines = 2
+            ellipsize = android.text.TextUtils.TruncateAt.END
+        })
         info.addView(hintText(listOfNotNull(
             detail.info.year.takeIf { it.isNotEmpty() },
             detail.info.area.takeIf { it.isNotEmpty() },
             detail.info.remarks.takeIf { it.isNotEmpty() },
             item.sourceName,
             "共 ${detail.episodes.size} 集",
-        ).joinToString(" · ")))
+        ).joinToString(" · ")).apply {
+            maxLines = if (compact) 3 else 4
+            ellipsize = android.text.TextUtils.TruncateAt.END
+        })
+        fun addPreview(text: String, heading: String, lines: Int, target: LinearLayout) {
+            target.addView(hintText(text).apply {
+                maxLines = lines
+                ellipsize = android.text.TextUtils.TruncateAt.END
+                setOnClickListener {
+                    AlertDialog.Builder(this@MainActivity)
+                        .setTitle(heading)
+                        .setMessage(text)
+                        .setPositiveButton("关闭", null)
+                        .show()
+                }
+            })
+        }
+        val extraInfo = if (compact) col else info
         if (detail.info.actor.isNotEmpty()) {
-            info.addView(hintText("主演：${detail.info.actor}"))
+            // 采集站有时返回数百名演员，只显示两行；点开仍能看完整名单。
+            if (!compact) addPreview("主演：${detail.info.actor}", "主演", 3, info)
         }
         if (detail.info.desc.isNotEmpty()) {
-            info.addView(TextView(this).apply {
-                setText(stripHtml(detail.info.desc))
-                setTextColor(Color.parseColor("#94a3b8"))
-                setTextSize(14f)
-                maxLines = 5
-            })
+            if (!compact) addPreview(stripHtml(detail.info.desc), "简介", 5, info)
         }
         header.addView(info, LinearLayout.LayoutParams(
             0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         col.addView(header)
+        if (compact) {
+            if (detail.info.actor.isNotEmpty()) addPreview("主演：${detail.info.actor}", "主演", 2, extraInfo)
+            if (detail.info.desc.isNotEmpty()) addPreview(stripHtml(detail.info.desc), "简介", 3, extraInfo)
+        }
 
         val coverUrl = detail.info.cover.ifEmpty { item.pic }
         if (coverUrl.isNotEmpty()) {
