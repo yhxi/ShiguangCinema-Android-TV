@@ -81,6 +81,8 @@ class MainActivity : Activity() {
     private lateinit var imageLoader: ImageLoader
     private lateinit var root: FrameLayout
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private var updateBadgeBar: LinearLayout? = null
+    private var updateBadge: TextView? = null
 
     /**
      * 按用途分槽的请求登记表。
@@ -297,6 +299,14 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         CrashLog.install(this)
         prefs = Prefs(this)
+        // Discard update metadata left by older builds that followed the upstream project.
+        if (prefs.latestTag.isNotEmpty() &&
+            !prefs.latestUrl.contains("yhxi/ShiguangCinema-Android-TV", ignoreCase = true)) {
+            prefs.latestTag = ""
+            prefs.latestNotes = ""
+            prefs.latestUrl = ""
+            prefs.lastUpdateCheck = 0L
+        }
         api = Api(prefs.serverUrl.ifEmpty { BuildConfig.DEFAULT_URL })
         api.restoreCookie(prefs.cookie)
         imageLoader = ImageLoader(this, api)
@@ -310,6 +320,7 @@ class MainActivity : Activity() {
         applySafeArea()
 
         if (prefs.serverUrl.isEmpty()) showSetup() else showBoot()
+        maybeCheckUpdate()
     }
 
     /**
@@ -1343,12 +1354,124 @@ class MainActivity : Activity() {
 
     /** 设置页只显示版本；许可与来源信息保留在项目 LICENSE / THIRD-PARTY.md。 */
     private fun githubFooter(): TextView = TextView(this).apply {
-        text = "时光影院 v${BuildConfig.VERSION_NAME}（测试版）"
+        text = "时光影院 v${BuildConfig.VERSION_NAME}" +
+            if (BuildConfig.TEST_BUILD) "（测试版）" else ""
         setTextColor(BRIGHTER_TEXT)
         setTextSize(13f)
         gravity = Gravity.CENTER
         setPadding(0, dp(22), 0, dp(14))
     }
+    /**
+     * 更新检测：每次启动最多检查一次，且 6 小时内不重复请求。
+     * 请求只发一次（8 秒超时）；拿不到就放弃——失败也算作"已检查"，不会反复重试，
+     * 同时保留已知的新版本标记，不因一次断网就把提示抹掉。
+     */
+    private fun maybeCheckUpdate() {
+        val now = System.currentTimeMillis()
+        if (now - prefs.lastUpdateCheck < 6 * 3600_000L) return
+        UpdateChecker.check { info ->
+            prefs.lastUpdateCheck = now
+            if (info == null) return@check
+            if (UpdateChecker.isNewer(info.tag, BuildConfig.VERSION_NAME)) {
+                val firstSeen = prefs.latestTag != info.tag
+                prefs.latestTag = info.tag
+                prefs.latestNotes = info.notes
+                prefs.latestUrl = info.url
+                if (firstSeen) toast("发现新版本 ${info.tag}，首页右上角可查看")
+            } else {
+                prefs.latestTag = ""
+                prefs.latestNotes = ""
+                prefs.latestUrl = ""
+            }
+            refreshUpdateBadge()
+        }
+    }
+
+    private fun refreshUpdateBadge() {
+        if (currentScreen != "recommend") return
+        val bar = updateBadgeBar ?: return
+        updateBadge?.let { bar.removeView(it) }
+        updateBadge = updateCapsule()
+        updateBadge?.let { bar.addView(it) }
+    }
+    /* --------------------------------------------------------- 更新提示 */
+
+    /** 首页右上角的更新胶囊：有新版本且开关打开时才出现 */
+    private fun updateCapsule(): TextView? {
+        if (!prefs.updateBannerEnabled) return null
+        val tag = prefs.latestTag
+        if (!UpdateChecker.isNewer(tag, BuildConfig.VERSION_NAME)) return null
+        val unseen = prefs.updateBannerSeen != tag
+        return button(if (unseen) "● 新版本 $tag" else "新版本 $tag") {
+            prefs.updateBannerSeen = tag
+            showUpdateDetail()
+        }.apply {
+            if (!unseen) setTextColor(0xFF94A3B8.toInt())
+        }
+    }
+
+    private fun showUpdateDetail() {
+        val notes = prefs.latestNotes.ifEmpty { "（这个版本没有提供更新说明）" }
+        val url = prefs.latestUrl.ifEmpty { "https://github.com/yhxi/ShiguangCinema-Android-TV/releases" }
+
+        // 左栏：更新说明，内容长时可滚动
+        val notesView = TextView(this).apply {
+            setText(notes)
+            setTextColor(Color.parseColor("#cbd5e1"))
+            setTextSize(14f)
+            setLineSpacing(dp(5).toFloat(), 1f)
+            setPadding(0, 0, dp(20), 0)
+        }
+        val notesScroll = android.widget.ScrollView(this).apply {
+            addView(notesView)
+            layoutParams = LinearLayout.LayoutParams(0, dp(300), 1f)
+        }
+
+        // 右栏：白色圆角卡片包住二维码，下面跟一行提示
+        val qrCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+            background = android.graphics.drawable.GradientDrawable().apply {
+                setColor(android.graphics.Color.WHITE)
+                cornerRadius = dp(12).toFloat()
+            }
+        }
+        qrBitmap(url, dp(168))?.let { bmp ->
+            qrCard.addView(ImageView(this).apply { setImageBitmap(bmp) })
+        }
+        val right = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            addView(qrCard, LinearLayout.LayoutParams(dp(196), dp(196)))
+            addView(TextView(this@MainActivity).apply {
+                setText("扫码下载")
+                setTextColor(Color.parseColor("#94a3b8"))
+                setTextSize(13f)
+                setPadding(0, dp(12), 0, 0)
+            })
+            addView(TextView(this@MainActivity).apply {
+                setText(url)
+                setTextColor(0xFF38BDF8.toInt())
+                setTextSize(11f)
+                setPadding(0, dp(6), 0, 0)
+            })
+        }
+
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(24), dp(18), dp(24), dp(4))
+            addView(notesScroll)
+            addView(right)
+        }
+
+        AlertDialog.Builder(this)
+            .setTitle("新版本 " + prefs.latestTag + "（当前 " + BuildConfig.VERSION_NAME + "）")
+            .setView(row)
+            .setPositiveButton("知道了") { _, _ -> showRecommend() }
+            .show()
+    }
+
     /** 把任意文本渲染成二维码位图（复用 ZXing） */
     private fun qrBitmap(text: String, sizePx: Int): android.graphics.Bitmap? = runCatching {
         val matrix = com.google.zxing.qrcode.QRCodeWriter()
@@ -1805,7 +1928,7 @@ class MainActivity : Activity() {
         section("观影设置")
         row("sources", "片源管理", "点播源 ${prefs.sources().count { it.enabled }} 个已启用 · 管理可用线路") { showSources() }
         row("tv", "播放设置", "续播、画质、缓冲与跳过片头片尾") { showPlaySettings() }
-        row("setup", "切换服务端", "tvoracle / tvworker 一键登录，也可手动填写") { showServerSettings() }
+        row("setup", "切换服务端", "选择预设服务端，输入密码连接") { showServerSettings() }
         section("维护工具")
         row("history", "清理缓存", "管理本地缓存占用") { showClearCache() }
         row("search", "网络诊断", "检测连接和片源响应") {
@@ -1829,7 +1952,7 @@ class MainActivity : Activity() {
         }
         col.addView(topBar())
         col.addView(titleText("服务器设置", 20f))
-        col.addView(hintText("点预设卡片即可自动填入并登录；也可以在下方手动填写"))
+        col.addView(hintText("点预设卡片选择服务器，再在下方输入密码连接"))
 
         // 输入框先创建、稍后再挂到页面上 —— 预设卡片要显示在最上面，
         // 但点卡片时需要能直接改这两个框的内容。
@@ -1862,7 +1985,11 @@ class MainActivity : Activity() {
                 setOnClickListener {
                     urlField.setText(preset.url)
                     pwdField.setText(preset.password)
-                    doLogin()
+                    if (preset.password.isNotEmpty()) doLogin()
+                    else {
+                        pwdField.requestFocus()
+                        toast("请输入服务端密码后连接")
+                    }
                 }
             }
             val words = LinearLayout(this).apply {
@@ -1877,7 +2004,7 @@ class MainActivity : Activity() {
             })
             card.addView(words, LinearLayout.LayoutParams(0, -2, 1f))
             card.addView(TextView(this).apply {
-                text = if (current) "已连接" else "一键登录 ›"
+                text = if (current) "已连接" else if (preset.password.isEmpty()) "填写密码 ›" else "一键登录 ›"
                 setTextColor(ACCENT)
                 setTextSize(14f)
             })
@@ -4571,6 +4698,9 @@ class MainActivity : Activity() {
             brandRow(),
             LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f),
         )
+        updateBadgeBar = brandBar
+        updateBadge = updateCapsule()
+        updateBadge?.let { brandBar.addView(it) }
         col.addView(brandBar)
         homeHistoryFirst = null
         // 启动阶段的状态行：非模态，不挡任何操作，连上后自动消失

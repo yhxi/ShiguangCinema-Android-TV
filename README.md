@@ -13,15 +13,15 @@
 
 需要 JDK 25、Android SDK API 37。请在本机的 local.properties 配置 SDK 路径，然后运行 gradlew.bat :app:assembleDebug。
 
-一键登录的预设密码仅从仓库根目录的 server-presets.properties 读取。该文件已被 Git 忽略；缺少它时仍可构建，但受密码保护的预设需要手动输入。文件格式：
+调试版的一键登录密码仅从仓库根目录的 server-presets.properties 读取。该文件已被 Git 忽略；正式发布版始终不内置密码，家人首次使用时需要手动输入。文件格式：
 
     cloudscreen.tvworkerPassword=填写本机密码
     cloudscreen.tvoraclePassword=填写本机密码
 
-签名所需的 keystore.properties 与 keystore/ 也只保存在本机，不提交到仓库。发给家人的 APK 仍包含一键登录密码，请只在信任的人之间分享。
+签名所需的 keystore.properties 与 keystore/ 也只保存在本机，不提交到仓库。正式发布版 APK 不含预设密码。旧版 APK 曾包含密码，公开发布前应更换旧密码。
 
 详细功能和版本记录见 README-CLOUDSCREEN.md。
 
 ## 许可与来源
 
-代码遵循 GPL-3.0，许可证见 LICENSE。项目包含源自 DpadTV 的代码，相关归属见 THIRD-PARTY.md；时光影院的版本发布和更新渠道独立于上游。
+代码遵循 GPL-3.0，许可证见 LICENSE。项目包含源自 DpadTV 的代码，相关归属见 THIRD-PARTY.md；时光影院从本仓库的 GitHub Releases 检查新版本，不使用上游更新渠道。

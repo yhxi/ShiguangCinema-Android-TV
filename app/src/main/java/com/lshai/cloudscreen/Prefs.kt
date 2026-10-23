@@ -617,6 +617,33 @@ class Prefs(ctx: Context) {
         }
     }
 
+    /** 首页右上角更新提示开关（关闭后只在设置页页脚显示红点） */
+    var updateBannerEnabled: Boolean
+        get() = sp.getBoolean("update_banner", true)
+        set(v) = sp.edit().putBoolean("update_banner", v).apply()
+
+    /** 已经看过详情的版本 tag，用于把胶囊从"未读"变成普通状态 */
+    var updateBannerSeen: String
+        get() = sp.getString("update_banner_seen", "") ?: ""
+        set(v) = sp.edit().putString("update_banner_seen", v).apply()
+
+    /** 最新版本的更新说明与页面地址（首页胶囊点开时展示） */
+    var latestNotes: String
+        get() = sp.getString("latest_notes", "") ?: ""
+        set(v) = sp.edit().putString("latest_notes", v).apply()
+
+    var latestUrl: String
+        get() = sp.getString("latest_url", "") ?: ""
+        set(v) = sp.edit().putString("latest_url", v).apply()
+    /** 远端最新 tag（空表示已是最新或还没检查过） */
+    var latestTag: String
+        get() = sp.getString("latest_tag", "") ?: ""
+        set(v) = sp.edit().putString("latest_tag", v).apply()
+
+    /** 上次检查更新的时间戳，避免每次启动都请求 */
+    var lastUpdateCheck: Long
+        get() = sp.getLong("last_update_check", 0L)
+        set(v) = sp.edit().putLong("last_update_check", v).apply()
     /** 播放进度存在 pos:<hash> 键里，这里统计并整体清掉 */
     fun progressCount(): Int = sp.all.keys.count { it.startsWith("pos:") }
 

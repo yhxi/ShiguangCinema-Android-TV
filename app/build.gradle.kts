@@ -36,8 +36,8 @@ android {
         // 23 = Android 6.0：Media3 的下限之上，老盒子都能装
         minSdk = 23
         targetSdk = 37
-        versionCode = 29
-        versionName = "1.0.0"
+        versionCode = 30
+        versionName = "1.0.1"
     }
 
     signingConfigs {
@@ -53,6 +53,10 @@ android {
 
     buildTypes {
         release {
+            buildConfigField("boolean", "TEST_BUILD", "false")
+            // Public Releases must never contain the local one-click credentials.
+            buildConfigField("String", "TVWORKER_PASSWORD", "\"\"")
+            buildConfigField("String", "TVORACLE_PASSWORD", "\"\"")
             // R8 混淆 + 压缩：dex 从 8.6MB 缩到 ~2MB，APK 4.8MB → 2.5MB 左右。
             // 项目无反射调用，media3 / zxing / coroutines 自带 consumer rules；
             // AndroidManifest 登记的四大组件 R8 自动 keep。
@@ -64,6 +68,9 @@ android {
             if (hasSigning) signingConfig = signingConfigs.getByName("release")
         }
         debug {
+            buildConfigField("boolean", "TEST_BUILD", "true")
+            buildConfigField("String", "TVWORKER_PASSWORD", javaString(presetProps.getProperty("cloudscreen.tvworkerPassword", "")))
+            buildConfigField("String", "TVORACLE_PASSWORD", javaString(presetProps.getProperty("cloudscreen.tvoraclePassword", "")))
             // 调试包也用同一把密钥签名：以后从测试版换正式版不用卸载重装
             if (hasSigning) signingConfig = signingConfigs.getByName("release")
         }
@@ -78,20 +85,9 @@ android {
         buildConfig = true
     }
 
-    // 加 -Pdpadtv.release=true 构建就不带"测试版"字样；平时构建默认是测试版
-    defaultConfig {
-        buildConfigField(
-            "boolean",
-            "TEST_BUILD",
-            if (project.findProperty("dpadtv.release") == "true") "false" else "true",
-        )
-    }
-
     defaultConfig {
         buildConfigField("String", "DEFAULT_URL", "\"https://tv.20350720.xyz/\"")
         buildConfigField("String", "DEFAULT_PASSWORD", "\"\"")
-        buildConfigField("String", "TVWORKER_PASSWORD", javaString(presetProps.getProperty("cloudscreen.tvworkerPassword", "")))
-        buildConfigField("String", "TVORACLE_PASSWORD", javaString(presetProps.getProperty("cloudscreen.tvoraclePassword", "")))
     }
 
     lint {
