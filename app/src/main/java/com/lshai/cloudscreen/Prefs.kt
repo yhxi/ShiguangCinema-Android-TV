@@ -174,6 +174,17 @@ class Prefs(ctx: Context) {
         return if (k.isEmpty()) 0L else sp.getLong(k, 0L)
     }
 
+    /** 详情页批量标记已看集数：剧名只归一化一次，长剧不必每集重新跑正则。 */
+    fun watchedEpisodes(series: String, urls: List<String>, thresholdMs: Long): BooleanArray {
+        val normalized = normalizeSeries(series)
+        return BooleanArray(urls.size) { index ->
+            val byUrl = sp.getLong("pos:" + urls[index].hashCode(), 0L)
+            val byEpisode = if (normalized.isEmpty()) 0L else
+                sp.getLong("ep:" + (normalized + "#" + index).hashCode(), 0L)
+            maxOf(byUrl, byEpisode) > thresholdMs
+        }
+    }
+
     fun saveEpisodeProgress(series: String, index: Int, positionMs: Long) {
         val k = episodeKey(series, index)
         if (k.isEmpty() || positionMs <= 5_000L) return

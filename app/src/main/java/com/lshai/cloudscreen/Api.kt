@@ -99,7 +99,7 @@ class HttpError(val status: Int, val body: String) : Exception("HTTP $status")
 class Api(baseUrl: String) {
 
     val baseUrl: String = baseUrl.trimEnd('/')
-    private var cookie: String? = null
+    @Volatile private var cookie: String? = null
 
     fun restoreCookie(value: String?) {
         cookie = value?.takeIf { it.isNotEmpty() }

@@ -100,6 +100,7 @@ class MainActivity : Activity() {
     private var updateProgressDialog: AlertDialog? = null
     private var updateProgressBar: ProgressBar? = null
     private var updateProgressText: TextView? = null
+    private var refreshHomeAfterPlayback = false
 
     /**
      * 按用途分槽的请求登记表。
@@ -359,6 +360,7 @@ class MainActivity : Activity() {
         hotSearchJob?.cancel()
         qrServer?.stop()
         scope.cancel()
+        imageLoader.close()
         super.onDestroy()
     }
 
@@ -373,10 +375,12 @@ class MainActivity : Activity() {
         super.onResume()
         hideSystemUi()
         resumePendingUpdateInstall()
-        // 从播放器返回时刷新首页，刚写入的续播记录立即可见。
-        if (::root.isInitialized && currentScreen == "recommend" && recommendItems.isNotEmpty()) {
+        // 只在从播放器返回时重建首页；首次 onResume 和从系统界面返回无需白画一遍。
+        if (refreshHomeAfterPlayback && ::root.isInitialized &&
+            currentScreen == "recommend" && recommendItems.isNotEmpty()) {
             showRecommend()
         }
+        refreshHomeAfterPlayback = false
     }
 
     /** 子页面（如网络诊断）点「← 返回主页」时带着 nav_home 回来，直接落到首页 */
@@ -1035,11 +1039,11 @@ class MainActivity : Activity() {
      * 用户立刻看到熟悉的首页，能直接点搜索/设置，连上后海报自动补上。
      */
     private fun showBoot() {
-        bootNotice = "正在加载…"
         bootFailed = false
         // 连上之后再拉推荐，避免还没连上就先发一轮注定失败的请求
         recommendRequested = true
         primeRecommendFromCache()   // 有缓存就先把海报墙画出来
+        bootNotice = if (recommendItems.isEmpty()) "正在加载…" else null
         showRecommend()
         autoConnect(silent = true)
     }
@@ -3833,13 +3837,20 @@ class MainActivity : Activity() {
      * 全部成功时完全不碰服务端。
      */
     private fun directThenServerSearch(kw: String, sources: List<SourceConfig>): SearchResult {
-        val directable = sources.filter { DirectCms.isEligible(it) }
+        val directable = sources.filter { DirectCms.shouldTryDirect(it) }
         if (directable.isEmpty()) return api.search(kw, sources)
 
         val items = ArrayList<SearchItem>()
         val failed = ArrayList<SourceConfig>()
-        val pool = java.util.concurrent.Executors.newFixedThreadPool(directable.size.coerceAtMost(4))
+        val serverOnly = sources.filter { it !in directable }
+        val pool = java.util.concurrent.Executors.newFixedThreadPool(
+            directable.size.coerceAtMost(4) + if (serverOnly.isEmpty()) 0 else 1,
+        )
         try {
+            // HTTP / 非标准 CMS 源必须经服务端；与可直连源同时发起，避免两段网络耗时相加。
+            val serverTask = if (serverOnly.isEmpty()) null else pool.submit(
+                java.util.concurrent.Callable { api.search(kw, serverOnly) },
+            )
             val tasks = directable.map { s ->
                 s to pool.submit(java.util.concurrent.Callable { DirectCms.search(s, kw) })
             }
@@ -3852,22 +3863,25 @@ class MainActivity : Activity() {
                 }
                 if (got.isNullOrEmpty()) failed.add(s) else items.addAll(got)
             }
+            // 直连失败仍经服务端补查，保持原来的结果完整性。
+            val fallbackTask = if (failed.isEmpty()) null else pool.submit(
+                java.util.concurrent.Callable { api.search(kw, failed) },
+            )
+            var failures = 0
+            for (task in listOfNotNull(serverTask, fallbackTask)) {
+                val result = task.get()
+                items.addAll(result.items)
+                failures += result.failures
+            }
+            return SearchResult(items.distinctBy { it.sourceUrl + "|" + it.vodId }, failures)
         } finally {
             pool.shutdownNow()
         }
-
-        val needServer = sources.filter { it !in directable } + failed
-        if (needServer.isEmpty()) {
-            return SearchResult(items.distinctBy { it.sourceUrl + "|" + it.vodId }, 0)
-        }
-        val r = api.search(kw, needServer)
-        items.addAll(r.items)
-        return SearchResult(items.distinctBy { it.sourceUrl + "|" + it.vodId }, r.failures)
     }
 
     /** 详情：能直连就直连，拿不到再回退服务端（行为与服务端 /api/detail 对齐） */
     private fun directDetailOrServer(vodId: String, source: SourceConfig): Detail {
-        if (DirectCms.isEligible(source)) {
+        if (DirectCms.shouldTryDirect(source)) {
             val d = runCatching { DirectCms.detail(source, vodId) }.getOrNull()
             if (d != null && d.episodes.isNotEmpty()) return d
         }
@@ -4059,12 +4073,7 @@ class MainActivity : Activity() {
         val marked = prefs.resumeThresholdSeconds * 1000L
         // 两份记录都看：按地址的 + 按「剧名+集号」的（换源之后地址变了，后者才认得出来）
         val progressKey = detail.info.title.ifEmpty { item.name }
-        val watched = BooleanArray(detail.episodes.size) { idx ->
-            maxOf(
-                prefs.progressOf(detail.episodes[idx]),
-                prefs.episodeProgressOf(progressKey, idx),
-            ) > marked
-        }
+        val watched = prefs.watchedEpisodes(progressKey, detail.episodes, marked)
         val lastIdx = if (prefs.resumeEnabled) watched.indexOfLast { it } else -1
         if (lastIdx >= 0) {
             col.addView(
@@ -4200,6 +4209,7 @@ class MainActivity : Activity() {
         sourceName: String = "",
     ) {
         if (urls.isEmpty()) return
+        refreshHomeAfterPlayback = true
         startActivity(Intent(this, PlayerActivity::class.java).apply {
             putStringArrayListExtra(PlayerActivity.EXTRA_URLS, ArrayList(urls))
             putExtra(PlayerActivity.EXTRA_INDEX, index.coerceIn(0, urls.size - 1))

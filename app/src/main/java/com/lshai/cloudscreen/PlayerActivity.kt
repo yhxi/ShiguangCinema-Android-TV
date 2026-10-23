@@ -2410,7 +2410,7 @@ class PlayerActivity : Activity() {
 
     /** 详情：能直连就直连，拿不到再回退服务端 —— 选集回查也走这条，比绕服务端快 */
     private fun detailOf(id: String, conf: SourceConfig, api: Api): Detail {
-        if (DirectCms.isEligible(conf)) {
+        if (DirectCms.shouldTryDirect(conf)) {
             val d = runCatching { DirectCms.detail(conf, id) }.getOrNull()
             if (d != null && d.episodes.isNotEmpty()) return d
         }

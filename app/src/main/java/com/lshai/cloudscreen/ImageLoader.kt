@@ -51,7 +51,10 @@ class ImageLoader(private val context: Context, api: Api) {
     // 3 个线程时，24 张海报要分 8 批发；每张即使只要 0.5 秒也要 4 秒才铺满。
     // 提到 6 个：弱网下再多会互相抢带宽，反而让单张更慢。
     private val pool = Executors.newFixedThreadPool(6)
+    // 磁盘压缩单独排队，不占用下载线程；首屏后续海报无需等前一张落盘。
+    private val diskPool = Executors.newSingleThreadExecutor()
     private val main = Handler(Looper.getMainLooper())
+    @Volatile private var closed = false
 
     /** 正在下载的图：同一个 key 的后续请求排队等结果，不再各自发起下载 */
     private val inFlight = ConcurrentHashMap<String, MutableList<(Bitmap?) -> Unit>>()
@@ -62,6 +65,7 @@ class ImageLoader(private val context: Context, api: Api) {
     private val diskScanned = AtomicBoolean(false)
 
     fun load(url: String, reqWidth: Int, reqHeight: Int, onReady: (Bitmap?) -> Unit) {
+        if (closed) return
         if (url.isEmpty()) {
             onReady(null)
             return
@@ -81,11 +85,21 @@ class ImageLoader(private val context: Context, api: Api) {
             inFlight[key] = mutableListOf(onReady)
         }
         pool.execute {
-            val bmp = readFromDisk(key) ?: download(url, reqWidth, reqHeight)?.also {
-                writeToDisk(key, it)
+            val cached = readFromDisk(key)
+            val bmp = cached ?: download(url, reqWidth, reqHeight)
+            // 先交给界面显示，再在后台写磁盘。JPEG 压缩不应挡住首张海报出现。
+            main.post { if (!closed) deliver(key, bmp) }
+            if (cached == null && bmp != null && !closed) {
+                runCatching { diskPool.execute { writeToDisk(key, bmp) } }
             }
-            main.post { deliver(key, bmp) }
         }
+    }
+
+    fun close() {
+        closed = true
+        pool.shutdownNow()
+        diskPool.shutdown()
+        synchronized(inFlight) { inFlight.clear() }
     }
 
     private fun deliver(key: String, bmp: Bitmap?) {
@@ -141,6 +155,7 @@ class ImageLoader(private val context: Context, api: Api) {
     private fun writeToDisk(key: String, bmp: Bitmap) {
         runCatching {
             if (!diskDir.exists()) diskDir.mkdirs()
+            ensureDiskScanned()
             val target = diskFile(key)
             val tmp = File(diskDir, target.name + ".tmp")
             val ok = tmp.outputStream().use { out ->
@@ -156,7 +171,6 @@ class ImageLoader(private val context: Context, api: Api) {
                 tmp.delete()
                 return
             }
-            ensureDiskScanned()
             diskBytes.addAndGet(target.length())
             trimDiskIfNeeded()
         }

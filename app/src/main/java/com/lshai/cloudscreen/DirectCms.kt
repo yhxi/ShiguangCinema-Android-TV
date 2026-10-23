@@ -27,6 +27,9 @@ object DirectCms {
     private const val UA = "okhttp/3.12.0"
     private const val CONNECT_TIMEOUT_MS = 3_500
     private const val READ_TIMEOUT_MS = 6_000
+    private const val DIRECT_RETRY_DELAY_MS = 5 * 60_000L
+    private data class Failure(val count: Int, val retryAt: Long)
+    private val failures = HashMap<String, Failure>()
 
     fun isEligible(src: SourceConfig): Boolean {
         val u = src.url
@@ -35,9 +38,31 @@ object DirectCms {
         return u.contains("/api.php") || u.contains("/provide/vod")
     }
 
+    /** 直连连续失败两次后短暂改走服务端，避免每次搜索都先白等直连超时。 */
+    fun shouldTryDirect(src: SourceConfig): Boolean =
+        isEligible(src) && synchronized(failures) {
+            (failures[src.url]?.retryAt ?: 0L) <= android.os.SystemClock.elapsedRealtime()
+        }
+
+    private fun recordFailure(url: String) {
+        val now = android.os.SystemClock.elapsedRealtime()
+        synchronized(failures) {
+            val previous = failures[url]
+            val count = if (previous == null || previous.retryAt > 0L) 1 else previous.count + 1
+            failures[url] = Failure(count, if (count >= 2) now + DIRECT_RETRY_DELAY_MS else 0L)
+        }
+    }
+
+    private fun getSourceJson(src: SourceConfig, url: String): JSONObject = try {
+        getJson(url).also { synchronized(failures) { failures.remove(src.url) } }
+    } catch (e: Exception) {
+        recordFailure(src.url)
+        throw e
+    }
+
     /** 搜索。失败直接抛异常，由调用方决定是否回退服务端。 */
     fun search(src: SourceConfig, keyword: String): List<SearchItem> {
-        val root = getJson(buildUrl(src.url, keyword))
+        val root = getSourceJson(src, buildUrl(src.url, keyword))
         val list = root.optJSONArray("list") ?: return emptyList()
         val out = ArrayList<SearchItem>(list.length())
         for (i in 0 until list.length()) {
@@ -63,7 +88,7 @@ object DirectCms {
 
     /** 详情。返回的 episodes 已是纯播放地址数组，和服务端 /api/detail 对齐。 */
     fun detail(src: SourceConfig, vodId: String): Detail {
-        val root = getJson(buildUrl(src.url, null, vodId))
+        val root = getSourceJson(src, buildUrl(src.url, null, vodId))
         val item = root.optJSONArray("list")?.optJSONObject(0)
             ?: throw IllegalStateException("详情为空")
         val urls = parsePlayUrls(item.optString("vod_play_url", ""))
