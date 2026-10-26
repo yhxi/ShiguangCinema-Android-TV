@@ -35,6 +35,7 @@ import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.media3.common.C
+import androidx.media3.common.Format
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
 import androidx.media3.common.TrackSelectionOverride
@@ -139,6 +140,7 @@ class PlayerActivity : Activity() {
     private lateinit var speedActionBtn: TextView
     /** 手机底部一级菜单里的倍速按钮（和遥控器操作栏那个共用一份标签） */
     private var speedBarBtn: TextView? = null
+    private var qualityBarBtn: TextView? = null
     private var introBarBtn: TextView? = null
     private var outroBarBtn: TextView? = null
     /** 暂停时浮在画面正中的播放按钮：点中间暂停之后，继续播就在原地 */
@@ -246,6 +248,9 @@ class PlayerActivity : Activity() {
     private var stopAtEpisodeEnd = false
     /** 方向锁：竖屏片源会自动转竖屏，但侧躺看的时候不希望它跟着转 */
     private var orientationLocked = false
+    private var currentVideoWidth = 0
+    private var currentVideoHeight = 0
+    private var selectedQualityLabel: String? = null
 
     private val handler = Handler(Looper.getMainLooper())
 
@@ -692,6 +697,16 @@ class PlayerActivity : Activity() {
             speedBarBtn = actionButton(speedButtonLabel()) { showSpeedMenu() }
             addTouchAction(speedBarBtn!!)
             addTouchAction(actionButton("选集") { showEpisodePicker() })
+            qualityBarBtn = actionButton("自动\n等待视频轨道") { showQualityMenu() }.apply {
+                setTextSize(9f)
+                setPadding(dp(2), dp(3), dp(2), dp(3))
+                maxLines = 2
+                gravity = Gravity.CENTER
+                contentDescription = "清晰度和视频码率，点击选择清晰度"
+            }
+            touchBar.addView(qualityBarBtn!!, LinearLayout.LayoutParams(dp(78), dp(43)).apply {
+                rightMargin = dp(2)
+            })
             addTouchAction(fullscreenButton())
             addTouchAction(actionButton("更多") { showMoreMenu() })
             updateSkipButtons()
@@ -716,6 +731,7 @@ class PlayerActivity : Activity() {
         actionBar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         // 选集放在第一位：按下键 → 焦点就落在这里，两下就能跳到任意一集
         actionBar.addView(actionButton("选集") { showEpisodePicker() })
+        actionBar.addView(actionButton("清晰度") { showQualityMenu() })
         actionBar.addView(actionButton("跳过") { showSkipMarks() })
         actionBar.addView(actionButton("上集") {
             if (player?.hasPreviousMediaItem() == true) {
@@ -859,6 +875,9 @@ class PlayerActivity : Activity() {
                 exo.addListener(object : Player.Listener {
                     override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
                         currentIndex = exo.currentMediaItemIndex
+                        currentVideoWidth = 0
+                        currentVideoHeight = 0
+                        updateQualityButton()
                         hasError = false
                         baseText = labelFor(currentIndex)
                         // 每集字幕是分开存的，换集时把「当前挂的是哪份」同步过来，
@@ -942,7 +961,14 @@ class PlayerActivity : Activity() {
                     }
 
                     override fun onVideoSizeChanged(videoSize: VideoSize) {
+                        currentVideoWidth = videoSize.width
+                        currentVideoHeight = videoSize.height
                         applyOrientationForVideo(videoSize.width, videoSize.height)
+                        updateQualityButton()
+                    }
+
+                    override fun onTracksChanged(tracks: Tracks) {
+                        updateQualityButton()
                     }
                 })
 
@@ -1187,7 +1213,6 @@ class PlayerActivity : Activity() {
         }
         prefs.saveIntroEnd(key, pos)
         prefs.skipIntroEnabled = true
-        updateSeekMarks(player?.duration ?: 0L)
         updateSkipButtons()
         toast("已记片头 ${formatTime(pos)}，本剧后续集数自动跳过")
     }
@@ -1204,7 +1229,6 @@ class PlayerActivity : Activity() {
         prefs.skipOutroEnabled = true
         // 此集刚标记时不立即切集；下一集开始恢复自动跳片尾。
         outroMarkedUrl = currentUrl()
-        updateSeekMarks(p.duration)
         updateSkipButtons()
         toast("已记片尾 ${formatTime(pos)}，本剧后续集数自动跳过")
     }
@@ -1249,7 +1273,6 @@ class PlayerActivity : Activity() {
         box.addView(hintLine("片头结束：" + if (intro > 0) formatTime(intro) else "未设置"))
         box.addView(skipAction("记当前位置为片头结束") {
             prefs.saveIntroEnd(key, pos)
-            updateSeekMarks(player?.duration ?: 0L)
             updateSkipButtons()
             toast("片头结束已记为 ${formatTime(pos)}")
         })
@@ -1262,7 +1285,6 @@ class PlayerActivity : Activity() {
         box.addView(hintLine("片尾开始：" + if (outro > 0) formatTime(outro) else "未设置"))
         box.addView(skipAction("记当前位置为片尾开始") {
             prefs.saveOutroStart(key, pos)
-            updateSeekMarks(player?.duration ?: 0L)
             outroMarkedUrl = currentUrl()
             updateSkipButtons()
             toast("片尾开始已记为 ${formatTime(pos)}，之后到这就会自动下一集")
@@ -1282,7 +1304,6 @@ class PlayerActivity : Activity() {
         if (intro > 0 || outro > 0) {
             box.addView(skipAction("清除本剧的片头片尾记录") {
                 prefs.clearSkipMarks(key)
-                updateSeekMarks(player?.duration ?: 0L)
                 updateSkipButtons()
                 toast("已清除")
             })
@@ -1364,7 +1385,7 @@ class PlayerActivity : Activity() {
         val pos = if (pendingSeek >= 0) pendingSeek else p.currentPosition
         if (dur > 0) {
             seekBar.progress = (pos * 1000 / dur).toInt().coerceIn(0, 1000)
-            // 已缓冲部分用白色画在蓝色之后（secondaryProgress）
+            // 缓冲区间由 MarkedSeekBar 自绘，secondaryProgress 提供其终点
             seekBar.secondaryProgress = (p.bufferedPosition * 1000 / dur).toInt().coerceIn(0, 1000)
             elapsedText.text = formatTime(pos)
             timeText.text = formatTime(dur)
@@ -1375,21 +1396,111 @@ class PlayerActivity : Activity() {
             timeText.text = "--:--"
         }
         updatePlayPauseIcon()
-        updateSeekMarks(dur)
+        updateQualityButton()
     }
 
-    /** 把片头结束点 / 片尾开始点换算成比例，画成进度条上的两道刻度 */
-    private fun updateSeekMarks(duration: Long) {
-        val key = skipKey()
-        if (duration <= 0L || key.isEmpty()) {
-            seekBar.introFraction = -1f
-            seekBar.outroFraction = -1f
-            return
+    /** 实时显示当前清晰度档位、解码分辨率和片源提供的视频码率。 */
+    private fun updateQualityButton() {
+        val button = qualityBarBtn ?: return
+        val format = selectedVideoFormat()
+        val width = currentVideoWidth.takeIf { it > 0 } ?: format?.width ?: -1
+        val height = currentVideoHeight.takeIf { it > 0 } ?: format?.height ?: -1
+        val actual = if (width > 0 && height > 0) qualityLabel(width, height) else "清晰度未知"
+        val firstLine = if (selectedQualityLabel == null) "自动·${if (actual == "清晰度未知") "未知" else actual}"
+            else if (actual == "清晰度未知") selectedQualityLabel!! else actual
+        val bitrate = format?.let { formatBitrate(it.bitrate) } ?: "码率未知"
+        val label = "$firstLine\n$bitrate"
+        if (button.text.toString() != label) button.text = label
+        button.contentDescription = "已选${selectedQualityLabel ?: "自动"}，当前$actual，视频$bitrate，点击选择清晰度"
+    }
+
+    /** 当前实际输出尺寸优先匹配到已选视频轨道，用它读取片源声明的码率。 */
+    private fun selectedVideoFormat(): Format? {
+        val p = player ?: return null
+        val tracks = p.currentTracks.groups
+            .filter { it.type == C.TRACK_TYPE_VIDEO }
+            .flatMap { group ->
+                (0 until group.length).filter { group.isTrackSupported(it) }
+                    .map { index -> Triple(group, index, group.getTrackFormat(index)) }
+            }
+        val selected = tracks.filter { (group, index, _) -> group.isTrackSelected(index) }
+        if (currentVideoWidth > 0 && currentVideoHeight > 0) {
+            val actual = (selected.ifEmpty { tracks }).firstOrNull { (_, _, f) ->
+                (f.width == currentVideoWidth && f.height == currentVideoHeight) ||
+                    (f.width == currentVideoHeight && f.height == currentVideoWidth)
+            }
+            if (actual != null) return actual.third
         }
-        val intro = prefs.introEndOf(key)
-        val outro = prefs.outroStartOf(key)
-        seekBar.introFraction = if (intro in 1 until duration) intro.toFloat() / duration else -1f
-        seekBar.outroFraction = if (outro in 1 until duration) outro.toFloat() / duration else -1f
+        return selected.maxByOrNull { (_, _, f) -> f.width.toLong() * f.height }
+            ?.third
+            ?: tracks.maxByOrNull { (_, _, f) -> f.width.toLong() * f.height }?.third
+    }
+
+    private fun qualityLabel(width: Int, height: Int): String {
+        val resolution = minOf(width, height)
+        return when {
+            resolution >= 2160 -> "4K"
+            resolution >= 1440 -> "2K"
+            resolution >= 1080 -> "1080P"
+            resolution >= 720 -> "720P"
+            resolution >= 480 -> "480P"
+            resolution >= 360 -> "360P"
+            else -> "${resolution}P"
+        }
+    }
+
+    private fun formatBitrate(bitsPerSecond: Int): String {
+        if (bitsPerSecond <= 0) return "码率未知"
+        return if (bitsPerSecond >= 1_000_000) {
+            String.format(java.util.Locale.US, "%.1f Mbps", bitsPerSecond / 1_000_000.0)
+        } else {
+            "${(bitsPerSecond / 1_000)} kbps"
+        }
+    }
+
+    private fun showQualityMenu() {
+        val p = player ?: return
+        val formats = p.currentTracks.groups
+            .filter { it.type == C.TRACK_TYPE_VIDEO }
+            .flatMap { group ->
+                (0 until group.length).filter { group.isTrackSupported(it) }
+                    .map { group.getTrackFormat(it) }
+            }
+            .filter { it.width > 0 && it.height > 0 }
+            .distinctBy { it.width to it.height }
+            .sortedWith(
+                compareByDescending<Format> { it.height }
+                    .thenByDescending { it.bitrate },
+            )
+        val options = formats.map { format ->
+            VideoQualityOption(qualityLabel(format.width, format.height), format)
+        }
+        val labels = listOf("自动（自适应）") + options.map { option ->
+            "${option.label} · ${formatBitrate(option.format.bitrate)}"
+        }
+        val checked = if (selectedQualityLabel == null) 0
+            else options.indexOfFirst { it.label == selectedQualityLabel }.let { if (it < 0) 0 else it + 1 }
+        AlertDialog.Builder(this)
+            .setTitle("清晰度 / 视频码率")
+            .setSingleChoiceItems(labels.toTypedArray(), checked) { dialog, which ->
+                val parameters = p.trackSelectionParameters.buildUpon()
+                    .clearOverridesOfType(C.TRACK_TYPE_VIDEO)
+                if (which == 0) {
+                    parameters.clearVideoSizeConstraints()
+                    selectedQualityLabel = null
+                } else {
+                    val option = options[which - 1]
+                    // 限制最高分辨率，保留该分辨率以下的自适应切换能力。
+                    parameters.setMaxVideoSize(option.format.width, option.format.height)
+                    selectedQualityLabel = option.label
+                }
+                p.trackSelectionParameters = parameters.build()
+                dialog.dismiss()
+                updateQualityButton()
+                showProgress()
+            }
+            .setNegativeButton("关闭", null)
+            .show()
     }
 
     /** 用 Canvas 画播放/暂停图标，省掉两张 png */
@@ -2157,6 +2268,11 @@ class PlayerActivity : Activity() {
         val group: Tracks.Group?,
         val trackIndex: Int,
         val disableText: Boolean = false,
+    )
+
+    private class VideoQualityOption(
+        val label: String,
+        val format: Format,
     )
 
     /**
