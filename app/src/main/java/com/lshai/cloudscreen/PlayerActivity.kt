@@ -3,6 +3,7 @@ package com.lshai.cloudscreen
 import android.app.Activity
 import android.app.AlertDialog
 import android.app.Dialog
+import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.content.res.Configuration
 import android.graphics.Canvas
@@ -14,6 +15,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.provider.Settings
 import android.text.InputType
 import android.view.Gravity
 import android.view.KeyEvent
@@ -200,6 +202,7 @@ class PlayerActivity : Activity() {
     private var lockOverlay: View? = null
     private var lockButton: View? = null
     private var backButton: TextView? = null
+    private var topCastButton: TextView? = null
     private var backGestureCallback: OnBackInvokedCallback? = null
     private var lastLockHintAt = 0L
     /** 「全屏 / 还原」的按钮，两处入口（触屏条 + 遥控操作栏）共用一份标签 */
@@ -302,6 +305,15 @@ class PlayerActivity : Activity() {
         }
     }
 
+    private val hideAfterBuffering = Runnable {
+        val p = player
+        val stillPlaying = p != null && p.isPlaying && p.playbackState == Player.STATE_READY
+        if (!locked && stillPlaying && !isActionBarVisible()) {
+            progressRow.visibility = View.GONE
+            if (::bottomChrome.isInitialized) bottomChrome.visibility = View.GONE
+            updateChrome()
+        }
+    }
     private val hideUi = Runnable {
         val p = player
         val paused = p != null && !p.playWhenReady && p.playbackState != Player.STATE_IDLE
@@ -515,6 +527,25 @@ class PlayerActivity : Activity() {
                 root.addView(it, FrameLayout.LayoutParams(dp(52), dp(52), Gravity.TOP or Gravity.START)
                     .apply { leftMargin = dp(8); topMargin = dp(2) })
             }
+            topCastButton = TextView(this).apply {
+                text = "▣ 投屏"
+                setTextColor(android.graphics.Color.WHITE)
+                setTextSize(14f)
+                gravity = Gravity.CENTER
+                setPadding(dp(14), 0, dp(14), 0)
+                background = GradientDrawable().apply {
+                    setColor(0x99000000.toInt())
+                    cornerRadius = dp(20).toFloat()
+                    setStroke(dp(1), 0x66FFFFFF)
+                }
+                visibility = View.GONE
+                isClickable = true
+                contentDescription = "手机投屏"
+                setOnClickListener { openSystemCastSettings() }
+            }.also {
+                root.addView(it, FrameLayout.LayoutParams(-2, dp(40), Gravity.TOP or Gravity.END)
+                    .apply { rightMargin = dp(14); topMargin = dp(8) })
+            }
         }
 
         // 进度条：左播放/暂停图标 + 进度 + 时间 + 倍速标签（都不可聚焦）
@@ -648,6 +679,16 @@ class PlayerActivity : Activity() {
                     cornerRadius = dp(20).toFloat()
                 }
             }
+            addTouchAction(actionButton("上集") {
+                if (player?.hasPreviousMediaItem() == true) player?.seekToPreviousMediaItem()
+                else toast("已是第一集")
+                showProgress()
+            })
+            addTouchAction(actionButton("下集") {
+                if (player?.hasNextMediaItem() == true) player?.seekToNextMediaItem()
+                else toast("已是最后一集")
+                showProgress()
+            })
             speedBarBtn = actionButton(speedButtonLabel()) { showSpeedMenu() }
             addTouchAction(speedBarBtn!!)
             addTouchAction(actionButton("选集") { showEpisodePicker() })
@@ -676,19 +717,19 @@ class PlayerActivity : Activity() {
         // 选集放在第一位：按下键 → 焦点就落在这里，两下就能跳到任意一集
         actionBar.addView(actionButton("选集") { showEpisodePicker() })
         actionBar.addView(actionButton("跳过") { showSkipMarks() })
-        actionBar.addView(actionButton("下集") {
-            if (player?.hasNextMediaItem() == true) {
-                player?.seekToNextMediaItem()
-            } else {
-                toast("已是最后一集")
-            }
-            showActions()
-        })
         actionBar.addView(actionButton("上集") {
             if (player?.hasPreviousMediaItem() == true) {
                 player?.seekToPreviousMediaItem()
             } else {
                 toast("已是第一集")
+            }
+            showActions()
+        })
+        actionBar.addView(actionButton("下集") {
+            if (player?.hasNextMediaItem() == true) {
+                player?.seekToNextMediaItem()
+            } else {
+                toast("已是最后一集")
             }
             showActions()
         })
@@ -843,9 +884,13 @@ class PlayerActivity : Activity() {
                         speedText.visibility = if (buffering) View.VISIBLE else View.GONE
                         handler.removeCallbacks(speedTick)
                         if (buffering) {
+                            handler.removeCallbacks(hideAfterBuffering)
                             lastBytes = 0L
                             lastMs = 0L
                             handler.post(speedTick)
+                        } else if (playbackState == Player.STATE_READY && player?.playWhenReady == true) {
+                            handler.removeCallbacks(hideAfterBuffering)
+                            handler.postDelayed(hideAfterBuffering, 3_000L)
                         }
                         if (playbackState == Player.STATE_ENDED) {
                             prefs.clearProgress(currentUrl())
@@ -858,7 +903,12 @@ class PlayerActivity : Activity() {
                     override fun onIsPlayingChanged(isPlaying: Boolean) {
                         updatePlayPauseIcon()
                         updateChrome()
-                        if (!isPlaying) showProgress()
+                        if (!isPlaying) {
+                            showProgress()
+                        } else if (player?.playbackState == Player.STATE_READY) {
+                            handler.removeCallbacks(hideAfterBuffering)
+                            handler.postDelayed(hideAfterBuffering, 3_000L)
+                        }
                     }
 
                     override fun onPlayerError(error: PlaybackException) {
@@ -1276,6 +1326,7 @@ class PlayerActivity : Activity() {
             // 锁屏期间任何操作层都不许自己冒出来
             titleText.visibility = View.GONE
             backButton?.visibility = View.GONE
+            topCastButton?.visibility = View.GONE
             return
         }
         val p = player
@@ -1285,6 +1336,7 @@ class PlayerActivity : Activity() {
         val visible = if (hasError || paused || chromeVisible) View.VISIBLE else View.GONE
         titleText.visibility = visible
         backButton?.visibility = visible
+        topCastButton?.visibility = visible
     }
 
     /**
@@ -1387,6 +1439,7 @@ class PlayerActivity : Activity() {
         progressRow.visibility = View.VISIBLE
         updateProgress()
         handler.removeCallbacks(hideUi)
+        handler.removeCallbacks(hideAfterBuffering)
         handler.removeCallbacks(uiTick)
         handler.post(uiTick)
         if (!isActionBarVisible()) {
@@ -1854,6 +1907,17 @@ class PlayerActivity : Activity() {
     }
 
     /* ------------------------------------------------------ 全屏 / 锁屏 */
+
+    /** 打开系统无线显示设置；由 Android 负责发现并连接支持 Miracast/无线显示的电视。 */
+    private fun openSystemCastSettings() {
+        val intent = Intent(Settings.ACTION_CAST_SETTINGS)
+        try {
+            startActivity(intent)
+            toast("请在系统投屏列表中选择电视；连接后手机画面会同步显示")
+        } catch (_: Exception) {
+            toast("此设备没有系统投屏入口，请从手机快捷设置中开启「投屏 / 无线显示」")
+        }
+    }
 
     /**
      * 「比例」里已经有三种模式，但手机上用户想要的是「一键满屏，别让我翻菜单」。
@@ -3361,6 +3425,7 @@ class PlayerActivity : Activity() {
         handler.removeCallbacks(saveTick)
         handler.removeCallbacks(uiTick)
         handler.removeCallbacks(hideUi)
+        handler.removeCallbacks(hideAfterBuffering)
         handler.removeCallbacks(speedTick)
         handler.removeCallbacks(hideActions)
         handler.removeCallbacks(clearPendingSeek)
