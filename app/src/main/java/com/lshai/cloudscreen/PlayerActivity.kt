@@ -10,6 +10,8 @@ import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.RectF
 import android.graphics.drawable.GradientDrawable
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -85,6 +87,7 @@ class PlayerActivity : Activity() {
         const val EXTRA_VOD_ID = "vod_id"
         const val EXTRA_SOURCE_URL = "source_url"
         const val EXTRA_SOURCE_NAME = "source_name"
+        const val EXTRA_RETURN_TO_SOURCES = "return_to_sources"
         const val CMD_TOGGLE = "toggle"
         const val CMD_STOP = "stop"
 
@@ -121,6 +124,7 @@ class PlayerActivity : Activity() {
         /** 画面上下滑的两种目标：左半屏亮度、右半屏音量 */
         private const val SWIPE_BRIGHTNESS = 1
         private const val SWIPE_VOLUME = 2
+        private const val SWIPE_SEEK = 3
         /** 长按多久开始临时加速 / 加速到几倍 */
         private const val LONG_PRESS_BOOST_MS = 480L
         private const val BOOST_SPEED = 2f
@@ -204,7 +208,7 @@ class PlayerActivity : Activity() {
     private var lockOverlay: View? = null
     private var lockButton: View? = null
     private var backButton: TextView? = null
-    private var topCastButton: TextView? = null
+    private var topCastButton: ImageView? = null
     private var backGestureCallback: OnBackInvokedCallback? = null
     private var lastLockHintAt = 0L
     /** 「全屏 / 还原」的按钮，两处入口（触屏条 + 遥控操作栏）共用一份标签 */
@@ -387,6 +391,7 @@ class PlayerActivity : Activity() {
         //   · 轻点中间竖带 → 播放/暂停
         //   · 轻点左右 → 唤出/收起控制条
         //   · 双击左右 → 快退/快进 10 秒
+        //   · 左右滑动 → 快退/快进 10 秒
         //   · 左半屏上下滑 → 亮度；右半屏上下滑 → 音量
         //   · 长按画面 → 临时 2 倍速，松手回到原速
         // 只认「按下→抬起」位移/耗时都在阈值内的轻点，滑动不会被误判成点击。
@@ -407,8 +412,12 @@ class PlayerActivity : Activity() {
                     // 手指一动就取消「长按加速」，免得滑动调音量时突然变 2 倍速
                     if (kotlin.math.abs(dx) > dp(12) || kotlin.math.abs(dy) > dp(12)) {
                         handler.removeCallbacks(startBoost)
+                        if (boosting) endBoost()
                     }
-                    if (swipeMode == 0 && kotlin.math.abs(dy) > dp(28) && kotlin.math.abs(dy) > kotlin.math.abs(dx) * 1.2f) {
+                    if (swipeMode == 0 && kotlin.math.abs(dx) > dp(36) && kotlin.math.abs(dx) > kotlin.math.abs(dy) * 1.2f) {
+                        swipeMode = SWIPE_SEEK
+                        handler.removeCallbacks(hideUi)
+                    } else if (swipeMode == 0 && kotlin.math.abs(dy) > dp(28) && kotlin.math.abs(dy) > kotlin.math.abs(dx) * 1.2f) {
                         // 第一次判定成上下滑：记下基准值，之后整串手势都按滑动处理
                         val leftHalf = touchDownX < v.width / 2f
                         swipeMode = if (leftHalf) SWIPE_BRIGHTNESS else SWIPE_VOLUME
@@ -418,7 +427,7 @@ class PlayerActivity : Activity() {
                         } ?: 0f)
                         handler.removeCallbacks(hideUi)
                     }
-                    if (swipeMode != 0) {
+                    if (swipeMode == SWIPE_BRIGHTNESS || swipeMode == SWIPE_VOLUME) {
                         // 屏幕高度的 60% 走完全程：行程太长手指要挪很远，太短又会误调
                         val span = (v.height * 0.6f).coerceAtLeast(1f)
                         val target = (swipeBase - dy / span).coerceIn(0f, 1f)
@@ -431,10 +440,19 @@ class PlayerActivity : Activity() {
                         // 长按加速松手：恢复原速，这次不算点击
                         endBoost()
                     } else if (swipeMode != 0) {
+                        if (swipeMode == SWIPE_SEEK) {
+                            val dx = e.x - touchDownX
+                            if (kotlin.math.abs(dx) >= dp(36)) {
+                                val seconds = if (dx > 0) 10_000L else -10_000L
+                                seekBy(seconds)
+                                showGestureHud(if (dx > 0) "快进 10 秒" else "快退 10 秒")
+                            }
+                        }
                         // 滑动结束：不算点击，只把提示和自动隐藏的计时收尾
                         swipeMode = 0
                         handler.removeCallbacks(hideGestureHud)
                         handler.postDelayed(hideGestureHud, 600)
+                        handler.removeCallbacks(hideUi)
                         handler.postDelayed(hideUi, HIDE_UI_DELAY_MS)
                     } else {
                         val dx = kotlin.math.abs(e.x - touchDownX)
@@ -526,29 +544,27 @@ class PlayerActivity : Activity() {
                 gravity = Gravity.CENTER
                 visibility = View.GONE
                 isClickable = true
-                contentDescription = "退出播放"
-                setOnClickListener { persistProgress(); finish() }
+                contentDescription = "返回本片来源"
+                setOnClickListener { onBackPressed() }
             }.also {
                 root.addView(it, FrameLayout.LayoutParams(dp(52), dp(52), Gravity.TOP or Gravity.START)
                     .apply { leftMargin = dp(8); topMargin = dp(2) })
             }
-            topCastButton = TextView(this).apply {
-                text = "▣ 投屏"
-                setTextColor(android.graphics.Color.WHITE)
-                setTextSize(14f)
-                gravity = Gravity.CENTER
-                setPadding(dp(14), 0, dp(14), 0)
+            topCastButton = ImageView(this).apply {
+                setImageResource(R.drawable.ic_cast)
+                scaleType = ImageView.ScaleType.CENTER_INSIDE
+                setPadding(dp(11), dp(11), dp(11), dp(11))
                 background = GradientDrawable().apply {
                     setColor(0x99000000.toInt())
-                    cornerRadius = dp(20).toFloat()
+                    cornerRadius = dp(22).toFloat()
                     setStroke(dp(1), 0x66FFFFFF)
                 }
                 visibility = View.GONE
                 isClickable = true
-                contentDescription = "手机投屏"
+                contentDescription = "投屏到同一局域网的电视"
                 setOnClickListener { openSystemCastSettings() }
             }.also {
-                root.addView(it, FrameLayout.LayoutParams(-2, dp(40), Gravity.TOP or Gravity.END)
+                root.addView(it, FrameLayout.LayoutParams(dp(44), dp(44), Gravity.TOP or Gravity.END)
                     .apply { rightMargin = dp(14); topMargin = dp(8) })
             }
         }
@@ -697,12 +713,12 @@ class PlayerActivity : Activity() {
             speedBarBtn = actionButton(speedButtonLabel()) { showSpeedMenu() }
             addTouchAction(speedBarBtn!!)
             addTouchAction(actionButton("选集") { showEpisodePicker() })
-            qualityBarBtn = actionButton("自动\n等待视频轨道") { showQualityMenu() }.apply {
-                setTextSize(9f)
+            qualityBarBtn = actionButton("自动") { showQualityMenu() }.apply {
+                setTextSize(12f)
                 setPadding(dp(2), dp(3), dp(2), dp(3))
-                maxLines = 2
+                maxLines = 1
                 gravity = Gravity.CENTER
-                contentDescription = "清晰度和视频码率，点击选择清晰度"
+                contentDescription = "选择清晰度"
             }
             touchBar.addView(qualityBarBtn!!, LinearLayout.LayoutParams(dp(78), dp(43)).apply {
                 rightMargin = dp(2)
@@ -1399,7 +1415,7 @@ class PlayerActivity : Activity() {
         updateQualityButton()
     }
 
-    /** 实时显示当前清晰度档位、解码分辨率和片源提供的视频码率。 */
+    /** 显示当前实际画质；只有片源提供的轨道才会出现在选择菜单。 */
     private fun updateQualityButton() {
         val button = qualityBarBtn ?: return
         val format = selectedVideoFormat()
@@ -1408,13 +1424,11 @@ class PlayerActivity : Activity() {
         val actual = if (width > 0 && height > 0) qualityLabel(width, height) else "清晰度未知"
         val firstLine = if (selectedQualityLabel == null) "自动·${if (actual == "清晰度未知") "未知" else actual}"
             else if (actual == "清晰度未知") selectedQualityLabel!! else actual
-        val bitrate = format?.let { formatBitrate(it.bitrate) } ?: "码率未知"
-        val label = "$firstLine\n$bitrate"
-        if (button.text.toString() != label) button.text = label
-        button.contentDescription = "已选${selectedQualityLabel ?: "自动"}，当前$actual，视频$bitrate，点击选择清晰度"
+        if (button.text.toString() != firstLine) button.text = firstLine
+        button.contentDescription = "已选${selectedQualityLabel ?: "自动"}，当前$actual，点击选择清晰度"
     }
 
-    /** 当前实际输出尺寸优先匹配到已选视频轨道，用它读取片源声明的码率。 */
+    /** 当前实际输出尺寸优先匹配到已选视频轨道。 */
     private fun selectedVideoFormat(): Format? {
         val p = player ?: return null
         val tracks = p.currentTracks.groups
@@ -1449,15 +1463,6 @@ class PlayerActivity : Activity() {
         }
     }
 
-    private fun formatBitrate(bitsPerSecond: Int): String {
-        if (bitsPerSecond <= 0) return "码率未知"
-        return if (bitsPerSecond >= 1_000_000) {
-            String.format(java.util.Locale.US, "%.1f Mbps", bitsPerSecond / 1_000_000.0)
-        } else {
-            "${(bitsPerSecond / 1_000)} kbps"
-        }
-    }
-
     private fun showQualityMenu() {
         val p = player ?: return
         val formats = p.currentTracks.groups
@@ -1467,21 +1472,19 @@ class PlayerActivity : Activity() {
                     .map { group.getTrackFormat(it) }
             }
             .filter { it.width > 0 && it.height > 0 }
-            .distinctBy { it.width to it.height }
             .sortedWith(
-                compareByDescending<Format> { it.height }
-                    .thenByDescending { it.bitrate },
+                compareByDescending<Format> { minOf(it.width, it.height) }
+                    .thenByDescending { it.width.toLong() * it.height },
             )
+            .distinctBy { qualityLabel(it.width, it.height) }
         val options = formats.map { format ->
             VideoQualityOption(qualityLabel(format.width, format.height), format)
         }
-        val labels = listOf("自动（自适应）") + options.map { option ->
-            "${option.label} · ${formatBitrate(option.format.bitrate)}"
-        }
+        val labels = listOf("自动（自适应）") + options.map { it.label }
         val checked = if (selectedQualityLabel == null) 0
             else options.indexOfFirst { it.label == selectedQualityLabel }.let { if (it < 0) 0 else it + 1 }
         AlertDialog.Builder(this)
-            .setTitle("清晰度 / 视频码率")
+            .setTitle("清晰度")
             .setSingleChoiceItems(labels.toTypedArray(), checked) { dialog, which ->
                 val parameters = p.trackSelectionParameters.buildUpon()
                     .clearOverridesOfType(C.TRACK_TYPE_VIDEO)
@@ -2019,12 +2022,23 @@ class PlayerActivity : Activity() {
 
     /* ------------------------------------------------------ 全屏 / 锁屏 */
 
-    /** 打开系统无线显示设置；由 Android 负责发现并连接支持 Miracast/无线显示的电视。 */
+    /** 手机与电视先接入同一局域网，再交给系统的无线显示入口选择设备。 */
     private fun openSystemCastSettings() {
+        val connectivity = getSystemService(CONNECTIVITY_SERVICE) as? ConnectivityManager
+        val onLan = connectivity?.allNetworks?.any { network ->
+            connectivity.getNetworkCapabilities(network)?.let { capabilities ->
+                capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+                    capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
+            } == true
+        } == true
+        if (!onLan) {
+            toast("请先把手机和电视连接到同一局域网，再点投屏")
+            return
+        }
         val intent = Intent(Settings.ACTION_CAST_SETTINGS)
         try {
             startActivity(intent)
-            toast("请在系统投屏列表中选择电视；连接后手机画面会同步显示")
+            toast("请选择同一局域网中的电视；连接后手机画面会同步显示")
         } catch (_: Exception) {
             toast("此设备没有系统投屏入口，请从手机快捷设置中开启「投屏 / 无线显示」")
         }
@@ -3382,14 +3396,14 @@ class PlayerActivity : Activity() {
             }
         }
 
+        if (keyCode == KeyEvent.KEYCODE_BACK) {
+            onBackPressed()
+            return true
+        }
+
         // 全屏纯净模式：按键先把控制条/操作栏唤出来，本次按键不执行动作（避免全屏时误操作）。
-        // 返回键直接退出全屏，而不是退出播放页 —— 全屏状态下按返回多半是想"退出来"。
         if (pureMode && !isActionBarVisible()) {
             when (keyCode) {
-                KeyEvent.KEYCODE_BACK -> {
-                    exitPureFullscreen()
-                    return true
-                }
                 KeyEvent.KEYCODE_VOLUME_UP,
                 KeyEvent.KEYCODE_VOLUME_DOWN,
                 KeyEvent.KEYCODE_VOLUME_MUTE,
@@ -3409,28 +3423,12 @@ class PlayerActivity : Activity() {
 
         val p = player ?: return super.onKeyDown(keyCode, event)
 
-        // 片尾倒计时浮着时，返回键只取消连播，不退出播放页（否则想「先停一下」会直接退出去）
-        if (keyCode == KeyEvent.KEYCODE_BACK && nextHint?.visibility == View.VISIBLE) {
-            cancelAutoNext()
-            return true
-        }
-
-        // 后台播放开启时，返回键 = 退到后台继续放（不销毁 Activity，音频不中断）。
-        // 操作栏里的「退出」才是真正的停止 + 释放。
-        if (keyCode == KeyEvent.KEYCODE_BACK && prefs.backgroundPlay && !isActionBarVisible()) {
-            persistProgress()
-            toast("后台播放中，操作栏「退出」可停止")
-            moveTaskToBack(true)
-            return true
-        }
-
         // 操作栏打开时：按键全部交给菜单（按钮可聚焦、可点击）
         if (isActionBarVisible()) {
             if (event.action == KeyEvent.ACTION_DOWN) {
                 handler.removeCallbacks(hideActions)
                 handler.postDelayed(hideActions, HIDE_ACTIONS_DELAY_MS)
                 when (keyCode) {
-                    KeyEvent.KEYCODE_BACK,
                     KeyEvent.KEYCODE_MENU,
                     KeyEvent.KEYCODE_M,
                     -> {
@@ -3506,7 +3504,16 @@ class PlayerActivity : Activity() {
             if (isTvDevice) unlockScreen() else lockHint()
             return
         }
-        super.onBackPressed()
+        persistProgress()
+        setResult(RESULT_OK, Intent().apply {
+            putExtra(EXTRA_RETURN_TO_SOURCES, true)
+            putExtra(EXTRA_SERIES_NAME, seriesTitle)
+            putExtra(EXTRA_VOD_ID, vodId)
+            putExtra(EXTRA_SOURCE_URL, sourceUrl)
+            putExtra(EXTRA_SOURCE_NAME, sourceName)
+            putExtra(EXTRA_COVER, coverUrl)
+        })
+        finish()
     }
 
     override fun onStart() {

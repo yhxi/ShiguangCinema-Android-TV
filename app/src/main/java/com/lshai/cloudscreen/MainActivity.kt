@@ -174,6 +174,7 @@ class MainActivity : Activity() {
     private var setupShowFields = false
     private val REQ_PICK_JSON = 1001
     private val REQ_STORAGE = 1002
+    private val REQ_PLAYER = 1003
 
     /** 顶部「返回主页」按钮的标记：自动聚焦时跳过它，避免一进页面焦点就落在返回上 */
     private val SKIP_FIRST_FOCUS = "skip-first-focus"
@@ -471,6 +472,7 @@ class MainActivity : Activity() {
             "files" -> showSources()
             "qradd" -> { qrServer?.stop(); qrServer = null; showSources() }
             "results" -> showRecommend()
+            "playbacksources" -> { cancelJob("playbacksources"); showRecommend() }
             "serversettings" -> showSetup()
             "detail", "live", "setup", "history" -> showRecommend()
             "sources" -> if (sourcesOrigin == "setup") showSetup() else showRecommend()
@@ -1047,7 +1049,6 @@ class MainActivity : Activity() {
         showRecommend()
         autoConnect(silent = true)
     }
-
     /**
      * 连接服务器（顺带拉服务端下发的片源配置）。
      *
@@ -1357,6 +1358,12 @@ class MainActivity : Activity() {
     @Deprecated("系统文件选择器仍走 startActivityForResult")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == REQ_PLAYER) {
+            if (resultCode == RESULT_OK && data?.getBooleanExtra(PlayerActivity.EXTRA_RETURN_TO_SOURCES, false) == true) {
+                showPlaybackSources(data)
+            }
+            return
+        }
         if (requestCode != REQ_PICK_JSON || resultCode != RESULT_OK) return
         val uri = data?.data ?: return
         runApi("读取文件…", {
@@ -3915,6 +3922,88 @@ class MainActivity : Activity() {
 
     /* --------------------------------------------------------------- 详情页 */
 
+    /** 从播放器返回时展示这部视频的来源，并补查其他已启用片源。 */
+    private fun showPlaybackSources(result: Intent) {
+        val title = seriesNameOf(result.getStringExtra(PlayerActivity.EXTRA_SERIES_NAME).orEmpty())
+        if (title.isEmpty()) { showRecommend(); return }
+        val sourceUrl = result.getStringExtra(PlayerActivity.EXTRA_SOURCE_URL).orEmpty()
+        val sourceName = result.getStringExtra(PlayerActivity.EXTRA_SOURCE_NAME).orEmpty()
+        val vodId = result.getStringExtra(PlayerActivity.EXTRA_VOD_ID).orEmpty()
+        if (currentScreen == "live" && sourceUrl.isEmpty() && vodId.isEmpty()) {
+            showLive()
+            return
+        }
+        val cover = result.getStringExtra(PlayerActivity.EXTRA_COVER).orEmpty()
+        val current = sourceUrl.takeIf { it.isNotEmpty() }?.let {
+            SearchItem(sourceName, vodId, title, cover, "", "", "", it)
+        }
+        val normalized = cleanKeyword(title)
+        fun isSameTitle(item: SearchItem) = cleanKeyword(item.name).equals(normalized, ignoreCase = true)
+        val known = lastResults.filter(::isSameTitle)
+        val initial = (listOfNotNull(current) + known).filter { it.sourceUrl.isNotEmpty() }
+            .distinctBy { it.sourceUrl }
+
+        fun render(items: List<SearchItem>, status: String) {
+            if (currentScreen != "playbacksources") return
+            val col = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(pagePad(40), dp(20), pagePad(40), dp(20))
+            }
+            col.addView(topBar())
+            col.addView(titleText("《$title》 · 选择播放源", 21f))
+            col.addView(hintText(status).apply { setPadding(0, dp(8), 0, dp(12)) })
+            val rows = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+            items.forEach { item ->
+                val name = item.sourceName.ifEmpty {
+                    item.sourceUrl.substringAfter("://").substringBefore('/').ifEmpty { "未知来源" }
+                }
+                val isCurrent = item.sourceUrl == sourceUrl
+                val label = (if (isCurrent) "● 当前 · " else "") + name
+                if (item.vodId.isNotEmpty()) {
+                    rows.addView(button(label, primary = isCurrent) {
+                        cancelJob("playbacksources")
+                        openDetail(item)
+                    }.apply {
+                        layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(52))
+                    })
+                } else {
+                    rows.addView(hintText("$label（当前来源暂无详情）"))
+                }
+            }
+            if (items.isEmpty()) rows.addView(hintText("暂无可选择的来源，请稍后重试。"))
+            col.addView(ScrollView(this).apply { addView(rows) }, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f,
+            ))
+            setScreen(col)
+        }
+
+        currentScreen = "playbacksources"
+        lastResults = initial
+        render(initial, "正在查找本片的其他来源…")
+        val enabledSources = prefs.sources().filter { it.enabled }
+        if (enabledSources.isEmpty()) {
+            render(initial, "已知来源 ${initial.size} 个；当前没有启用的片源。")
+            return
+        }
+        cancelJob("playbacksources")
+        jobs["playbacksources"] = scope.launch {
+            try {
+                val found = withContext(Dispatchers.IO) { directThenServerSearch(title, enabledSources) }
+                if (currentScreen != "playbacksources") return@launch
+                val matches = found.items.filter(::isSameTitle)
+                val merged = (initial.map { item ->
+                    if (item.vodId.isEmpty()) matches.firstOrNull { it.sourceUrl == item.sourceUrl } ?: item else item
+                } + matches).filter { it.sourceUrl.isNotEmpty() }.distinctBy { it.sourceUrl }
+                lastResults = merged
+                render(merged, "找到 ${merged.size} 个来源，选择一个查看集数。")
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                render(initial, "其他来源暂时查找失败，下面是已知来源。")
+            }
+        }
+    }
+
     /**
      * 打开详情。
      *
@@ -4217,7 +4306,7 @@ class MainActivity : Activity() {
     ) {
         if (urls.isEmpty()) return
         refreshHomeAfterPlayback = true
-        startActivity(Intent(this, PlayerActivity::class.java).apply {
+        startActivityForResult(Intent(this, PlayerActivity::class.java).apply {
             putStringArrayListExtra(PlayerActivity.EXTRA_URLS, ArrayList(urls))
             putExtra(PlayerActivity.EXTRA_INDEX, index.coerceIn(0, urls.size - 1))
             putExtra(PlayerActivity.EXTRA_TITLE, title)
@@ -4227,7 +4316,7 @@ class MainActivity : Activity() {
             putExtra(PlayerActivity.EXTRA_VOD_ID, vodId)
             putExtra(PlayerActivity.EXTRA_SOURCE_URL, sourceUrl)
             putExtra(PlayerActivity.EXTRA_SOURCE_NAME, sourceName)
-        })
+        }, REQ_PLAYER)
     }
 
     /* ------------------------------------------------------------ 简易适配器 */
