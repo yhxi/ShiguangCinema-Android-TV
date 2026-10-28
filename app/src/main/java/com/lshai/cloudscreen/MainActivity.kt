@@ -50,7 +50,6 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
@@ -76,6 +75,9 @@ private const val MAX_SEARCH_CONCURRENCY = 8
 
 /** 搜索时同时打到服务端 /api/search 的请求数上限：同一台机器，压太狠会被限流 */
 private const val SERVER_SEARCH_CONCURRENCY = 4
+
+/** 单源请求的超时：整批源才需要 45 秒，单源给 15 秒足够，装死的源不能占住线程太久 */
+private const val SEARCH_SOURCE_TIMEOUT_MS = 15_000
 
 /** 分批合并结果的刷新间隔：太密会打断正在翻页的用户，太疏又看不出「随搜随出」 */
 private const val PARTIAL_RENDER_INTERVAL_MS = 400L
@@ -182,6 +184,11 @@ class MainActivity : Activity() {
     private var searchProgressNote = ""
     /** 结果网格：分批合并时用它把选中项与焦点还回原处，避免每来一批就跳回顶部 */
     private var resultsGrid: GridView? = null
+    /** 结果页顶部计数与进度行：原地刷新时只改文字，不重建页面 */
+    private var resultsTitle: TextView? = null
+    private var resultsHint: TextView? = null
+    /** 搜索页输入框的内容：整页重建（热门词回填等）时要把用户打的字带回去 */
+    private var homeKeyword = ""
     /** 详情页短时缓存：key = vodId + 源地址，value = (写入时间, 详情) */
     private val detailCache = HashMap<String, Pair<Long, Detail>>()
     /** 片源管理列表：测速完只刷行内容，不重建整页 */
@@ -605,7 +612,11 @@ class MainActivity : Activity() {
         // 否则后台每刷一次就会把正在进行的搜索判成「用户已经离开」。
         if (currentScreen != lastRenderedScreen) screenEpoch++
         // 离开结果页就松开网格引用，别把整棵视图树挂在 Activity 上
-        if (currentScreen != "results") resultsGrid = null
+        if (currentScreen != "results") {
+            resultsGrid = null
+            resultsTitle = null
+            resultsHint = null
+        }
         if (lastRenderedScreen != null && lastRenderedScreen != currentScreen) {
             // 用 withLayer() 让动画走硬件层，老盒子上比逐帧重绘稳
             view.alpha = 0f
@@ -1004,7 +1015,7 @@ class MainActivity : Activity() {
      */
     private fun <T> runApi(
         loading: String? = "加载中…",
-        block: () -> T,
+        block: suspend CoroutineScope.() -> T,
         then: (T) -> Unit,
         quiet: Boolean = false,
         onError: ((Exception) -> Unit)? = null,
@@ -1047,7 +1058,7 @@ class MainActivity : Activity() {
     private fun <T> runApiK(
         key: String,
         loading: String? = "加载中…",
-        block: () -> T,
+        block: suspend CoroutineScope.() -> T,
         then: (T) -> Unit,
         quiet: Boolean = false,
         onError: ((Exception) -> Unit)? = null,
@@ -3487,6 +3498,7 @@ class MainActivity : Activity() {
      * @param keepSelection 分批合并结果时为 true：沿用上一版网格的选中项，
      *   并把焦点还给网格。慢源每返回一批就重建整页，如果不还原，
      *   用户正在往下翻的时候会被拽回第一条 —— 电视上尤其难受。
+     *   （已经在结果页上的增量刷新走 [updateResultsInPlace]，不会重建整页。）
      */
     private fun showResults(keepSelection: Boolean = false) {
         currentScreen = "results"
@@ -3504,16 +3516,7 @@ class MainActivity : Activity() {
         } else {
             null
         }
-        val visible = if (sourceFilter.isEmpty()) {
-            lastResults
-        } else {
-            lastResults.filter { it.sourceName == sourceFilter }
-        }
-        // 按"第一个源是否已知不可用"排序：点进去默认用的是第一个源，
-        // 上次测过失败的就往后排，让能看的先露头
-        resultGroups = visible.groupBy { it.name }
-            .map { (title, items) -> title to items }
-            .sortedBy { (_, items) -> if (prefs.sourceTest(items.first().sourceUrl)?.first == false) 1 else 0 }
+        val visibleCount = applyResultsData()
 
         val col = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -3522,7 +3525,9 @@ class MainActivity : Activity() {
         col.addView(topBar())
 
         val bar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        bar.addView(titleText("${resultGroups.size} 部 · ${visible.size} 条结果", 18f))
+        val titleView = titleText("${resultGroups.size} 部 · $visibleCount 条结果", 18f)
+        resultsTitle = titleView
+        bar.addView(titleView)
         bar.addView(button("来源筛选") {
             val names = listOf("全部来源") + lastResults.map { it.sourceName }.distinct().sorted()
             AlertDialog.Builder(this)
@@ -3536,13 +3541,13 @@ class MainActivity : Activity() {
         bar.addView(button("返回推荐") { showRecommend() })
         bar.addView(button("重新搜索") { showHome() })
         col.addView(hScroll(bar))
-        if (searchInProgress) {
-            col.addView(
-                hintText(
-                    searchProgressNote.ifEmpty { "已先显示返回的结果，仍在并行搜索其他片源…" },
-                ),
-            )
-        }
+        // 这一行在搜索过程中一直存在，只改文字 —— 增减视图会让下面的网格整体位移
+        val hintView = hintText(
+            searchProgressNote.ifEmpty { "已先显示返回的结果，仍在并行搜索其他片源…" },
+        )
+        hintView.visibility = if (searchInProgress) View.VISIBLE else View.GONE
+        resultsHint = hintView
+        col.addView(hintView)
 
         if (sourceFilter.isNotEmpty()) {
             col.addView(hintText("当前只看：$sourceFilter（$(${resultGroups.size}) 部）"))
@@ -3592,6 +3597,54 @@ class MainActivity : Activity() {
                 if (gridHadFocus) grid.requestFocus()
             }
         }
+    }
+
+    /**
+     * 重算结果分组（过滤 + 按「第一个源是否已知不可用」排序）。
+     * 点进去默认用第一个源，上次测过失败的就往后排，让能看的先露头。
+     * @return 过滤后的条目数
+     */
+    private fun applyResultsData(): Int {
+        val visible = if (sourceFilter.isEmpty()) {
+            lastResults
+        } else {
+            lastResults.filter { it.sourceName == sourceFilter }
+        }
+        // 先把排序键算出来再排：sortedBy 的比较器每次比较都会重新取一次 key，
+        // 而 prefs.sourceTest 每次要读两个 SharedPreferences 键。
+        resultGroups = visible
+            .groupBy { it.name }
+            .map { (title, items) ->
+                val bad = prefs.sourceTest(items.first().sourceUrl)?.first == false
+                (if (bad) 1 else 0) to (title to items)
+            }
+            .sortedBy { it.first }
+            .map { it.second }
+        return visible.size
+    }
+
+    /**
+     * 结果页原地刷新：只换数据、改两行文字，不重建工具栏与网格。
+     *
+     * 慢源每返回一批结果就整页重建的话，滚动位置、焦点、甚至 GridView 的复用池
+     * 都会被打断；在结果页上直接用 notifyDataSetChanged 更平滑。
+     * 前提是网格还挂在窗口上 —— 用户已经离开就什么都不做。
+     */
+    private fun updateResultsInPlace(): Boolean {
+        val grid = resultsGrid ?: return false
+        if (!grid.isAttachedToWindow) return false
+        val visibleCount = applyResultsData()
+        (grid.adapter as? BaseAdapter)?.notifyDataSetChanged()
+        resultsTitle?.text = "${resultGroups.size} 部 · $visibleCount 条结果"
+        resultsHint?.apply {
+            if (searchInProgress) {
+                text = searchProgressNote.ifEmpty { "已先显示返回的结果，仍在并行搜索其他片源…" }
+                visibility = View.VISIBLE
+            } else {
+                visibility = View.GONE
+            }
+        }
+        return true
     }
 
     /** 按文案在视图树里找按钮：分批合并结果后把焦点还给用户原来停的那个按钮 */
@@ -3709,14 +3762,27 @@ class MainActivity : Activity() {
     }
     private fun showHome() {
         currentScreen = "home"
+        // 热门词回填、后台维护都会调 showHome() 整页重建，输入框是新建的。
+        // 这里记住「重建前焦点是不是在输入框上」，重建后把文字和焦点一起还回去，
+        // 否则用户在电视上按了半天的片名会被后台刷新抹掉。
+        val keepKeywordFocus = ::root.isInitialized && root.findFocus() is EditText
         val col = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(pagePad(48), dp(20), pagePad(48), dp(20))
         }
 
         col.addView(topBar())
-        val keywordField = field("输入影片名称…")
+        // 把上次没搜完/刚搜过的词带回来。不能直接 setText：布局前控件宽度是 0，
+        // 会算出横向滚动偏移、把开头一两个字裁掉 —— field() 里已经处理了这个时序坑。
+        val keywordField = field("输入影片名称…", homeKeyword)
         keywordField.imeOptions = EditorInfo.IME_ACTION_SEARCH
+        keywordField.addTextChangedListener(object : android.text.TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+            override fun afterTextChanged(s: android.text.Editable?) {
+                homeKeyword = s?.toString().orEmpty()
+            }
+        })
         // 输入框 + 搜索按钮固定同一行：输入框吃掉剩余宽度，按钮永远可见。
         // 旧写法是「输入框 580dp + 按钮并排」，在 600dp 左右的窄屏上按钮直接被挤出可视区，
         // 用户只看到输入框、以为没有搜索按钮。
@@ -3901,7 +3967,12 @@ class MainActivity : Activity() {
         }
 
         setScreen(col)
-        if (lastResults.isEmpty()) keywordField.requestFocus() else listView.requestFocus()
+        // 重建前焦点在输入框上就还给输入框（光标位置由 field() 回填文字时一并处理）
+        if (keepKeywordFocus || lastResults.isEmpty()) {
+            keywordField.requestFocus()
+        } else {
+            listView.requestFocus()
+        }
     }
 
     private fun doSearch(keyword: String) {
@@ -3917,6 +3988,8 @@ class MainActivity : Activity() {
         val sources = enabledSources
         val token = ++searchToken
         lastSearchKeyword = kw
+        // 点热门词/推荐海报也是搜这个词，回搜索页时输入框显示它，而不是上一次手打的内容
+        homeKeyword = kw
         searchInProgress = true
         searchProgressNote = ""
         sourceFilter = ""
@@ -3952,7 +4025,8 @@ class MainActivity : Activity() {
                 lastResults = progress.items
                 searchInProgress = true
                 searchProgressNote = describeSearchProgress(progress)
-                showResults(keepSelection = true)
+                // 已经在结果页上就只刷数据；还没进结果页（首批结果）才建整页
+                if (!updateResultsInPlace()) showResults(keepSelection = true)
                 // showResults 可能刚把页面从「首页」切成「结果页」，世代已经推进，这里跟上
                 searchResultsEpoch = screenEpoch
                 busyLabel?.text = searchProgressNote
@@ -3995,7 +4069,8 @@ class MainActivity : Activity() {
                 showHome()
             } else {
                 toast("找到 ${result.items.size} 个结果$failedNote")
-                showResults()
+                // 已经停在结果页就原地收尾，不重建整页（会打断滚动与焦点）
+                if (!updateResultsInPlace()) showResults()
             }
         }, onError = {
             if (token != searchToken) return@runApiK
@@ -4017,6 +4092,10 @@ class MainActivity : Activity() {
      * 直连失败或无结果的源再向服务端补查。每个源完成就回传一次合并结果，
      * 慢源不会挡住先返回的结果。
      *
+     * 直连和服务端各用**独立的线程池**，不再靠信号量限流：
+     * 以前服务端请求占满线程后，直连任务只能排在后面等，直连本来是快路径，
+     * 结果被慢路径堵住；拆成两个池之后两边互不影响。
+     *
      * @param shouldContinue 取消探测。搜索被取消、或被新的搜索顶掉时返回 false，
      *   这里立刻停止等待剩下的源 —— HTTP 请求本身打断不了，但界面不用陪着等。
      */
@@ -4031,34 +4110,40 @@ class MainActivity : Activity() {
         val directable = sources.filter { DirectCms.shouldTryDirect(it) }
         val items = ArrayList<SearchItem>()
         val failed = ArrayList<SourceConfig>()
-        // 直连打的是各家采集站，可以放得宽一些；服务端请求都落在同一台机器上，
-        // 8 路同时打过去容易被限流、也互相拖慢，单独限到 4 路。
-        val serverGate = java.util.concurrent.Semaphore(SERVER_SEARCH_CONCURRENCY)
         var done = 0
         var failures = 0
         fun snapshot() = SearchResult(items.distinctBy { it.sourceUrl + "|" + it.vodId }, failures)
         fun emit(retrying: Int = 0) =
             onPartial(SearchProgress(snapshot().items, failures, done, total, retrying))
 
-        val pool = java.util.concurrent.Executors.newFixedThreadPool(
-            minOf(total, MAX_SEARCH_CONCURRENCY).coerceAtLeast(1),
-        ) { r -> Thread(r, "search-source").apply { isDaemon = true } }
-        try {
-            // 每个源单独请求，最多 8 个同时进行；先完成的源先把结果交给界面。
-            val completed = java.util.concurrent.ExecutorCompletionService<SearchSourceCompletion>(pool)
-            sources.forEach { source ->
-                val direct = source in directable
-                completed.submit(java.util.concurrent.Callable {
-                    val result = runCatching {
-                        if (direct) SearchResult(DirectCms.search(source, kw), 0)
-                        else serverSearch(kw, source, serverGate)
-                    }.getOrNull()
-                    SearchSourceCompletion(source, result, direct)
-                })
+        // 完成的任务都往同一个队列里放，主循环只管按「谁先完成谁先算」取，
+        // 这样两个线程池的结果能合并成一条时间线。
+        val finished = java.util.concurrent.LinkedBlockingQueue<SearchSourceCompletion>()
+        val directPool = java.util.concurrent.Executors.newFixedThreadPool(
+            minOf(directable.size, MAX_SEARCH_CONCURRENCY).coerceAtLeast(1),
+        ) { r -> Thread(r, "search-direct").apply { isDaemon = true } }
+        // 服务端请求都落在同一台机器上，8 路同时打过去容易被限流、也互相拖慢，限到 4 路。
+        // 池大小固定 4（而不是按「必须走服务端的源数」算）：直连失败的源还要回退到这里补查，
+        // 按前者算的话，20 个源全部直连失败时会退化成单线程串行。
+        val serverPool = java.util.concurrent.Executors.newFixedThreadPool(
+            SERVER_SEARCH_CONCURRENCY,
+        ) { r -> Thread(r, "search-server").apply { isDaemon = true } }
+
+        fun submit(source: SourceConfig, direct: Boolean) {
+            val task = Runnable {
+                val result = runCatching {
+                    if (direct) SearchResult(DirectCms.search(source, kw), 0)
+                    else serverSearch(kw, source)
+                }.getOrNull()
+                finished.offer(SearchSourceCompletion(source, result, direct))
             }
+            if (direct) directPool.execute(task) else serverPool.execute(task)
+        }
+        try {
+            sources.forEach { submit(it, it in directable) }
             for (i in 0 until total) {
                 if (!shouldContinue()) return snapshot()
-                val completion = runCatching { completed.take().get() }.getOrNull()
+                val completion = runCatching { finished.take() }.getOrNull()
                 done++
                 if (completion == null) {
                     failures++
@@ -4082,15 +4167,16 @@ class MainActivity : Activity() {
             // 直连失败或无结果的源再回退服务端，仍保持并发。
             if (failed.isNotEmpty()) {
                 val pending = failed.size
-                val fallback = java.util.concurrent.ExecutorCompletionService<SearchResult?>(pool)
                 failed.forEach { source ->
-                    fallback.submit(java.util.concurrent.Callable {
-                        runCatching { serverSearch(kw, source, serverGate) }.getOrNull()
+                    serverPool.execute(Runnable {
+                        val result = runCatching { serverSearch(kw, source) }.getOrNull()
+                        finished.offer(SearchSourceCompletion(source, result, true))
                     })
                 }
                 for (i in 0 until pending) {
                     if (!shouldContinue()) return snapshot()
-                    val result = runCatching { fallback.take().get() }.getOrNull()
+                    val completion = runCatching { finished.take() }.getOrNull()
+                    val result = completion?.result
                     if (result == null) {
                         failures++
                     } else {
@@ -4102,7 +4188,8 @@ class MainActivity : Activity() {
             }
             return snapshot()
         } finally {
-            pool.shutdownNow()
+            directPool.shutdownNow()
+            serverPool.shutdownNow()
         }
     }
 
@@ -4112,19 +4199,12 @@ class MainActivity : Activity() {
      * 接口本来就收 `sources` 数组（服务端按数组逐个采集站串行请求），
      * 只传一个元素同样合法，返回结构不变 —— 所以单源请求是兼容的，
      * 只是把「服务端串行」拆成了「客户端并发 + 服务端各自串行」。
+     *
+     * 超时按单源收紧到 15 秒：45 秒是「一次问十几个站」的余量，
+     * 单源用这个值会让一个装死的源白占工作线程一分多钟。
      */
-    private fun serverSearch(
-        kw: String,
-        source: SourceConfig,
-        gate: java.util.concurrent.Semaphore,
-    ): SearchResult {
-        gate.acquire()
-        try {
-            return api.search(kw, listOf(source))
-        } finally {
-            gate.release()
-        }
-    }
+    private fun serverSearch(kw: String, source: SourceConfig): SearchResult =
+        api.search(kw, listOf(source), readTimeoutMs = SEARCH_SOURCE_TIMEOUT_MS)
 
     /** 详情：能直连就直连，拿不到再回退服务端（行为与服务端 /api/detail 对齐） */
     private fun directDetailOrServer(vodId: String, source: SourceConfig): Detail {
@@ -4134,24 +4214,6 @@ class MainActivity : Activity() {
         }
         return api.detail(vodId, source)
     }
-
-    /** 采集站的简介常带 <p>/<br>/&nbsp; 这类标记，直接显示会很脏。 */
-    private fun stripHtml(text: String): String =
-        text.replace(Regex("<[^>]{0,40}>"), " ")
-            .replace("&nbsp;", " ")
-            .replace("&amp;", "&")
-            .replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .replace(Regex("\\s+"), " ")
-            .trim()
-
-    /** 去掉括号注记、年份与标点，得到更可能被采集站命中的片名。 */
-    private fun cleanKeyword(keyword: String): String =
-        keyword
-            .replace(Regex("[（(\\[【][^）)\\]】]*[）)\\]】]"), "")
-            .replace(Regex("[·:：!！?？,，.。\\-—_~、|]+"), " ")
-            .replace(Regex("\\s+"), " ")
-            .trim()
 
     /* --------------------------------------------------------------- 详情页 */
 
@@ -4525,10 +4587,6 @@ class MainActivity : Activity() {
             sourceName = h.sourceName,
         )
     }
-
-    /** "海贼王 · 第 1135/1180 集" → "海贼王" */
-    private fun seriesNameOf(label: String): String =
-        label.substringBefore(" · 第").substringBefore("·第").trim()
 
     /** 整季播放：把整个集数列表交给播放器，一集放完自动进下一集 */
     private fun playFromList(
@@ -5791,15 +5849,13 @@ class MainActivity : Activity() {
         }
         toast("正在切换到「$label」…")
         runApiK("mediaswitch", null, {
-            runBlocking {
-                val latest = async(Dispatchers.IO) {
-                    runCatching { api.douban(type, "最新", 0, 8) }.getOrDefault(emptyList())
-                }
-                val popular = async(Dispatchers.IO) {
-                    runCatching { api.douban(type, "热门", 0, 8) }.getOrDefault(emptyList())
-                }
-                (latest.await() + popular.await()).distinctBy { it.title.trim() }
+            val latest = async(Dispatchers.IO) {
+                runCatching { api.douban(type, "最新", 0, 8) }.getOrDefault(emptyList())
             }
+            val popular = async(Dispatchers.IO) {
+                runCatching { api.douban(type, "热门", 0, 8) }.getOrDefault(emptyList())
+            }
+            (latest.await() + popular.await()).distinctBy { it.title.trim() }
         }, { items ->
             if (items.isEmpty()) {
                 toast("「$label」暂时没有推荐，保持原来的列表")
@@ -5833,17 +5889,15 @@ class MainActivity : Activity() {
         // 翻页不要提示：以前滚到底部会弹一个「加载更多…」对话框，非常吵。
         // 首屏加载也有页面内的「正在整理最新热播剧集…」兜着，同样不需要胶囊。
         runApiK("recommend", null, {
-            runBlocking {
-                val tag = prefs.recommendTag
-                // 混合模式两路各取 8；单选某个榜单就一次取 16，条数别变少
-                val specs = if (tag.isEmpty()) listOf("最新" to 8, "热门" to 8) else listOf(tag to 16)
-                specs.map { (t, n) ->
-                    async(Dispatchers.IO) {
-                        runCatching { api.douban(loadingType, t, page * n, n) }
-                            .getOrDefault(emptyList())
-                    }
-                }.awaitAll().flatten().distinctBy { it.title.trim() }
-            }
+            val tag = prefs.recommendTag
+            // 混合模式两路各取 8；单选某个榜单就一次取 16，条数别变少
+            val specs = if (tag.isEmpty()) listOf("最新" to 8, "热门" to 8) else listOf(tag to 16)
+            specs.map { (t, n) ->
+                async(Dispatchers.IO) {
+                    runCatching { api.douban(loadingType, t, page * n, n) }
+                        .getOrDefault(emptyList())
+                }
+            }.awaitAll().flatten().distinctBy { it.title.trim() }
         }, { items ->
             isLoadingMore = false
             if (loadingType != mediaType) return@runApiK

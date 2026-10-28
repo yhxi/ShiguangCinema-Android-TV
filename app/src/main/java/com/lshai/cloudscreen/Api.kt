@@ -188,13 +188,22 @@ class Api(baseUrl: String) {
         return status()
     }
 
-    fun search(keyword: String, sources: List<SourceConfig>): SearchResult {
+    /**
+     * 搜索。`readTimeoutMs` 按「一次请求要问几个采集站」来定：
+     * 整批十几个源时 45 秒是常态；现在客户端按源拆开并发，单个源就不该再给这么长，
+     * 否则一个装死的源能占住工作线程一分多钟。
+     */
+    fun search(
+        keyword: String,
+        sources: List<SourceConfig>,
+        readTimeoutMs: Int = 45_000,
+    ): SearchResult {
         val payload = JSONObject().apply {
             put("wd", keyword)
             put("sources", JSONArray().apply { sources.forEach { put(it.toJson()) } })
             put("filterAdult", true)
         }
-        val conn = open("/api/search", readTimeoutMs = 45000).apply {
+        val conn = open("/api/search", readTimeoutMs = readTimeoutMs).apply {
             requestMethod = "POST"
             doOutput = true
             setRequestProperty("Content-Type", "application/json")

@@ -29,6 +29,11 @@ import java.util.concurrent.atomic.AtomicLong
  */
 class ImageLoader(private val context: Context, api: Api) {
 
+    private companion object {
+        /** 请求宽度不超过这个值就按「小图」处理：RGB_565 + 只在列表/网格里出现 */
+        const val SMALL_IMAGE_MAX_WIDTH = 400
+    }
+
     /**
      * 换服务器时只换 BaseUrl 与 Cookie，**不重建 ImageLoader** ——
      * 重建会把内存与磁盘缓存一起丢掉，重新连接后满屏海报又要重下一遍。
@@ -70,6 +75,7 @@ class ImageLoader(private val context: Context, api: Api) {
             onReady(null)
             return
         }
+        // 内存缓存仍按尺寸分：列表要小图、详情页要大图，混用会把缓存挤爆
         val key = "$url@${reqWidth}x$reqHeight"
         cache.get(key)?.let {
             onReady(it)
@@ -85,12 +91,12 @@ class ImageLoader(private val context: Context, api: Api) {
             inFlight[key] = mutableListOf(onReady)
         }
         pool.execute {
-            val cached = readFromDisk(key)
+            val cached = readFromDisk(url, reqWidth, reqHeight)
             val bmp = cached ?: download(url, reqWidth, reqHeight)
             // 先交给界面显示，再在后台写磁盘。JPEG 压缩不应挡住首张海报出现。
             main.post { if (!closed) deliver(key, bmp) }
             if (cached == null && bmp != null && !closed) {
-                runCatching { diskPool.execute { writeToDisk(key, bmp) } }
+                runCatching { diskPool.execute { writeToDisk(url, bmp, reqWidth) } }
             }
         }
     }
@@ -113,11 +119,10 @@ class ImageLoader(private val context: Context, api: Api) {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
         if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
-        var sample = 1
-        while (bounds.outWidth / (sample * 2) >= reqWidth && bounds.outHeight / (sample * 2) >= reqHeight) {
-            sample *= 2
+        val opts = BitmapFactory.Options().apply {
+            inSampleSize = sampleFor(bounds.outWidth, bounds.outHeight, reqWidth, reqHeight)
+            inPreferredConfig = configFor(reqWidth)
         }
-        val opts = BitmapFactory.Options().apply { inSampleSize = sample }
         return try {
             BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
         } catch (e: OutOfMemoryError) {
@@ -125,25 +130,64 @@ class ImageLoader(private val context: Context, api: Api) {
         }
     }
 
+    /** 2 的幂降采样：两个方向都不能小于请求值 */
+    private fun sampleFor(srcW: Int, srcH: Int, reqW: Int, reqH: Int): Int {
+        var sample = 1
+        while (srcW / (sample * 2) >= reqW && srcH / (sample * 2) >= reqH) {
+            sample *= 2
+        }
+        return sample
+    }
+
+    /**
+     * 列表/结果页的小海报用 RGB_565：海报是照片，肉眼差别很小，内存直接省一半，
+     * 老盒子（堆只有 192MB）上少一半 GC 抖动。详情页的大封面仍用 ARGB_8888。
+     */
+    private fun configFor(reqWidth: Int): Bitmap.Config =
+        if (reqWidth <= SMALL_IMAGE_MAX_WIDTH) Bitmap.Config.RGB_565 else Bitmap.Config.ARGB_8888
+
     /* ------------------------------------------------------------ 磁盘缓存 */
 
     /**
      * 磁盘上存的是**已经降采样过**的位图：下次进来直接解码小图，不用重新下载、也不用再缩一遍。
      * 用 JPEG(85) 而不是 PNG —— 海报是照片类内容，PNG 体积要大三四倍。
+     *
+     * 文件名只按 URL 算，**不带尺寸**：同一张海报在列表里是 240px、详情页要 600px，
+     * 按尺寸分目录会留下两三份副本，50MB 的缓存实际只装得下一半的片子。
+     * 读取时按本次请求再降采样（见 [readFromDisk]）。
      */
-    private fun diskFile(key: String): File =
-        File(diskDir, sha1(key) + ".img")
+    private fun diskFile(url: String): File = File(diskDir, sha1(url) + ".img")
 
-    private fun readFromDisk(key: String): Bitmap? {
-        val f = diskFile(key)
+    /**
+     * 已经确认「原图本身就这么大」的 URL。
+     * 没有这个标记的话，每次进详情页都会因为「磁盘上那张比要的小」重新下一遍，
+     * 而下回来的还是同样大小，永远收敛不了。
+     */
+    private val diskSmall = java.util.Collections.synchronizedSet(HashSet<String>())
+
+    private fun readFromDisk(url: String, reqWidth: Int, reqHeight: Int): Bitmap? {
+        val f = diskFile(url)
         if (!f.isFile || f.length() == 0L) return null
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(f.absolutePath, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+            // 文件坏了（写一半被杀、空间不足）就删掉，下次重新下载
+            runCatching { f.delete() }
+            return null
+        }
+        // 磁盘上是小图、这次要的是大图（先看了列表再进详情）：当作没有，重新下一张大的。
+        // 但只重下一次 —— 原图就这么大的话，再下也没用。
+        if (bounds.outWidth < reqWidth * 9 / 10 && url !in diskSmall) return null
+        val opts = BitmapFactory.Options().apply {
+            inSampleSize = sampleFor(bounds.outWidth, bounds.outHeight, reqWidth, reqHeight)
+            inPreferredConfig = configFor(reqWidth)
+        }
         val bmp = try {
-            BitmapFactory.decodeFile(f.absolutePath)
+            BitmapFactory.decodeFile(f.absolutePath, opts)
         } catch (e: OutOfMemoryError) {
             null
         }
         if (bmp == null) {
-            // 文件坏了（写一半被杀、空间不足）就删掉，下次重新下载
             runCatching { f.delete() }
             return null
         }
@@ -152,11 +196,14 @@ class ImageLoader(private val context: Context, api: Api) {
         return bmp
     }
 
-    private fun writeToDisk(key: String, bmp: Bitmap) {
+    private fun writeToDisk(url: String, bmp: Bitmap, reqWidth: Int) {
         runCatching {
             if (!diskDir.exists()) diskDir.mkdirs()
             ensureDiskScanned()
-            val target = diskFile(key)
+            val target = diskFile(url)
+            // 覆盖前先记下旧文件的宽度：新图没有更大，说明原图已经到顶
+            val oldWidth = if (target.isFile) storedWidth(target) else 0
+            val oldLen = if (target.isFile) target.length() else 0L
             val tmp = File(diskDir, target.name + ".tmp")
             val ok = tmp.outputStream().use { out ->
                 bmp.compress(Bitmap.CompressFormat.JPEG, 85, out)
@@ -171,9 +218,19 @@ class ImageLoader(private val context: Context, api: Api) {
                 tmp.delete()
                 return
             }
-            diskBytes.addAndGet(target.length())
+            // 覆盖写要扣掉旧文件的体积，否则统计只增不减，缓存会被提前判满
+            diskBytes.addAndGet(target.length() - oldLen)
+            // 新图还是不够这次要的尺寸（原图就这么大），或者根本没比旧的大：
+            // 记下来，以后别再为同一张图反复重下
+            if (bmp.width <= oldWidth || bmp.width < reqWidth * 9 / 10) diskSmall.add(url)
             trimDiskIfNeeded()
         }
+    }
+
+    private fun storedWidth(f: File): Int {
+        val b = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(f.absolutePath, b)
+        return b.outWidth
     }
 
     /** 首次写入前扫一遍目录，得到当前占用；只扫一次 */
@@ -204,6 +261,7 @@ class ImageLoader(private val context: Context, api: Api) {
         runCatching { diskDir.deleteRecursively() }
         diskBytes.set(0)
         diskScanned.set(true)
+        diskSmall.clear()
         return n
     }
 

@@ -157,12 +157,9 @@ class Prefs(ctx: Context) {
      * 但换源恰恰是因为原源卡了/失效了，这个场景很常见。剧名 + 集号 是跨源唯一稳定的坐标
      * （片头片尾标记也是这么存的，见 skipKey）。
      *
-     * 剧名先做一遍归一化：不同采集站返回的标题经常差在空格、全角括号、`·` 分隔符上
-     * （「海贼王」/「海贼王 · 更新至 1000 集」），不归一化就白白匹配不上。
+     * 剧名先做一遍归一化（规则见 [normalizeSeries]）：不同采集站返回的标题经常差在空格、
+     * 全角括号、`·` 分隔符上（「海贼王」/「海贼王 · 更新至 1000 集」），不归一化就白白匹配不上。
      */
-    private fun normalizeSeries(series: String): String =
-        series.replace(Regex("[\\s·・\\-—_()（）\\[\\]【】:：,，.。]"), "").lowercase()
-
     private fun episodeKey(series: String, index: Int): String {
         val s = normalizeSeries(series)
         if (s.isEmpty() || index < 0) return ""

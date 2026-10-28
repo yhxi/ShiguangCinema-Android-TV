@@ -36,8 +36,8 @@ android {
         // 23 = Android 6.0：Media3 的下限之上，老盒子都能装
         minSdk = 23
         targetSdk = 37
-        versionCode = 42
-        versionName = "1.1.3"
+        versionCode = 43
+        versionName = "1.1.4"
     }
 
     signingConfigs {
@@ -94,6 +94,14 @@ android {
         abortOnError = false
         checkReleaseBuilds = false
     }
+
+    testOptions {
+        unitTests {
+            // 纯逻辑单测跑在 JVM 上，不启动 Android 运行时：
+            // 万一被测代码碰到 android.* 的方法，返回默认值而不是抛 "not mocked"
+            isReturnDefaultValues = true
+        }
+    }
 }
 
 dependencies {
@@ -112,4 +120,7 @@ dependencies {
     implementation("androidx.annotation:annotation:1.6.0")
     implementation("androidx.core:core:1.9.0")
     implementation("androidx.collection:collection:1.2.0")
+
+    // 纯函数单测（片名清洗、播放地址解析、版本号比较），只跑在 JVM 上，不进 APK
+    testImplementation("junit:junit:4.13.2")
 }
