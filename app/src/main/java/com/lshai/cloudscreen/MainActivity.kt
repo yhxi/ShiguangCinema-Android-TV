@@ -189,6 +189,13 @@ class MainActivity : Activity() {
     private var resultsHint: TextView? = null
     /** 搜索页输入框的内容：整页重建（热门词回填等）时要把用户打的字带回去 */
     private var homeKeyword = ""
+    /** 搜索页热门榜单的就地填充容器（label → 视图），showHome 每次重建时清空重建 */
+    private val hotChipRows = linkedMapOf<String, LinearLayout>()
+    private val hotHintViews = linkedMapOf<String, TextView>()
+    private val hotBoxes = linkedMapOf<String, LinearLayout>()
+    /** 搜索页的联想候选区与结果列表：打字时二选一显示 */
+    private var homeSuggestBox: LinearLayout? = null
+    private var homeResultsList: View? = null
     /** 详情页短时缓存：key = vodId + 源地址，value = (写入时间, 详情) */
     private val detailCache = HashMap<String, Pair<Long, Detail>>()
     /** 片源管理列表：测速完只刷行内容，不重建整页 */
@@ -3757,29 +3764,161 @@ class MainActivity : Activity() {
 
     /* --------------------------------------------------------------- 热门搜索 */
 
-    /** 搜索页热门搜索：按类型缓存，取首页排行榜前 10 条 */
-    private val hotSearchTitles = mutableMapOf<String, List<String>>()
+    /** 搜索页的热门分类。动画/动漫的豆瓣榜单不做适龄过滤，儿童向用精选清单。 */
+    private data class HotCategory(
+        val label: String,
+        val doubanType: String?,
+        val doubanTag: String?,
+    )
+
+    private val hotCategories = listOf(
+        HotCategory("热门电影", "movie", "热门"),
+        HotCategory("热门电视剧", "tv", "热门"),
+        // 儿童向动画只给精选清单：豆瓣的「动画」分类混着全部年龄段，家长要的是「闭眼点都安全」
+        HotCategory("热门动画 · 适合小朋友", null, null),
+        // 国漫：先给精选（用户点名的几部排最前），豆瓣「国产动画」榜单能拉到就接在后面
+        HotCategory("热门动漫", "tv", "国产动画"),
+    )
+
+    /** 6 岁上下能看的动画：经典、全龄、无恐怖暴力元素 */
+    private val KIDS_ANIMATION = listOf(
+        "小猪佩奇", "汪汪队立大功", "超级飞侠", "海底小纵队", "萌鸡小队",
+        "超级宝贝JOJO", "熊出没", "猪猪侠", "大耳朵图图", "小马宝莉",
+    )
+
+    /** 国漫精选：仙逆 / 凡人修仙传 / 斗破按用户点名顺序排最前 */
+    private val DONGHUA_PICKS = listOf(
+        "仙逆", "凡人修仙传", "斗破苍穹", "完美世界", "遮天", "斗罗大陆",
+        "神印王座", "吞噬星空", "师兄啊师兄", "剑来", "牧神记", "诛仙",
+    )
+
+    private fun curatedTitles(label: String): List<String> = when {
+        label.startsWith("热门动画") -> KIDS_ANIMATION
+        label == "热门动漫" -> DONGHUA_PICKS
+        else -> emptyList()
+    }
+
+    /** 各分类的热门片名；豆瓣拉不到就用精选清单兜底，保证每一类都有内容 */
+    private val hotTitles = linkedMapOf<String, List<String>>()
+
+    /** 联想词池：片名 → 所属分类，首字母匹配的数据源 */
+    private val suggestPool = linkedMapOf<String, String>()
+
+    /**
+     * 刚完成一次搜索后置 true：回搜索页时输入框里是刚搜过的词，
+     * 但这时应该显示热门榜单而不是把刚搜过的词再联想一遍。
+     * 用户一打字就清掉。
+     */
+    private var homeSuppressSuggest = false
+
+    /** 片名 → 拼音首字母的缓存，输入时不再逐字编码 */
+    private val initialsCache = HashMap<String, String>()
 
     private fun ensureHotSearch() {
-        if (hotSearchTitles.size >= 3 || hotSearchJob?.isActive == true) return
+        if (hotTitles.size >= hotCategories.size || hotSearchJob?.isActive == true) return
         hotSearchJob = scope.launch {
             // 热门词只用于提示，不该在用户刚打开搜索页时与手动搜索抢网络。
-            delay(1_200)
+            delay(800)
             if (currentScreen != "home") return@launch
-            val specs = listOf("movie" to "热门", "tv" to "热门", "show" to "综艺")
-            for ((type, tag) in specs) {
+            for (cat in hotCategories) {
                 if (currentScreen != "home") break
-                if (hotSearchTitles.containsKey(type)) continue
-                val items = withContext(kotlinx.coroutines.Dispatchers.IO) {
-                    runCatching { api.douban(type, tag, 0, 10) }.getOrDefault(emptyList())
+                if (hotTitles.containsKey(cat.label)) continue
+                val curated = curatedTitles(cat.label)
+                val fetched = if (cat.doubanType == null) {
+                    emptyList()
+                } else {
+                    withContext(kotlinx.coroutines.Dispatchers.IO) {
+                        runCatching {
+                            api.douban(cat.doubanType, cat.doubanTag!!, 0, 25)
+                        }.getOrDefault(emptyList())
+                    }.map { it.title }.filter { it.isNotBlank() }
                 }
-                hotSearchTitles[type] = items.map { it.title }.filter { it.isNotBlank() }
-            }
-            withContext(kotlinx.coroutines.Dispatchers.Main) {
-                if (currentScreen == "home") showHome()
+                // 精选排前面（顺序就是推荐顺序），豆瓣榜单接在后面补充
+                hotTitles[cat.label] = (curated + fetched).distinct().take(12)
+                rebuildSuggestPool()
+                withContext(kotlinx.coroutines.Dispatchers.Main) {
+                    if (currentScreen == "home") refreshHotChips()
+                }
             }
         }
     }
+
+    /** 重建联想词池：搜索历史 + 看过的剧 + 各类热门榜单 + 首页推荐 */
+    private fun rebuildSuggestPool() {
+        suggestPool.clear()
+        fun add(title: String, label: String) {
+            val t = title.trim()
+            if (t.isNotEmpty() && !suggestPool.containsKey(t)) suggestPool[t] = label
+        }
+        prefs.searchHistory().forEach { add(it, "最近搜索") }
+        prefs.history().take(20).forEach { add(it.seriesTitle.ifEmpty { historyTitle(it) }, "看过的") }
+        hotTitles.forEach { (label, titles) -> titles.forEach { add(it, label) } }
+        recommendItems.forEach { add(it.title, "推荐") }
+        lastResults.forEach { add(it.name, "搜索结果") }
+    }
+
+    /**
+     * 输入联想：片名包含关键词，或拼音首字母以关键词开头（2 个字母以上放宽到包含）。
+     * 「cjqc」→《超级汽车》、「xn」→《仙逆》就是靠第二条命中的。
+     */
+    private fun matchSuggestions(q: String): List<Pair<String, String>> {
+        val out = mutableListOf<Pair<String, String>>()
+        for ((title, label) in suggestPool) {
+            val initials = initialsCache.getOrPut(title) { PinyinInitials.initialsOf(title) }
+            val hit = title.lowercase().contains(q) ||
+                initials.startsWith(q) ||
+                (q.length >= 2 && initials.contains(q))
+            if (hit) out.add(title to label)
+            if (out.size >= 6) break
+        }
+        return out
+    }
+
+    /**
+     * 就地刷新热门榜单的 chip 行。数据是后台分批到的，到一批填一批；
+     * 不重建整页，正在打字的输入法不会被关掉。
+     */
+    private fun refreshHotChips() {
+        for ((label, row) in hotChipRows) {
+            val titles = hotTitles[label].orEmpty()
+            val box = hotBoxes[label] ?: continue
+            if (titles.isEmpty()) {
+                box.visibility = View.GONE
+                continue
+            }
+            row.removeAllViews()
+            titles.forEach { title -> row.addView(chip(title) { doSearch(title) }) }
+        }
+    }
+
+    /**
+     * 搜索页正文的显隐切换：正在打字且有候选 → 显示联想、隐藏榜单和结果；
+     * 没在打字（刚搜过、回填的关键词）→ 恢复榜单和结果。
+     * 全部是 visibility 切换，不重建视图。
+     */
+    private fun refreshSearchBody() {
+        val box = homeSuggestBox ?: return
+        val typing = homeKeyword.isNotBlank() && !homeSuppressSuggest
+        val q = if (typing) homeKeyword.trim().lowercase() else ""
+        val matches = if (q.isEmpty()) emptyList() else matchSuggestions(q)
+        box.visibility = if (matches.isEmpty()) View.GONE else View.VISIBLE
+        if (matches.isNotEmpty()) {
+            box.removeAllViews()
+            box.addView(hintText("输入首字母或片名，选中直接搜").apply { setPadding(0, dp(4), 0, dp(2)) })
+            matches.forEach { (title, label) ->
+                box.addView(
+                    focusRow("$title　·　$label") { doSearch(title) },
+                    LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(52)),
+                )
+            }
+        }
+        val searching = typing && matches.isNotEmpty()
+        hotBoxes.forEach { (label, v) ->
+            v.visibility = if (searching || hotTitles[label].isNullOrEmpty()) View.GONE else View.VISIBLE
+        }
+        homeResultsList?.visibility = if (searching) View.GONE else View.VISIBLE
+    }
+
     private fun showHome() {
         currentScreen = "home"
         // 热门词回填、后台维护都会调 showHome() 整页重建，输入框是新建的。
@@ -3800,7 +3939,13 @@ class MainActivity : Activity() {
             override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
             override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
             override fun afterTextChanged(s: android.text.Editable?) {
-                homeKeyword = s?.toString().orEmpty()
+                val text = s?.toString().orEmpty()
+                // field() 回填的是同一段文字，不算用户输入（也不该清掉 suppress 标记）
+                if (text == homeKeyword) return
+                homeKeyword = text
+                homeSuppressSuggest = false
+                // 只就地刷新候选与榜单的显隐，不重建页面 —— 重建会关掉正在打字的输入法
+                refreshSearchBody()
             }
         })
         // 输入框 + 搜索按钮固定同一行：输入框吃掉剩余宽度，按钮永远可见。
@@ -3819,20 +3964,35 @@ class MainActivity : Activity() {
         })
         col.addView(inputRow)
 
-        // 热门搜索：电影 / 剧集 / 综艺 各取排行榜前 10，点一下直接搜
+        // 热门榜单：四类（电影 / 电视剧 / 儿童动画 / 国漫），数据到了就地填充 chip 行，
+        // 不重建整页 —— 重建会把正在打字的输入法关掉
         ensureHotSearch()
-        for ((type, label) in listOf(
-            "movie" to "热门电影",
-            "tv" to "热门剧集",
-            "show" to "热门综艺",
-        )) {
-            val titles = hotSearchTitles[type].orEmpty()
-            if (titles.isEmpty()) continue
-            col.addView(hintText(label))
+        val hotSection = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        for (cat in hotCategories) {
+            val hint = hintText(cat.label)
             val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-            titles.forEach { title -> row.addView(chip(title) { doSearch(title) }) }
-            col.addView(hScroll(row))
+            val box = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                addView(hint)
+                addView(hScroll(row))
+            }
+            hotHintViews[cat.label] = hint
+            hotChipRows[cat.label] = row
+            hotBoxes[cat.label] = box
+            hotSection.addView(box)
         }
+        col.addView(hotSection)
+
+        // 输入联想：打字（含拼音首字母，如 cjqc → 超级汽车）时显示候选，
+        // 遥控器上下移到候选行、OK 直接搜。有候选时隐藏热门榜单和结果列表。
+        val suggestBox = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+        }
+        homeSuggestBox = suggestBox
+        col.addView(suggestBox)
+        rebuildSuggestPool()
+        refreshHotChips()
 
         val statusRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -3884,6 +4044,7 @@ class MainActivity : Activity() {
         // 重搜一部之前看过的片子应该是一次点击的事。
         val history = prefs.searchHistory()
         val listView = newList()
+        homeResultsList = listView
         if (lastResults.isEmpty()) {
             if (history.isEmpty()) {
                 col.addView(
@@ -3986,6 +4147,9 @@ class MainActivity : Activity() {
             } else false
         }
 
+        // 结果列表在本方法后面才创建，这里最后再同步一次联想/榜单的显隐
+        refreshSearchBody()
+
         setScreen(col)
         // 重建前焦点在输入框上就还给输入框（光标位置由 field() 回填文字时一并处理）
         if (keepKeywordFocus || lastResults.isEmpty()) {
@@ -4010,6 +4174,7 @@ class MainActivity : Activity() {
         lastSearchKeyword = kw
         // 点热门词/推荐海报也是搜这个词，回搜索页时输入框显示它，而不是上一次手打的内容
         homeKeyword = kw
+        homeSuppressSuggest = true
         searchInProgress = true
         searchProgressNote = ""
         sourceFilter = ""

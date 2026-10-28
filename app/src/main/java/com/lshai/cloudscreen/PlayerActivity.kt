@@ -98,6 +98,8 @@ class PlayerActivity : Activity() {
         private const val SAVE_INTERVAL_MS = 5_000L
         /** 进度真正落盘的最小间隔：轮询 5 秒一次，但写盘 30 秒一次就够 */
         private const val PERSIST_INTERVAL_MS = 30_000L
+        /** 中央「缓冲中…」的延迟显示：短暂卡顿（换分片、网络抖动）不弹大字 */
+        private const val BUFFERING_UI_DELAY_MS = 700L
         private const val NOTIFICATION_ID = 0x5EC0
         /** 外挂字幕文件选择（SAF） */
         private const val REQ_SUBTITLE = 0x5EC1
@@ -311,6 +313,22 @@ class PlayerActivity : Activity() {
     }
 
     private val clearPendingSeek = Runnable { pendingSeek = -1L }
+
+    /**
+     * 缓冲提示延迟显示：卡住超过 700ms 才把中央的「缓冲中…」放出来。
+     * HLS 换分片经常卡几百毫秒，立即弹大字会闪个不停；到点时再核对一次状态，
+     * 已经恢复播放就不显示了。
+     */
+    private val showBufferingUi = Runnable {
+        if (player?.playbackState == Player.STATE_BUFFERING) {
+            bufferingText.visibility = View.VISIBLE
+            speedText.visibility = View.VISIBLE
+            lastBytes = 0L
+            lastMs = 0L
+            handler.removeCallbacks(speedTick)
+            handler.post(speedTick)
+        }
+    }
 
     /** 片尾倒计时：靠轮询播放位置实现，不依赖播放器自己的「播完」时机，切集不会重复触发 */
     private val nextTick = object : Runnable {
@@ -914,7 +932,10 @@ class PlayerActivity : Activity() {
                             titleText.text = baseText
                             titleText.setTextColor(android.graphics.Color.parseColor("#cbd5e1"))
                         }
-                        bufferingText.visibility = View.VISIBLE
+                        // 换集的缓冲提示交给 onPlaybackStateChanged 的延迟逻辑：
+                        // 秒开的集数不该闪一下「缓冲中…」，真卡住了自然会显示
+                        bufferingText.visibility = View.GONE
+                        speedText.visibility = View.GONE
                         updateChrome()
                         if (urls.size > 1 && reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) {
                             toast("自动播放：第 ${currentIndex + 1} 集")
@@ -926,14 +947,18 @@ class PlayerActivity : Activity() {
 
                     override fun onPlaybackStateChanged(playbackState: Int) {
                         val buffering = playbackState == Player.STATE_BUFFERING
-                        bufferingText.visibility = if (buffering) View.VISIBLE else View.GONE
-                        speedText.visibility = if (buffering) View.VISIBLE else View.GONE
+                        // 中央「缓冲中…」延迟 700ms 才出现：HLS 换分片经常卡几百毫秒，
+                        // 每次都弹大字会闪个不停；短暂卡顿用户根本无感，长卡才需要解释。
+                        handler.removeCallbacks(showBufferingUi)
+                        if (buffering) {
+                            handler.postDelayed(showBufferingUi, BUFFERING_UI_DELAY_MS)
+                        } else {
+                            bufferingText.visibility = View.GONE
+                            speedText.visibility = View.GONE
+                        }
                         handler.removeCallbacks(speedTick)
                         if (buffering) {
                             handler.removeCallbacks(hideAfterBuffering)
-                            lastBytes = 0L
-                            lastMs = 0L
-                            handler.post(speedTick)
                         } else if (playbackState == Player.STATE_READY && player?.playWhenReady == true) {
                             handler.removeCallbacks(hideAfterBuffering)
                             handler.postDelayed(hideAfterBuffering, 3_000L)
@@ -1000,6 +1025,7 @@ class PlayerActivity : Activity() {
                         baseText = msg
                         titleText.text = msg
                         titleText.setTextColor(android.graphics.Color.parseColor("#fca5a5"))
+                        handler.removeCallbacks(showBufferingUi)
                         bufferingText.visibility = View.GONE
                         speedText.visibility = View.GONE
                         updateChrome()
@@ -3317,7 +3343,9 @@ class PlayerActivity : Activity() {
         baseText = labelFor(index)
         titleText.text = baseText
         titleText.setTextColor(android.graphics.Color.parseColor("#cbd5e1"))
-        bufferingText.visibility = View.VISIBLE
+        // 缓冲提示交给延迟逻辑：卡住超过 700ms 才显示，秒开不闪大字
+        bufferingText.visibility = View.GONE
+        speedText.visibility = View.GONE
         p.seekTo(index, startAt)
         p.play()
         updateChrome()
@@ -3605,6 +3633,7 @@ class PlayerActivity : Activity() {
         handler.removeCallbacks(hideUi)
         handler.removeCallbacks(hideAfterBuffering)
         handler.removeCallbacks(speedTick)
+        handler.removeCallbacks(showBufferingUi)
         handler.removeCallbacks(hideActions)
         handler.removeCallbacks(clearPendingSeek)
         handler.removeCallbacks(nextTick)
