@@ -191,11 +191,14 @@ class MainActivity : Activity() {
     private var homeKeyword = ""
     /** 搜索页热门榜单的就地填充容器（label → 视图），showHome 每次重建时清空重建 */
     private val hotChipRows = linkedMapOf<String, LinearLayout>()
-    private val hotHintViews = linkedMapOf<String, TextView>()
     private val hotBoxes = linkedMapOf<String, LinearLayout>()
     /** 搜索页的联想候选区与结果列表：打字时二选一显示 */
     private var homeSuggestBox: LinearLayout? = null
     private var homeResultsList: View? = null
+    /** 最近搜索卡片：只要搜过就常驻，打字联想时收起 */
+    private var homeHistoryBox: LinearLayout? = null
+    /** 热门榜单整块（四张卡片的外壳）：出搜索结果时让位给结果列表 */
+    private var homeHotSection: LinearLayout? = null
     /** 详情页短时缓存：key = vodId + 源地址，value = (写入时间, 详情) */
     private val detailCache = HashMap<String, Pair<Long, Detail>>()
     /** 片源管理列表：测速完只刷行内容，不重建整页 */
@@ -717,23 +720,135 @@ class MainActivity : Activity() {
         }
 
     /**
-     * 小号标签（热门搜索、快捷筛选用）。
+     * 小号标签（最近搜索的词条用它）。
      *
-     * 以前热门搜索也用主按钮样式（16sp / 46dp 高 / 最小 76dp 宽），一排十个叠下来像一面按钮墙，
-     * 和页面里的「搜索」主按钮抢注意力。这里降一档：13sp、深色卡片底、只有聚焦才有描边。
+     * 只在白底卡片内出现，底色用 SOFT 浅灰绿跟卡片区分开；聚焦才有描边。
      */
-    private fun chip(label: String, onClick: () -> Unit): TextView =
+    private fun chip(label: String, bg: Int = SOFT, onClick: () -> Unit): TextView =
         TextView(this).apply {
             setText(label)
-            setTextSize(13f)
-            setTextColor(BRIGHTER_TEXT)
+            setTextSize(14f)
+            setTextColor(TEXT_COLOR)
             isSingleLine = true
             isFocusable = true
             isFocusableInTouchMode = true
-            setPadding(dp(12), dp(9), dp(12), dp(9))
+            setPadding(dp(14), dp(8), dp(14), dp(8))
             setOnClickListener { onClick() }
-            applyFocusStyle(this, PANEL, this, focusScale = 1f)
+            applyFocusStyle(this, bg, this, focusScale = 1f)
         }
+
+    /** 白底圆角卡片（热门榜单 / 最近搜索）：细描边 + 大圆角，让榜单像一块正式版面。 */
+    private fun panelCard(): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(14), dp(10), dp(14), dp(12))
+        background = GradientDrawable().apply {
+            setColor(PANEL)
+            cornerRadius = dp(16).toFloat()
+            setStroke(dp(1), BORDER)
+        }
+    }
+
+    /**
+     * 卡片头：竖色条 + 加粗标题 + 右侧小注。
+     * actionLabel 传了就在最右侧放一个可聚焦的小动作（如「清空」）。
+     */
+    private fun cardHeader(
+        label: String,
+        note: String,
+        actionLabel: String? = null,
+        onAction: (() -> Unit)? = null,
+    ): LinearLayout {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        row.addView(
+            View(this).apply {
+                background = GradientDrawable().apply {
+                    setColor(ACCENT)
+                    cornerRadius = dp(2).toFloat()
+                }
+            },
+            LinearLayout.LayoutParams(dp(4), dp(18)).apply { rightMargin = dp(8) },
+        )
+        row.addView(
+            TextView(this).apply {
+                setText(label)
+                setTextSize(16f)
+                setTextColor(INK)
+                setTypeface(null, Typeface.BOLD)
+            },
+        )
+        row.addView(View(this), LinearLayout.LayoutParams(0, dp(1), 1f))
+        row.addView(
+            TextView(this).apply {
+                setText(note)
+                setTextSize(12f)
+                setTextColor(BRIGHTER_TEXT)
+            },
+        )
+        if (actionLabel != null && onAction != null) {
+            row.addView(
+                TextView(this).apply {
+                    setText(actionLabel)
+                    setTextSize(13f)
+                    setTextColor(ACCENT)
+                    isFocusable = true
+                    isFocusableInTouchMode = true
+                    setPadding(dp(10), dp(4), dp(10), dp(4))
+                    setOnClickListener { onAction() }
+                    applyFocusStyle(this, PANEL, this, focusScale = 1f)
+                },
+                LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                ).apply { leftMargin = dp(8) },
+            )
+        }
+        return row
+    }
+
+    /**
+     * 榜单词条：排名序号 + 片名，横向滚动排开就是一份带名次的榜单。
+     * 前三名按榜单惯例用暖色（红 / 橙 / 琥珀），其余灰绿；点击直接搜。
+     */
+    private fun rankChip(rank: Int, title: String, onClick: () -> Unit): View {
+        val rankColor = when (rank) {
+            1 -> 0xFFE11D48.toInt()
+            2 -> 0xFFF97316.toInt()
+            3 -> 0xFFF59E0B.toInt()
+            else -> BRIGHTER_TEXT
+        }
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            isFocusable = true
+            isFocusableInTouchMode = true
+            setPadding(dp(12), dp(7), dp(14), dp(7))
+            setOnClickListener { onClick() }
+            // 整块是 LinearLayout（排名 + 片名两个文字），没有单一文字控件可传
+            applyFocusStyle(this, SOFT, focusScale = 1f)
+        }
+        row.addView(
+            TextView(this).apply {
+                setText(rank.toString())
+                setTextSize(14f)
+                setTextColor(rankColor)
+                setTypeface(null, Typeface.BOLD)
+            },
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+            ).apply { rightMargin = dp(7) },
+        )
+        row.addView(
+            TextView(this).apply {
+                setText(title)
+                setTextSize(14f)
+                setTextColor(TEXT_COLOR)
+                isSingleLine = true
+            },
+        )
+        return row
+    }
 
     /**
      * 列表形状的自绘可聚焦行（搜索历史的每一行用它）。
@@ -3875,8 +3990,9 @@ class MainActivity : Activity() {
     }
 
     /**
-     * 就地刷新热门榜单的 chip 行。数据是后台分批到的，到一批填一批；
+     * 就地刷新热门榜单卡片。数据是后台分批到的，到一批填一批；
      * 不重建整页，正在打字的输入法不会被关掉。
+     * 词条带排名序号（前三名暖色高亮），像一份正式榜单而不是一排小标签。
      */
     private fun refreshHotChips() {
         for ((label, row) in hotChipRows) {
@@ -3886,8 +4002,11 @@ class MainActivity : Activity() {
                 box.visibility = View.GONE
                 continue
             }
+            box.visibility = View.VISIBLE
             row.removeAllViews()
-            titles.forEach { title -> row.addView(chip(title) { doSearch(title) }) }
+            titles.forEachIndexed { idx, title ->
+                row.addView(rankChip(idx + 1, title) { doSearch(title) })
+            }
         }
     }
 
@@ -3913,6 +4032,12 @@ class MainActivity : Activity() {
             }
         }
         val searching = typing && matches.isNotEmpty()
+        // 有候选时把最近搜索、热门榜单都收起来，让位给联想列表；
+        // 没在打字时恢复。出过搜索结果的情况下榜单整块隐藏 ——
+        // 结果比榜单重要，别把结果挤出屏幕。
+        homeHistoryBox?.visibility = if (searching) View.GONE else View.VISIBLE
+        homeHotSection?.visibility =
+            if (searching || lastResults.isNotEmpty()) View.GONE else View.VISIBLE
         hotBoxes.forEach { (label, v) ->
             v.visibility = if (searching || hotTitles[label].isNullOrEmpty()) View.GONE else View.VISIBLE
         }
@@ -3964,23 +4089,77 @@ class MainActivity : Activity() {
         })
         col.addView(inputRow)
 
-        // 热门榜单：四类（电影 / 电视剧 / 儿童动画 / 国漫），数据到了就地填充 chip 行，
-        // 不重建整页 —— 重建会把正在打字的输入法关掉
+        // ── 最近搜索：搜过就常驻显示（电视上打字太难，重搜一部片子该是一次点击的事）──
+        // 点词条直接重搜；右上角「清空」带确认。整卡在打字联想时收起（refreshSearchBody）。
+        val history = prefs.searchHistory()
+        if (history.isNotEmpty()) {
+            val card = panelCard()
+            card.addView(
+                cardHeader("最近搜索", "点词条直接重搜", "清空") {
+                    AlertDialog.Builder(this)
+                        .setTitle("清空搜索历史")
+                        .setMessage("确定清空这 ${history.size} 条记录？")
+                        .setPositiveButton("清空") { _, _ ->
+                            prefs.clearSearchHistory()
+                            showHome()
+                        }
+                        .setNegativeButton("取消", null)
+                        .show()
+                },
+            )
+            val chipRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            history.forEach { kw -> chipRow.addView(chip(kw) { doSearch(kw) }) }
+            card.addView(hScroll(chipRow).apply { setPadding(0, dp(6), 0, 0) })
+            val box = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                addView(
+                    card,
+                    LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ).apply { bottomMargin = dp(10) },
+                )
+            }
+            homeHistoryBox = box
+            col.addView(box)
+        } else {
+            homeHistoryBox = null
+        }
+
+        // ── 热门榜单：四类（电影 / 电视剧 / 儿童动画 / 国漫）各一张正式卡片 ──
+        // 卡片 = 白底圆角 + 分类标题（竖色条 + 加粗 + 数据来源小注）+ 带排名的词条行。
+        // 数据到了就地填词条，不重建整页 —— 重建会把正在打字的输入法关掉。
+        // 出过搜索结果时整块隐藏（refreshSearchBody），把屏幕留给结果列表。
         ensureHotSearch()
         val hotSection = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         for (cat in hotCategories) {
-            val hint = hintText(cat.label)
+            val note = when {
+                cat.doubanType == null -> "精选片单 · 点词条直接搜"
+                cat.doubanTag == "国产动画" -> "精选 + 豆瓣国产动画"
+                else -> "豆瓣实时榜单"
+            }
+            val card = panelCard()
+            card.addView(cardHeader(cat.label, note))
             val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            card.addView(hScroll(row).apply { setPadding(0, dp(6), 0, 0) })
             val box = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
-                addView(hint)
-                addView(hScroll(row))
+                // 数据没到之前先藏着，refreshHotChips 填上词条再亮出来
+                visibility = View.GONE
+                addView(
+                    card,
+                    LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ).apply { bottomMargin = dp(10) },
+                )
             }
-            hotHintViews[cat.label] = hint
             hotChipRows[cat.label] = row
             hotBoxes[cat.label] = box
             hotSection.addView(box)
         }
+        hotSection.visibility = if (lastResults.isEmpty()) View.VISIBLE else View.GONE
+        homeHotSection = hotSection
         col.addView(hotSection)
 
         // 输入联想：打字（含拼音首字母，如 cjqc → 超级汽车）时显示候选，
@@ -4040,71 +4219,14 @@ class MainActivity : Activity() {
         }
         col.addView(statusRow)
 
-        // 没有结果时把「搜索历史」放在这里：电视遥控器打字太难，
-        // 重搜一部之前看过的片子应该是一次点击的事。
-        val history = prefs.searchHistory()
+        // 最近搜索已上提为输入行下方的常驻卡片；这里没有结果时留一句引导即可。
         val listView = newList()
         homeResultsList = listView
         if (lastResults.isEmpty()) {
-            if (history.isEmpty()) {
-                col.addView(
-                    hintText("（还没有搜索记录，输入片名开始）"),
-                    LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f),
-                )
-            } else {
-                // 逐条可删。以前只有一句「清空搜索历史」，手滑搜错的词会永远占着第一条；
-                // 现在每行 = 关键词（OK 重搜）+ 右侧「✕」（OK 删除），左右键即可在两者间移动。
-                val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-                history.forEach { kw ->
-                    val row = LinearLayout(this).apply {
-                        orientation = LinearLayout.HORIZONTAL
-                        gravity = Gravity.CENTER_VERTICAL
-                        clipChildren = false
-                        clipToPadding = false
-                    }
-                    row.addView(
-                        focusRow("最近搜索 · $kw") {
-                            keywordField.setText(kw)
-                            doSearch(kw)
-                        },
-                        LinearLayout.LayoutParams(0, dp(52), 1f),
-                    )
-                    row.addView(
-                        focusRow("✕ 删除", tint = 0xFFFCA5A5.toInt()) {
-                            AlertDialog.Builder(this)
-                                .setTitle("删除这条搜索记录")
-                                .setMessage(kw)
-                                .setPositiveButton("删除") { _, _ ->
-                                    prefs.removeSearchHistory(kw)
-                                    showHome()
-                                }
-                                .setNegativeButton("取消", null)
-                                .show()
-                        },
-                        LinearLayout.LayoutParams(dp(96), dp(52)).apply { leftMargin = dp(6) },
-                    )
-                    box.addView(row, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(58)))
-                }
-                box.addView(
-                    button("清空全部搜索历史") {
-                        AlertDialog.Builder(this)
-                            .setTitle("清空搜索历史")
-                            .setMessage("确定清空这 ${history.size} 条记录？")
-                            .setPositiveButton("清空") { _, _ ->
-                                prefs.clearSearchHistory()
-                                showHome()
-                            }
-                            .setNegativeButton("取消", null)
-                            .show()
-                    },
-                    LinearLayout.LayoutParams(dp(220), dp(52)).apply { topMargin = dp(10) },
-                )
-                val scroll = ScrollView(this).apply {
-                    isVerticalScrollBarEnabled = false
-                    addView(box)
-                }
-                col.addView(scroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
-            }
+            col.addView(
+                hintText("在上方输入片名开搜，或直接点热门榜单里的词条"),
+                LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f),
+            )
         } else {
             // 同一部片在多个采集站都有结果，平铺会刷出一堆重复行（「流浪地球」7 条里 5 条是同一部片）。
             // 按片名收成一行，来源并列显示；点进去后详情页的「换源」可以切换。
