@@ -71,6 +71,15 @@ private const val SEARCH_CACHE_MS = 3 * 60_000L
 /** 详情页复用的时间窗：5 分钟内同一部剧（同源）不再重复请求 */
 private const val DETAIL_CACHE_MS = 5 * 60_000L
 
+/** 搜索时同时进行的源请求数上限（各源是不同主机，可以放得宽一些） */
+private const val MAX_SEARCH_CONCURRENCY = 8
+
+/** 搜索时同时打到服务端 /api/search 的请求数上限：同一台机器，压太狠会被限流 */
+private const val SERVER_SEARCH_CONCURRENCY = 4
+
+/** 分批合并结果的刷新间隔：太密会打断正在翻页的用户，太疏又看不出「随搜随出」 */
+private const val PARTIAL_RENDER_INTERVAL_MS = 400L
+
 /**
  * 原生客户端主界面。刻意不用 XML 布局、不引 AppCompat/Leanback：
  * 只用框架控件，D-pad 焦点是系统原生支持的，老设备上行为最可预测。
@@ -155,7 +164,24 @@ class MainActivity : Activity() {
     /** 搜索结果短时缓存：key = 关键词 + 源集合，value = (写入时间, 结果) */
     private val searchCache = HashMap<String, Pair<Long, List<SearchItem>>>()
     private var lastSearchKeyword = ""
-    private var lastSearchWasPartial = false
+    private var searchInProgress = false
+    /**
+     * 本次搜索的编号。取消搜索、或又发起一次新搜索时自增，
+     * 在途的旧编号回包全部作废 —— 否则慢源的迟到结果会把用户拽回结果页。
+     */
+    @Volatile private var searchToken = 0
+    /**
+     * 界面世代：每次**真正换页**（currentScreen 变了）+1。
+     * 搜索结果只允许落在「发起搜索的那个页面」或「本次搜索已经画出来的结果页」，
+     * 世代对不上就说明用户中途去了别处，哪怕后来又回到同一个页面也不再回跳。
+     */
+    private var screenEpoch = 0
+    private var searchOriginEpoch = 0
+    private var searchResultsEpoch = -1
+    /** 结果页顶部「已搜索 x/y 个源…」那行文案，随每批结果刷新 */
+    private var searchProgressNote = ""
+    /** 结果网格：分批合并时用它把选中项与焦点还回原处，避免每来一批就跳回顶部 */
+    private var resultsGrid: GridView? = null
     /** 详情页短时缓存：key = vodId + 源地址，value = (写入时间, 详情) */
     private val detailCache = HashMap<String, Pair<Long, Detail>>()
     /** 片源管理列表：测速完只刷行内容，不重建整页 */
@@ -165,9 +191,11 @@ class MainActivity : Activity() {
     private var busyLabel: TextView? = null
     private var busyKey: String? = null
     private var busyCancellable = true
-    /** 启动阶段的非模态提示：null = 已就绪；否则在首页顶部显示一行小字（不打断操作）。 */
+    /** 启动阶段的非模态提示：null = 不显示提示；仅首次连接时显示加载状态。 */
     private var bootNotice: String? = null
     private var bootFailed = false
+    private var bootRetryAttempt = 0
+    private var bootRetryJob: Job? = null
     /** 当前界面名，用于实现遥控器 BACK 的层级回退（否则任何界面按返回都会直接退出应用）。 */
     private var currentScreen = "setup"
     /** 设置页是否展开「服务器连接」区块。已连接时默认收起（低频操作不占首屏） */
@@ -462,6 +490,13 @@ class MainActivity : Activity() {
             if (busyCancellable) {
                 cancelJob(key)
                 dismissProgress()
+                if (key == "search") {
+                    // 作废这次搜索的编号：工作线程里还在跑的源即使稍后返回，也不会再把结果页弹出来
+                    searchToken++
+                    searchInProgress = false
+                    searchProgressNote = ""
+                    if (currentScreen == "results") showResults()
+                }
                 toast("已取消")
             } else {
                 toast("正在处理，稍等一下…")
@@ -566,6 +601,11 @@ class MainActivity : Activity() {
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         // 加载胶囊挂在 root 上，removeAllViews 会把它一起摘掉，这里重新挂回最上层
         if (busyBar?.visibility == View.VISIBLE) attachBusyBar()
+        // 只有真的换页才算「世代」推进；同一页面的原地重绘（补封面、批量合并结果）不算，
+        // 否则后台每刷一次就会把正在进行的搜索判成「用户已经离开」。
+        if (currentScreen != lastRenderedScreen) screenEpoch++
+        // 离开结果页就松开网格引用，别把整棵视图树挂在 Activity 上
+        if (currentScreen != "results") resultsGrid = null
         if (lastRenderedScreen != null && lastRenderedScreen != currentScreen) {
             // 用 withLayer() 让动画走硬件层，老盒子上比逐帧重绘稳
             view.alpha = 0f
@@ -1042,6 +1082,8 @@ class MainActivity : Activity() {
      */
     private fun showBoot() {
         bootFailed = false
+        bootRetryAttempt = 0
+        bootRetryJob?.cancel()
         // 连上之后再拉推荐，避免还没连上就先发一轮注定失败的请求
         recommendRequested = true
         primeRecommendFromCache()   // 有缓存就先把海报墙画出来
@@ -1049,6 +1091,18 @@ class MainActivity : Activity() {
         showRecommend()
         autoConnect(silent = true)
     }
+    /** 首页启动连接失败后安静地退避重试，不把瞬时网络抖动变成需要用户处理的错误提示。 */
+    private fun scheduleBootRetry() {
+        bootRetryJob?.cancel()
+        val delays = longArrayOf(2_000L, 5_000L, 15_000L, 30_000L)
+        val waitMs = delays[bootRetryAttempt.coerceAtMost(delays.lastIndex)]
+        bootRetryAttempt++
+        bootRetryJob = scope.launch {
+            delay(waitMs)
+            if (!isFinishing && !isDestroyed) autoConnect(silent = true)
+        }
+    }
+
     /**
      * 连接服务器（顺带拉服务端下发的片源配置）。
      *
@@ -1094,6 +1148,9 @@ class MainActivity : Activity() {
                 seedDefaultSourcesAsync(st, subSources)
                 bootNotice = null
                 bootFailed = false
+                bootRetryAttempt = 0
+                bootRetryJob?.cancel()
+                bootRetryJob = null
                 recommendRequested = false
                 // 用户可能在连接期间已经点进设置/搜索，别把他拽回首页
                 if (currentScreen == "recommend") {
@@ -1105,11 +1162,18 @@ class MainActivity : Activity() {
             },
             quiet = silent,
             onError = { e ->
-                // 不弹窗、不反复提示：只在首页顶部留一行可重试的说明
-                bootFailed = true
-                bootNotice = "未连接：${describe(e)}"
                 recommendRequested = true
-                if (currentScreen == "recommend") showRecommend()
+                if (silent) {
+                    // 首屏连接失败通常只是网络或服务器启动稍慢，保持首页安静并在后台重试。
+                    bootFailed = false
+                    bootNotice = null
+                    if (currentScreen == "recommend") showRecommend()
+                    scheduleBootRetry()
+                } else {
+                    bootFailed = true
+                    bootNotice = "未连接：${describe(e)}"
+                    if (currentScreen == "recommend") showRecommend()
+                }
             },
         )
     }
@@ -3401,13 +3465,45 @@ class MainActivity : Activity() {
     /* ------------------------------------------------- 搜索结果（卡片网格） */
 
     private var resultGroups: List<Pair<String, List<SearchItem>>> = emptyList()
+    private data class SearchSourceCompletion(
+        val source: SourceConfig,
+        val result: SearchResult?,
+        val direct: Boolean,
+    )
+
+    /** 一批搜索进度：已合并的结果 + 进度计数，用来边搜边显示 */
+    private data class SearchProgress(
+        val items: List<SearchItem>,
+        val failures: Int,
+        val done: Int,
+        val total: Int,
+        val retrying: Int = 0,
+    )
 
     /**
      * 搜索结果按网页版的样子展示：封面 + 标题 + 类型/年份/备注 + 来源数。
      * 同一片名收成一张卡片（多来源在详情页「换源」里切）。
+     *
+     * @param keepSelection 分批合并结果时为 true：沿用上一版网格的选中项，
+     *   并把焦点还给网格。慢源每返回一批就重建整页，如果不还原，
+     *   用户正在往下翻的时候会被拽回第一条 —— 电视上尤其难受。
      */
-    private fun showResults() {
+    private fun showResults(keepSelection: Boolean = false) {
         currentScreen = "results"
+        val prevGrid = resultsGrid
+        // 只有「上一版结果页还挂在窗口上」才值得沿用选中项，否则索引会指到别的列表
+        val prevTitle = if (keepSelection && prevGrid?.isAttachedToWindow == true) {
+            resultGroups.getOrNull(prevGrid.selectedItemPosition)?.first
+        } else {
+            null
+        }
+        val gridHadFocus = keepSelection && prevGrid?.hasFocus() == true
+        // 焦点停在工具条按钮上（来源筛选/返回推荐/重新搜索）时，记住它，重建后还回去
+        val prevFocusLabel = if (keepSelection && !gridHadFocus) {
+            (root.findFocus() as? Button)?.text?.toString()
+        } else {
+            null
+        }
         val visible = if (sourceFilter.isEmpty()) {
             lastResults
         } else {
@@ -3440,10 +3536,12 @@ class MainActivity : Activity() {
         bar.addView(button("返回推荐") { showRecommend() })
         bar.addView(button("重新搜索") { showHome() })
         col.addView(hScroll(bar))
-        if (lastSearchWasPartial && lastSearchKeyword.isNotBlank()) {
-            col.addView(button("用全部片源再搜一次") {
-                doSearch(lastSearchKeyword, allSources = true)
-            })
+        if (searchInProgress) {
+            col.addView(
+                hintText(
+                    searchProgressNote.ifEmpty { "已先显示返回的结果，仍在并行搜索其他片源…" },
+                ),
+            )
         }
 
         if (sourceFilter.isNotEmpty()) {
@@ -3480,7 +3578,31 @@ class MainActivity : Activity() {
         col.addView(grid, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
 
-        setScreen(col)
+        resultsGrid = grid
+        setScreen(col, focusFirst = !gridHadFocus && prevFocusLabel == null)
+        if (prevFocusLabel != null) {
+            // 布局完成后再找，此时新工具条才真正建好
+            col.post { findButtonByText(col, prevFocusLabel)?.requestFocus() }
+        }
+        // 布局完成后再定位，否则 GridView 还没测出行高，setSelection 会被忽略
+        val keepIdx = prevTitle?.let { t -> resultGroups.indexOfFirst { it.first == t } } ?: -1
+        if (keepIdx >= 0 || gridHadFocus) {
+            grid.post {
+                if (keepIdx >= 0) grid.setSelection(keepIdx)
+                if (gridHadFocus) grid.requestFocus()
+            }
+        }
+    }
+
+    /** 按文案在视图树里找按钮：分批合并结果后把焦点还给用户原来停的那个按钮 */
+    private fun findButtonByText(v: View, label: String): View? {
+        if (v is Button && v.visibility == View.VISIBLE && v.text?.toString() == label) return v
+        if (v is ViewGroup) {
+            for (i in 0 until v.childCount) {
+                findButtonByText(v.getChildAt(i), label)?.let { return it }
+            }
+        }
+        return null
     }
 
     private fun resultsAdapter(): BaseAdapter = object : BaseAdapter() {
@@ -3630,10 +3752,12 @@ class MainActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
+        val allSources = prefs.sources()
         statusRow.addView(
             TextView(this).apply {
                 setText(
-                    "片源 ${prefs.sources().size} 个 · 服务器 ${api.baseUrl}" +
+                    // 搜索只打启用源，这里就说启用数，免得「片源 20 个」和实际搜的 15 个对不上
+                    "启用片源 ${allSources.count { it.enabled }}/${allSources.size} · 服务器 ${api.baseUrl}" +
                         if (sourceFilter.isEmpty()) "" else " · 只看：$sourceFilter",
                 )
                 setTextColor(Color.parseColor("#64748b"))
@@ -3780,46 +3904,81 @@ class MainActivity : Activity() {
         if (lastResults.isEmpty()) keywordField.requestFocus() else listView.requestFocus()
     }
 
-    private fun doSearch(keyword: String, allSources: Boolean = false) {
+    private fun doSearch(keyword: String) {
         homeMaintenanceJob?.cancel()
         favoriteCheckJob?.cancel()
         hotSearchJob?.cancel()
         val kw = keyword.trim()
         if (kw.isEmpty()) { toast("请输入片名"); return }
+        // 只搜「已启用」的源：停用的源不该再被请求，也不该出现在缓存键里
         val enabledSources = prefs.sources().filter { it.enabled }
         if (enabledSources.isEmpty()) { toast("没有启用的片源，去「片源管理」开启或添加"); showSources(); return }
-        // 先查用户排序靠前的三个源；没有结果时自动扩展到全部源，不牺牲查找完整度。
-        val sources = if (allSources || enabledSources.size <= 3) enabledSources else enabledSources.take(3)
-        val partial = sources.size < enabledSources.size
+        // 全部启用源一起搜索；优先展示已完成源的结果，慢源在后台继续补齐。
+        val sources = enabledSources
+        val token = ++searchToken
         lastSearchKeyword = kw
-        lastSearchWasPartial = partial
+        searchInProgress = true
+        searchProgressNote = ""
         sourceFilter = ""
+        // 记下发起搜索时所在的界面世代：只有「还停在这个页面」或「本次搜索已经画出的结果页」
+        // 才允许改界面，用户中途去了别处就不再回跳（哪怕后来又回到同一个页面）。
+        searchOriginEpoch = screenEpoch
+        searchResultsEpoch = -1
         // 搜一次要服务端把每个采集站都问一遍，十几秒很正常。
         // 刚搜过的关键词（3 分钟内、源的集合没变）直接复用结果 —— 看完一部点返回再搜同一部是常见动作。
         val cacheKey = prefs.serverUrl + "|" + kw + "|" + sources.joinToString(",") { it.url }
         searchCache[cacheKey]?.let { (at, items) ->
             if (System.currentTimeMillis() - at < SEARCH_CACHE_MS) {
-                if (items.isEmpty() && partial) {
-                    doSearch(kw, allSources = true)
-                    return
-                }
                 prefs.addSearchHistory(kw)
                 lastResults = items
+                searchInProgress = false
                 toast("用刚才的结果（${items.size} 个）")
                 showResults()
                 return
             }
         }
-        runApiK("search", "正在搜索「$kw」（${sources.size}/${enabledSources.size} 个源）…", {
-            val first = directThenServerSearch(kw, sources)
+        // 每来一批结果就重建整页会打断正在翻页的用户：这里合并刷新，最多 ~2.5 次/秒。
+        // 首批结果不受节流影响（lastRenderAt 从 0 开始），保证「有结果就立刻显示」。
+        var lastRenderAt = 0L
+        val onPartial: (SearchProgress) -> Unit = { progress ->
+            // 回调来自工作线程，回到主线程再动界面
+            scope.launch {
+                if (token != searchToken) return@launch
+                if (progress.items.isEmpty()) return@launch
+                if (screenEpoch != searchOriginEpoch && screenEpoch != searchResultsEpoch) return@launch
+                val now = android.os.SystemClock.elapsedRealtime()
+                if (now - lastRenderAt < PARTIAL_RENDER_INTERVAL_MS) return@launch
+                lastRenderAt = now
+                lastResults = progress.items
+                searchInProgress = true
+                searchProgressNote = describeSearchProgress(progress)
+                showResults(keepSelection = true)
+                // showResults 可能刚把页面从「首页」切成「结果页」，世代已经推进，这里跟上
+                searchResultsEpoch = screenEpoch
+                busyLabel?.text = searchProgressNote
+            }
+        }
+        runApiK("search", "正在搜索「$kw」（${sources.size} 个源）…", {
+            val first = directThenServerSearch(
+                kw, sources, shouldContinue = { token == searchToken }, onPartial = onPartial,
+            )
             // 兜底：豆瓣条目常带「（2023）」「：副标题」这类噪声，采集站匹配不到时再试一次干净片名
             if (first.items.isNotEmpty()) {
                 first
             } else {
                 val cleaned = cleanKeyword(kw)
-                if (cleaned.isNotEmpty() && cleaned != kw) directThenServerSearch(cleaned, sources) else first
+                if (cleaned.isNotEmpty() && cleaned != kw) {
+                    directThenServerSearch(
+                        cleaned, sources, shouldContinue = { token == searchToken }, onPartial = onPartial,
+                    )
+                } else {
+                    first
+                }
             }
         }, { result ->
+            if (token != searchToken) return@runApiK
+            searchInProgress = false
+            searchProgressNote = ""
             prefs.addSearchHistory(kw)
             searchCache[cacheKey] = System.currentTimeMillis() to result.items
             if (searchCache.size > 20) {
@@ -3828,68 +3987,142 @@ class MainActivity : Activity() {
                     .forEach { searchCache.remove(it.key) }
             }
             lastResults = result.items
+            // 用户已经离开搜索/结果页（去了设置、详情、推荐…）：结果留着，但不要把人拽回来
+            if (screenEpoch != searchOriginEpoch && screenEpoch != searchResultsEpoch) return@runApiK
             val failedNote = if (result.failures > 0) "（${result.failures} 个源无响应）" else ""
             if (result.items.isEmpty()) {
-                if (partial) {
-                    doSearch(kw, allSources = true)
-                    return@runApiK
-                }
                 toast("没有找到结果$failedNote，换个片名或别的源试试")
                 showHome()
             } else {
                 toast("找到 ${result.items.size} 个结果$failedNote")
                 showResults()
             }
+        }, onError = {
+            if (token != searchToken) return@runApiK
+            searchInProgress = false
+            searchProgressNote = ""
+            if (currentScreen == "results") showResults()
         })
     }
 
-    /**
-     * 先直连、再回退服务端。
-     *
-     * 能直连的源（https + 标准苹果CMS）在手机上并发问，省掉「设备 → Cloudflare → 采集站」
-     * 那两跳；失败的源、以及本来就是 http 的源一起交给服务端，保证结果不丢。
-     * 全部成功时完全不碰服务端。
-     */
-    private fun directThenServerSearch(kw: String, sources: List<SourceConfig>): SearchResult {
-        val directable = sources.filter { DirectCms.shouldTryDirect(it) }
-        if (directable.isEmpty()) return api.search(kw, sources)
+    /** 结果页顶部那行进度文案 */
+    private fun describeSearchProgress(p: SearchProgress): String = buildString {
+        append("已搜索 ${p.done}/${p.total} 个源")
+        if (p.retrying > 0) append("，正在补查 ${p.retrying} 个无结果源")
+        append(" · 已找到 ${p.items.size} 个结果，继续搜索…")
+    }
 
+    /**
+     * 对全部启用源并发查询：标准 HTTPS 苹果 CMS 从设备直连，其余源逐个交给服务端；
+     * 直连失败或无结果的源再向服务端补查。每个源完成就回传一次合并结果，
+     * 慢源不会挡住先返回的结果。
+     *
+     * @param shouldContinue 取消探测。搜索被取消、或被新的搜索顶掉时返回 false，
+     *   这里立刻停止等待剩下的源 —— HTTP 请求本身打断不了，但界面不用陪着等。
+     */
+    private fun directThenServerSearch(
+        kw: String,
+        sources: List<SourceConfig>,
+        shouldContinue: () -> Boolean = { true },
+        onPartial: (SearchProgress) -> Unit = {},
+    ): SearchResult {
+        if (sources.isEmpty()) return SearchResult(emptyList(), 0)
+        val total = sources.size
+        val directable = sources.filter { DirectCms.shouldTryDirect(it) }
         val items = ArrayList<SearchItem>()
         val failed = ArrayList<SourceConfig>()
-        val serverOnly = sources.filter { it !in directable }
+        // 直连打的是各家采集站，可以放得宽一些；服务端请求都落在同一台机器上，
+        // 8 路同时打过去容易被限流、也互相拖慢，单独限到 4 路。
+        val serverGate = java.util.concurrent.Semaphore(SERVER_SEARCH_CONCURRENCY)
+        var done = 0
+        var failures = 0
+        fun snapshot() = SearchResult(items.distinctBy { it.sourceUrl + "|" + it.vodId }, failures)
+        fun emit(retrying: Int = 0) =
+            onPartial(SearchProgress(snapshot().items, failures, done, total, retrying))
+
         val pool = java.util.concurrent.Executors.newFixedThreadPool(
-            directable.size.coerceAtMost(4) + if (serverOnly.isEmpty()) 0 else 1,
-        )
+            minOf(total, MAX_SEARCH_CONCURRENCY).coerceAtLeast(1),
+        ) { r -> Thread(r, "search-source").apply { isDaemon = true } }
         try {
-            // HTTP / 非标准 CMS 源必须经服务端；与可直连源同时发起，避免两段网络耗时相加。
-            val serverTask = if (serverOnly.isEmpty()) null else pool.submit(
-                java.util.concurrent.Callable { api.search(kw, serverOnly) },
-            )
-            val tasks = directable.map { s ->
-                s to pool.submit(java.util.concurrent.Callable { DirectCms.search(s, kw) })
+            // 每个源单独请求，最多 8 个同时进行；先完成的源先把结果交给界面。
+            val completed = java.util.concurrent.ExecutorCompletionService<SearchSourceCompletion>(pool)
+            sources.forEach { source ->
+                val direct = source in directable
+                completed.submit(java.util.concurrent.Callable {
+                    val result = runCatching {
+                        if (direct) SearchResult(DirectCms.search(source, kw), 0)
+                        else serverSearch(kw, source, serverGate)
+                    }.getOrNull()
+                    SearchSourceCompletion(source, result, direct)
+                })
             }
-            for ((s, f) in tasks) {
-                val got = try {
-                    f.get(7, java.util.concurrent.TimeUnit.SECONDS)
-                } catch (e: Exception) {
-                    f.cancel(true)
-                    null
+            for (i in 0 until total) {
+                if (!shouldContinue()) return snapshot()
+                val completion = runCatching { completed.take().get() }.getOrNull()
+                done++
+                if (completion == null) {
+                    failures++
+                    continue
                 }
-                if (got.isNullOrEmpty()) failed.add(s) else items.addAll(got)
+                val result = completion.result
+                if (result == null) {
+                    // 直连失败留到下面回退服务端；服务端自己也失败才算真的失败
+                    if (completion.direct) failed.add(completion.source) else failures++
+                } else {
+                    failures += result.failures
+                    if (result.items.isNotEmpty()) {
+                        items.addAll(result.items)
+                    } else if (completion.direct) {
+                        // 直连「成功但没结果」多半是采集站对直连限流/降级，交给服务端再问一次
+                        failed.add(completion.source)
+                    }
+                }
+                emit()
             }
-            // 直连失败仍经服务端补查，保持原来的结果完整性。
-            val fallbackTask = if (failed.isEmpty()) null else pool.submit(
-                java.util.concurrent.Callable { api.search(kw, failed) },
-            )
-            var failures = 0
-            for (task in listOfNotNull(serverTask, fallbackTask)) {
-                val result = task.get()
-                items.addAll(result.items)
-                failures += result.failures
+            // 直连失败或无结果的源再回退服务端，仍保持并发。
+            if (failed.isNotEmpty()) {
+                val pending = failed.size
+                val fallback = java.util.concurrent.ExecutorCompletionService<SearchResult?>(pool)
+                failed.forEach { source ->
+                    fallback.submit(java.util.concurrent.Callable {
+                        runCatching { serverSearch(kw, source, serverGate) }.getOrNull()
+                    })
+                }
+                for (i in 0 until pending) {
+                    if (!shouldContinue()) return snapshot()
+                    val result = runCatching { fallback.take().get() }.getOrNull()
+                    if (result == null) {
+                        failures++
+                    } else {
+                        failures += result.failures
+                        if (result.items.isNotEmpty()) items.addAll(result.items)
+                    }
+                    emit(retrying = pending - i - 1)
+                }
             }
-            return SearchResult(items.distinctBy { it.sourceUrl + "|" + it.vodId }, failures)
+            return snapshot()
         } finally {
             pool.shutdownNow()
+        }
+    }
+
+    /**
+     * 每源单独打服务端 `/api/search`。
+     *
+     * 接口本来就收 `sources` 数组（服务端按数组逐个采集站串行请求），
+     * 只传一个元素同样合法，返回结构不变 —— 所以单源请求是兼容的，
+     * 只是把「服务端串行」拆成了「客户端并发 + 服务端各自串行」。
+     */
+    private fun serverSearch(
+        kw: String,
+        source: SourceConfig,
+        gate: java.util.concurrent.Semaphore,
+    ): SearchResult {
+        gate.acquire()
+        try {
+            return api.search(kw, listOf(source))
+        } finally {
+            gate.release()
         }
     }
 
@@ -3988,7 +4221,11 @@ class MainActivity : Activity() {
         cancelJob("playbacksources")
         jobs["playbacksources"] = scope.launch {
             try {
-                val found = withContext(Dispatchers.IO) { directThenServerSearch(title, enabledSources) }
+                val found = withContext(Dispatchers.IO) {
+                    // 用户离开这个页面（job 被取消）就立刻停止等待剩下的源
+                    val job = coroutineContext[Job]
+                    directThenServerSearch(title, enabledSources, shouldContinue = { job?.isActive != false })
+                }
                 if (currentScreen != "playbacksources") return@launch
                 val matches = found.items.filter(::isSameTitle)
                 val merged = (initial.map { item ->
