@@ -153,6 +153,15 @@ class PlayerActivity : Activity() {
     private lateinit var prefs: Prefs
 
     private var urls: List<String> = emptyList()
+
+    /**
+     * 上一次 [buildMediaItems] 的结果：万集长剧重建一次要读几万次 SharedPreferences，
+     * 列表没变就直接复用。
+     */
+    private var mediaItemsCache: Pair<List<String>, List<MediaItem>>? = null
+
+    /** 这一集是否已经原地重试过一次：避免同一个坏源把重试变成死循环 */
+    private var autoRetried = false
     private var currentIndex = 0
     private var seriesTitle = ""
     /** 干净剧名（不含「 · 第 x/y 集」），用于回查整季 */
@@ -895,6 +904,8 @@ class PlayerActivity : Activity() {
                         currentVideoHeight = 0
                         updateQualityButton()
                         hasError = false
+                        // 换集之后重新给这一集一次「原地重试」的机会
+                        autoRetried = false
                         baseText = labelFor(currentIndex)
                         // 每集字幕是分开存的，换集时把「当前挂的是哪份」同步过来，
                         // 不然菜单里还显示着上一集的字幕名
@@ -960,6 +971,24 @@ class PlayerActivity : Activity() {
                             if (pos > 3_000L) prefs.saveProgress(currentUrl(), pos)
                             toast("硬解失败，本剧已改用软解，正在重试…")
                             handler.postDelayed({ recreate() }, 300)
+                            return
+                        }
+                        // 非解码类错误多半是分片超时/源站抖动，换源成本比原地重试高得多：
+                        // 先自己重试一次，还不行再自动退回「选择播放源」，而不是把用户丢在错误画面上。
+                        if (!decodeFail) {
+                            if (!autoRetried) {
+                                autoRetried = true
+                                toast("播放中断，正在重试…")
+                                baseText = "网络抖动，正在重试…"
+                                titleText.text = baseText
+                                handler.postDelayed({
+                                    hasError = false
+                                    player?.prepare()
+                                }, 1_000L)
+                                return
+                            }
+                            toast("这个源打不开，正在查找其他来源…")
+                            handler.postDelayed({ backToSources() }, 600L)
                             return
                         }
                         val msg = if (decodeFail) {
@@ -2303,7 +2332,21 @@ class PlayerActivity : Activity() {
      * 每一条都按「自己的播放地址」去找已保存的外挂字幕 —— 同一部剧每集的字幕文件不同，
      * 所以不能只给当前这一条挂，否则选集/自动连播换集之后字幕就没了。
      */
-    private fun buildMediaItems(): List<MediaItem> = urls.map { mediaItemOf(it) }
+    private fun buildMediaItems(): List<MediaItem> {
+        val src = urls
+        mediaItemsCache?.let { (key, items) -> if (key == src) return items }
+        val built = src.map { mediaItemOf(it) }
+        mediaItemsCache = src to built
+        return built
+    }
+
+    /**
+     * 字幕配置是烤在 MediaItem 里的，改完字幕必须让缓存失效，
+     * 否则 [buildMediaItems] 会把旧配置原样返回。
+     */
+    private fun invalidateMediaItems() {
+        mediaItemsCache = null
+    }
 
     /** 单条媒体项：带上这一集自己的外挂字幕（如果没有就是纯地址） */
     private fun mediaItemOf(u: String): MediaItem {
@@ -2467,6 +2510,8 @@ class PlayerActivity : Activity() {
      */
     private fun applySubtitleNow() {
         val p = player ?: return
+        // 字幕变了：先把烤在 MediaItem 里的旧配置作废，下面重建才会带上新字幕
+        invalidateMediaItems()
         val idx = currentIndex
         val url = urls.getOrNull(idx) ?: return
         val pos = p.currentPosition
@@ -3504,6 +3549,16 @@ class PlayerActivity : Activity() {
             if (isTvDevice) unlockScreen() else lockHint()
             return
         }
+        backToSources()
+    }
+
+    /**
+     * 带着「回到来源选择」的结果关掉播放页。
+     * 用户按返回、以及某个源连续失败两次，走的都是这里 —— 后者把「按返回键换源」
+     * 从一句提示变成自动动作，用户不用自己再按一次。
+     */
+    private fun backToSources() {
+        if (isFinishing || isDestroyed) return
         persistProgress()
         setResult(RESULT_OK, Intent().apply {
             putExtra(EXTRA_RETURN_TO_SOURCES, true)

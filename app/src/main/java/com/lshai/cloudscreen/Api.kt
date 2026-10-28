@@ -210,23 +210,7 @@ class Api(baseUrl: String) {
         }
         conn.outputStream.use { it.write(payload.toString().toByteArray(Charsets.UTF_8)) }
         val root = JSONObject(readBody(conn))
-        val list = root.optJSONArray("list") ?: JSONArray()
-        val items = (0 until list.length()).mapNotNull { i ->
-            val o = list.optJSONObject(i) ?: return@mapNotNull null
-            SearchItem(
-                sourceName = o.optString("sourceName", ""),
-                vodId = o.optString("vodId", ""),
-                name = o.optString("name", ""),
-                pic = o.optString("pic", ""),
-                typeName = o.optString("typeName", ""),
-                year = o.optString("year", ""),
-                remarks = o.optString("remarks", ""),
-                sourceUrl = o.optString("sourceUrl", ""),
-            )
-        }
-        // 公共采集站经常挂，把「几个源无响应」透出来，否则用户只会觉得「结果怎么这么少」
-        val failures = root.optJSONArray("failures")?.length() ?: 0
-        return SearchResult(items, failures)
+        return parseSearch(root)
     }
 
     fun detail(vodId: String, source: SourceConfig): Detail {
@@ -258,19 +242,7 @@ class Api(baseUrl: String) {
         val path = "/api/douban?type=" + enc(type) + "&tag=" + enc(tag) +
             "&pageStart=" + pageStart + "&pageSize=" + pageSize
         val root = JSONObject(readBody(open(path)))
-        // 实测返回 {"items":[{id,title,cover,rating,isTv}]}；list/subjects 仅作兼容
-        val arr = root.optJSONArray("items")
-            ?: root.optJSONArray("list")
-            ?: root.optJSONArray("subjects")
-            ?: JSONArray()
-        return (0 until arr.length()).mapNotNull { i ->
-            val o = arr.optJSONObject(i) ?: return@mapNotNull null
-            DoubanItem(
-                title = o.optString("title", o.optString("name", "")),
-                cover = o.optString("cover", o.optString("pic", o.optString("img", ""))),
-                rating = o.optString("rating", o.optString("rate", "")),
-            )
-        }
+        return parseDouban(root)
     }
 
     /**
@@ -517,4 +489,51 @@ class Api(baseUrl: String) {
     }
 
     private fun enc(s: String): String = URLEncoder.encode(s, "UTF-8")
+}
+
+/**
+ * `/api/search` 的响应解析。
+ *
+ * 抽成独立函数是因为这里的字段名全是「跟服务端约定俗成」的：
+ * 服务端改个字段名，界面上只会表现为「搜索没有结果」，没有任何报错 ——
+ * 只有把解析逻辑拉出来用单测钉住，才敢放心做字段兜底。
+ */
+internal fun parseSearch(root: JSONObject): SearchResult {
+    val list = root.optJSONArray("list") ?: JSONArray()
+    val items = (0 until list.length()).mapNotNull { i ->
+        val o = list.optJSONObject(i) ?: return@mapNotNull null
+        SearchItem(
+            sourceName = o.optString("sourceName", ""),
+            vodId = o.optString("vodId", ""),
+            name = o.optString("name", ""),
+            pic = o.optString("pic", ""),
+            typeName = o.optString("typeName", ""),
+            year = o.optString("year", ""),
+            remarks = o.optString("remarks", ""),
+            sourceUrl = o.optString("sourceUrl", ""),
+        )
+    }
+    // 公共采集站经常挂，把「几个源无响应」透出来，否则用户只会觉得「结果怎么这么少」
+    val failures = root.optJSONArray("failures")?.length() ?: 0
+    return SearchResult(items, failures)
+}
+
+/**
+ * 豆瓣推荐解析。实测返回 `{"items":[{id,title,cover,rating,isTv}]}`；
+ * `list` / `subjects` 是上游 LibreTV / 豆瓣接口的旧字段名，仅作兼容，
+ * 封面同样按 cover → pic → img 兜底 —— 这些兜底链一个都不能断。
+ */
+internal fun parseDouban(root: JSONObject): List<DoubanItem> {
+    val arr = root.optJSONArray("items")
+        ?: root.optJSONArray("list")
+        ?: root.optJSONArray("subjects")
+        ?: JSONArray()
+    return (0 until arr.length()).mapNotNull { i ->
+        val o = arr.optJSONObject(i) ?: return@mapNotNull null
+        DoubanItem(
+            title = o.optString("title", o.optString("name", "")),
+            cover = o.optString("cover", o.optString("pic", o.optString("img", ""))),
+            rating = o.optString("rating", o.optString("rate", "")),
+        )
+    }
 }

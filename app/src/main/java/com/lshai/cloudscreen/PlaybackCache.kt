@@ -4,6 +4,8 @@ import android.content.Context
 import androidx.media3.datasource.cache.LeastRecentlyUsedCacheEvictor
 import androidx.media3.datasource.cache.SimpleCache
 import androidx.media3.database.StandaloneDatabaseProvider
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.io.File
 
 /**
@@ -19,8 +21,17 @@ object PlaybackCache {
     /** 默认上限 2GB；实际值可在设置里改（Prefs.cacheLimitMb） */
     private const val DEFAULT_MAX_MB = 2048
 
+    /** 缓存占用的复用窗口：30 秒内重复打开设置页不必重新遍历目录 */
+    private const val SIZE_TTL_MS = 30_000L
+
     @Volatile
     private var instance: SimpleCache? = null
+
+    /** 上次算到的占用；-1 = 未知 */
+    @Volatile
+    private var cachedSize = -1L
+    @Volatile
+    private var cachedAtMs = 0L
 
     /** 存活中的播放器个数。>0 时绝不能 release 缓存实例，否则播放器下次读分片会崩。 */
     private val activePlayers = java.util.concurrent.atomic.AtomicInteger(0)
@@ -61,11 +72,32 @@ object PlaybackCache {
         get(context)
     }
 
-    /** 当前缓存占用（字节） */
-    fun sizeBytes(context: Context): Long {
+    /**
+     * 上次算到的占用（字节）；-1 表示还没算过。
+     *
+     * 界面上先用它垫一下，真正遍历目录放到 [sizeBytesAsync] 里做 ——
+     * 上限 2GB 的 HLS 缓存可能有几万个分片文件，同步遍历会把主线程卡住。
+     */
+    fun knownSizeBytes(): Long = cachedSize
+
+    /**
+     * 后台重算缓存占用。30 秒内复用上次结果，避免反复遍历同一个目录。
+     * 只读文件长度、不读内容，正常情况下几百毫秒内完成。
+     */
+    suspend fun sizeBytesAsync(context: Context): Long = withContext(Dispatchers.IO) {
+        val now = android.os.SystemClock.elapsedRealtime()
+        val known = cachedSize
+        if (known >= 0 && now - cachedAtMs < SIZE_TTL_MS) return@withContext known
         val dir = File(context.cacheDir, "media_cache")
-        if (!dir.exists()) return 0L
-        return dir.walkTopDown().filter { it.isFile }.sumOf { it.length() }
+        val bytes = if (!dir.exists()) {
+            0L
+        } else {
+            runCatching { dir.walkTopDown().filter { it.isFile }.sumOf { it.length() } }
+                .getOrDefault(0L)
+        }
+        cachedSize = bytes
+        cachedAtMs = now
+        bytes
     }
 
     /**
@@ -83,6 +115,8 @@ object PlaybackCache {
             instance = null
             val dir = File(context.cacheDir, "media_cache")
             runCatching { dir.deleteRecursively() }
+            cachedSize = 0L
+            cachedAtMs = android.os.SystemClock.elapsedRealtime()
             return true
         }
     }

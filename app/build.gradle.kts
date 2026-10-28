@@ -36,8 +36,8 @@ android {
         // 23 = Android 6.0：Media3 的下限之上，老盒子都能装
         minSdk = 23
         targetSdk = 37
-        versionCode = 43
-        versionName = "1.1.4"
+        versionCode = 44
+        versionName = "1.1.5"
     }
 
     signingConfigs {
@@ -123,4 +123,6 @@ dependencies {
 
     // 纯函数单测（片名清洗、播放地址解析、版本号比较），只跑在 JVM 上，不进 APK
     testImplementation("junit:junit:4.13.2")
+    // JVM 上没有 Android 的 org.json 实现，装一份同 API 的真实现才能测 JSON 解析
+    testImplementation("org.json:json:20240303")
 }

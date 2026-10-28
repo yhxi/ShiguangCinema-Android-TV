@@ -1956,17 +1956,9 @@ class MainActivity : Activity() {
     }
     /** 播放缓存（磁盘）：显示占用并清空 */
     private fun showClearPlaybackCache() {
-        val bytes = PlaybackCache.sizeBytes(this)
-        val mb = bytes / 1024.0 / 1024.0
-        val text = String.format(
-            java.util.Locale.US,
-            "当前占用 %.1f MB\n上限 %d MB，超出后自动淘汰最久未用的片段。",
-            mb,
-            prefs.cacheLimitMb,
-        ) + if (PlaybackCache.isInUse()) "\n\n正在播放，退出播放后再清。" else ""
-        AlertDialog.Builder(this)
+        val dialog = AlertDialog.Builder(this)
             .setTitle("播放缓存")
-            .setMessage(text)
+            .setMessage(playbackCacheMessage(PlaybackCache.knownSizeBytes().takeIf { it >= 0 }))
             .setPositiveButton("清空") { _, _ ->
                 if (PlaybackCache.clear(this)) {
                     toast("已清空播放缓存")
@@ -1977,7 +1969,28 @@ class MainActivity : Activity() {
                 showSetup()
             }
             .setNegativeButton("取消", null)
-            .show()
+            .create()
+        dialog.show()
+        // 2GB 上限的缓存可能有几万个分片，遍历目录放到后台，算完再刷新文案
+        scope.launch {
+            val bytes = PlaybackCache.sizeBytesAsync(this@MainActivity)
+            if (dialog.isShowing) dialog.setMessage(playbackCacheMessage(bytes))
+        }
+    }
+
+    /** @param bytes null 表示占用还在后台算 */
+    private fun playbackCacheMessage(bytes: Long?): String {
+        val head = if (bytes == null) {
+            "当前占用计算中…"
+        } else {
+            String.format(
+                java.util.Locale.US,
+                "当前占用 %.1f MB\n上限 %d MB，超出后自动淘汰最久未用的片段。",
+                bytes / 1024.0 / 1024.0,
+                prefs.cacheLimitMb,
+            )
+        }
+        return head + if (PlaybackCache.isInUse()) "\n\n正在播放，退出播放后再清。" else ""
     }
     /** Android 13+ 发通知要用户同意；不同意也不影响后台播放，只是没有那条控制条 */
     private fun ensureNotificationPermission() {
@@ -2041,11 +2054,11 @@ class MainActivity : Activity() {
         val hist = prefs.history().size
         val search = prefs.searchHistory().size
         val progressCount = prefs.progressCount()   // 注意别叫 progress：会遮住同名的方法
-        val mediaDisk = PlaybackCache.sizeBytes(this)
-        // 以前这里只显示占用、点「清理」却不删它 —— 数字显示 800MB，清完还是 800MB
-        val msg = buildString {
+        // 播放缓存占用要遍历几万个分片，先用上次算到的值垫着，后台算完再刷新文案
+        fun buildMsg(mediaDisk: Long?): String = buildString {
             append("海报：内存 ").append(imgs).append(" 张 · 磁盘 ").append(mb(posterDisk)).append('\n')
-            append("播放缓存（磁盘）：").append(mb(mediaDisk))
+            append("播放缓存（磁盘）：")
+            append(if (mediaDisk == null) "计算中…" else mb(mediaDisk))
             append(" / 上限 ").append(prefs.cacheLimitMb).append(" MB\n")
             append("观看历史：").append(hist).append(" 条\n")
             append("搜索记录：").append(search).append(" 条\n")
@@ -2053,9 +2066,10 @@ class MainActivity : Activity() {
             append("片源配置、直播源和服务器设置不会被清除。")
             if (PlaybackCache.isInUse()) append("\n\n正在播放，播放缓存这次会跳过（退出播放后再清）。")
         }
-        AlertDialog.Builder(this)
+        val knownMedia = PlaybackCache.knownSizeBytes().takeIf { it >= 0 }
+        val dialog = AlertDialog.Builder(this)
             .setTitle("清理缓存")
-            .setMessage(msg)
+            .setMessage(buildMsg(knownMedia))
             .setPositiveButton("清理") { _, _ ->
                 // 删几 GB 分片在老盒子上要好几秒，放后台做，界面给个"正在清理"
                 progress("正在清理…", "clear", cancellable = false)
@@ -2069,13 +2083,18 @@ class MainActivity : Activity() {
                     toast(
                         "已清理：海报 " + n + " 张 + " + mb(posterDisk) +
                             "、历史 " + hist + " 条、搜索 " + search + " 条、进度 " + progressCount + " 条" +
-                            if (mediaCleared) "、播放缓存 " + mb(mediaDisk) else "（播放缓存占用中，未清）",
+                            if (mediaCleared) "、播放缓存" else "（播放缓存占用中，未清）",
                     )
                     showSetup()
                 }
             }
             .setNegativeButton("取消", null)
-            .show()
+            .create()
+        dialog.show()
+        scope.launch {
+            val bytes = PlaybackCache.sizeBytesAsync(this@MainActivity)
+            if (dialog.isShowing) dialog.setMessage(buildMsg(bytes))
+        }
     }
     /* ------------------------------------------------------------- 播放设置 */
 
@@ -3725,7 +3744,8 @@ class MainActivity : Activity() {
 
             poster.tag = first.pic
             poster.setImageBitmap(null)
-            imageLoader.load(first.pic, dp(120), dp(170)) { bmp ->
+            // 按 ImageView 的实际尺寸取图：以前要 120x170 却只显示 86x120，白解了 2 倍像素
+            imageLoader.load(first.pic, dp(86), dp(120)) { bmp ->
                 if (poster.tag == first.pic) poster.setImageBitmap(bmp)
             }
             cell.setOnClickListener { openDetail(first) }
