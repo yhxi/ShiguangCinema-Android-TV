@@ -172,6 +172,7 @@ class MainActivity : Activity() {
      * 在途的旧编号回包全部作废 —— 否则慢源的迟到结果会把用户拽回结果页。
      */
     @Volatile private var searchToken = 0
+    private var searchConnections: SearchConnections? = null
     /**
      * 界面世代：每次**真正换页**（currentScreen 变了）+1。
      * 搜索结果只允许落在「发起搜索的那个页面」或「本次搜索已经画出来的结果页」，
@@ -405,6 +406,7 @@ class MainActivity : Activity() {
         favoriteCheckJob?.cancel()
         hotSearchJob?.cancel()
         qrServer?.stop()
+        searchConnections?.cancel()
         scope.cancel()
         imageLoader.close()
         super.onDestroy()
@@ -510,6 +512,7 @@ class MainActivity : Activity() {
                 if (key == "search") {
                     // 作废这次搜索的编号：工作线程里还在跑的源即使稍后返回，也不会再把结果页弹出来
                     searchToken++
+                    searchConnections?.cancel()
                     searchInProgress = false
                     searchProgressNote = ""
                     if (currentScreen == "results") showResults()
@@ -1148,7 +1151,7 @@ class MainActivity : Activity() {
         jobs[key] = scope.launch {
             try {
                 val result = withContext(Dispatchers.IO) { block() }
-                dismissProgress()
+                if (busyKey == key) dismissProgress()
                 then(result)
             } catch (e: kotlinx.coroutines.CancellationException) {
                 // 取消（切换页面 / 被同槽位的新请求顶掉）不是网络错误。
@@ -1157,7 +1160,7 @@ class MainActivity : Activity() {
                 // 这里必须重新抛出，交给协程框架按「正常取消」处理。
                 throw e
             } catch (e: Exception) {
-                dismissProgress()
+                if (busyKey == key) dismissProgress()
                 if (quiet) {
                     onError?.invoke(e)
                     return@launch
@@ -1272,11 +1275,12 @@ class MainActivity : Activity() {
                 } else {
                     emptyList()
                 }
+                val cookie = api.currentCookie() ?: prefs.cookie
+                if (coroutineContext[Job]?.isActive == false) throw kotlinx.coroutines.CancellationException()
+                prefs.rememberServer(prefs.serverUrl, prefs.password, cookie)
                 st to subSources
             },
             then = { (st, subSources) ->
-                api.currentCookie()?.let { prefs.cookie = it }
-                prefs.rememberServer(prefs.serverUrl, prefs.password, prefs.cookie)
                 seedLiveFromServer(st)
                 seedDefaultSourcesAsync(st, subSources)
                 bootNotice = null
@@ -1478,16 +1482,23 @@ class MainActivity : Activity() {
         val dir = java.io.File(path)
         browsePath = dir.absolutePath
 
-        val entries = ArrayList<Pair<String, java.io.File>>()
-        dir.parentFile?.let { entries.add("⬆  上级目录" to it) }
-        val children = dir.listFiles()?.sortedWith(
-            compareBy({ !it.isDirectory }, { it.name.lowercase() }),
-        ).orEmpty()
-        children.forEach { f ->
-            val name = if (f.isDirectory) "📁  " + f.name else "📄  " + f.name
-            entries.add(name to f)
-        }
+        runApiK("files", "读取目录…", {
+            val entries = ArrayList<Pair<String, java.io.File>>()
+            dir.parentFile?.let { entries.add("⬆  上级目录" to it) }
+            val children = dir.listFiles()?.sortedWith(
+                compareBy({ !it.isDirectory }, { it.name.lowercase() }),
+            ).orEmpty()
+            children.forEach { f ->
+                val name = if (f.isDirectory) "📁  " + f.name else "📄  " + f.name
+                entries.add(name to f)
+            }
+            entries
+        }, { entries ->
+            if (currentScreen == "files" && browsePath == dir.absolutePath) renderFileBrowser(entries)
+        })
+    }
 
+    private fun renderFileBrowser(entries: List<Pair<String, java.io.File>>) {
         val col = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(40), dp(24), dp(40), dp(20))
@@ -1500,12 +1511,12 @@ class MainActivity : Activity() {
         bar.addView(button("/sdcard") { showFileBrowser("/sdcard") })
         bar.addView(button("/storage") { showFileBrowser("/storage") })
         bar.addView(button("自动查找") {
-            val found = findReadableStorageRoot()
-            if (found != null) {
-                showFileBrowser(found)
-            } else {
-                toast("系统限制访问存储，请改用「粘贴文本」或「从网址下载」")
-            }
+            runApiK("files", "查找存储…", { findReadableStorageRoot() }, { found ->
+                if (currentScreen == "files") {
+                    if (found != null) showFileBrowser(found)
+                    else toast("系统限制访问存储，请改用「粘贴文本」或「从网址下载」")
+                }
+            })
         })
         col.addView(hScroll(bar))
         // 顶部栏是横向滚动容器：左右键若找不到可见邻居，就吞掉按键，避免焦点跑到屏幕外
@@ -2255,7 +2266,7 @@ class MainActivity : Activity() {
                 4096 -> "4 GB"
                 else -> "2 GB"
             },
-            "后台播放          ${if (prefs.backgroundPlay) "开（退出后继续播）" else "关（退出即停止）"}",
+            "后台播放          ${if (prefs.backgroundPlay) "开（按 Home 后继续播）" else "关（进入后台暂停）"}",
             "起播缓冲          " + when (prefs.bufferMode) {
                 0 -> "快速（秒开）"
                 2 -> "稳定（抗卡顿）"
@@ -2297,14 +2308,14 @@ class MainActivity : Activity() {
                     5 -> chooseOption(
                         "播放缓存上限",
                         listOf("512 MB", "1 GB", "2 GB", "4 GB"),
-                        listOf(512, 1024, 2048, 4096).indexOf(prefs.cacheLimitMb).coerceAtLeast(2),
+                        listOf(512, 1024, 2048, 4096).indexOf(prefs.cacheLimitMb).let { if (it < 0) 2 else it },
                     ) { i ->
                         prefs.cacheLimitMb = listOf(512, 1024, 2048, 4096)[i]
                         PlaybackCache.recreate(this)
                         toast("已设为 ${listOf("512 MB", "1 GB", "2 GB", "4 GB")[i]}，下次播放生效")
                         refresh()
                     }
-                    6 -> chooseOption("后台播放", listOf("开：退出后继续播放", "关：退出即停止并释放"),
+                    6 -> chooseOption("后台播放", listOf("开：按 Home 后继续播放", "关：进入后台暂停"),
                         if (prefs.backgroundPlay) 0 else 1
                     ) { i ->
                         prefs.backgroundPlay = (i == 0)
@@ -2606,8 +2617,12 @@ class MainActivity : Activity() {
                 } else {
                     st.verified
                 }
-                Triple(st, verified, effectivePassword)
-            }, { (st, verified, pw) ->
+                val saved = if (!st.passwordRequired || verified) {
+                    if (coroutineContext[Job]?.isActive == false) throw kotlinx.coroutines.CancellationException()
+                    prefs.rememberServer(url, effectivePassword, candidate.currentCookie().orEmpty())
+                } else false
+                Triple(st, verified, saved)
+            }, { (st, verified, savedSecurely) ->
                 if (st.passwordRequired && !verified) {
                     toast("密码未通过验证，请检查后重试")
                     return@runApiK
@@ -2616,7 +2631,6 @@ class MainActivity : Activity() {
                 // 只换 Api 绑定，保留已下载的海报缓存（重建 loader 会白下一遍图）
                 imageLoader.updateApi(candidate)
                 prefs.serverUrl = url
-                val savedSecurely = prefs.rememberServer(url, pw, candidate.currentCookie().orEmpty())
                 if (!savedSecurely) toast("已连接，但设备无法安全保存密码，下次连接需重新输入")
                 toast(if (verified) "已连接 v${st.version}" else "已连接，但登录未生效")
                 seedLiveFromServer(st)
@@ -3317,6 +3331,7 @@ class MainActivity : Activity() {
 
     /* --------------------------------------------------------------- 扫码添加 */
 
+    private val qrImportLock = Any()
     private var qrServer: QrAddServer? = null
 
     /** 扫码添加：App 起一个局域网小网页，二维码里就是这个地址，手机扫码后粘贴 sources.json */
@@ -3328,15 +3343,17 @@ class MainActivity : Activity() {
         val server = QrAddServer(this, 8765, qrToken) { text ->
             val list = api.parseSourceList(text)
             if (list.isEmpty()) throw IllegalArgumentException("no sources")
-            prefs.addSources(list)
-            val live = api.parseLiveFromExport(text)
-            if (live.isNotEmpty()) {
-                val cur = prefs.liveUrls()
-                live.forEach { if (!cur.contains(it)) cur.add(it) }
-                prefs.saveLiveUrls(cur)
-                if (prefs.activeLiveUrl.isEmpty()) prefs.activeLiveUrl = cur.first()
+            synchronized(qrImportLock) {
+                val added = prefs.addSources(list)
+                val live = api.parseLiveFromExport(text)
+                if (live.isNotEmpty()) {
+                    val cur = prefs.liveUrls()
+                    live.forEach { if (!cur.contains(it)) cur.add(it) }
+                    prefs.saveLiveUrls(cur)
+                    if (prefs.activeLiveUrl.isEmpty()) prefs.activeLiveUrl = cur.first()
+                }
+                added
             }
-            list.size
         }
         qrServer = if (server.start()) server else null
         val url = server.url
@@ -4323,6 +4340,8 @@ class MainActivity : Activity() {
         if (enabledSources.isEmpty()) { toast("没有启用的片源，去「片源管理」开启或添加"); showSources(); return }
         // 全部启用源一起搜索；优先展示已完成源的结果，慢源在后台继续补齐。
         val sources = enabledSources
+        searchConnections?.cancel()
+        val requestConnections = SearchConnections().also { searchConnections = it }
         val token = ++searchToken
         lastSearchKeyword = kw
         // 点热门词/推荐海报也是搜这个词，回搜索页时输入框显示它，而不是上一次手打的内容
@@ -4372,7 +4391,7 @@ class MainActivity : Activity() {
         }
         runApiK("search", "正在搜索「$kw」（${sources.size} 个源）…", {
             val first = directThenServerSearch(
-                kw, sources, shouldContinue = { token == searchToken }, onPartial = onPartial,
+                kw, sources, requests = requestConnections, shouldContinue = { token == searchToken }, onPartial = onPartial,
             )
             // 兜底：豆瓣条目常带「（2023）」「：副标题」这类噪声，采集站匹配不到时再试一次干净片名
             if (first.items.isNotEmpty()) {
@@ -4381,7 +4400,7 @@ class MainActivity : Activity() {
                 val cleaned = cleanKeyword(kw)
                 if (cleaned.isNotEmpty() && cleaned != kw) {
                     directThenServerSearch(
-                        cleaned, sources, shouldContinue = { token == searchToken }, onPartial = onPartial,
+                        cleaned, sources, requests = requestConnections, shouldContinue = { token == searchToken }, onPartial = onPartial,
                     )
                 } else {
                     first
@@ -4440,6 +4459,7 @@ class MainActivity : Activity() {
     private fun directThenServerSearch(
         kw: String,
         sources: List<SourceConfig>,
+        requests: SearchConnections = SearchConnections(),
         shouldContinue: () -> Boolean = { true },
         onPartial: (SearchProgress) -> Unit = {},
     ): SearchResult {
@@ -4457,6 +4477,18 @@ class MainActivity : Activity() {
         // 完成的任务都往同一个队列里放，主循环只管按「谁先完成谁先算」取，
         // 这样两个线程池的结果能合并成一条时间线。
         val finished = java.util.concurrent.LinkedBlockingQueue<SearchSourceCompletion>()
+        fun awaitCompletion(): SearchSourceCompletion? {
+            while (shouldContinue() && !Thread.currentThread().isInterrupted) {
+                val result = try {
+                    finished.poll(200, java.util.concurrent.TimeUnit.MILLISECONDS)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    return null
+                }
+                if (result != null) return result
+            }
+            return null
+        }
         val directPool = java.util.concurrent.Executors.newFixedThreadPool(
             minOf(directable.size, MAX_SEARCH_CONCURRENCY).coerceAtLeast(1),
         ) { r -> Thread(r, "search-direct").apply { isDaemon = true } }
@@ -4469,10 +4501,10 @@ class MainActivity : Activity() {
 
         fun submit(source: SourceConfig, direct: Boolean) {
             val task = Runnable {
-                val result = runCatching {
+                val result = runCatching { requests.run {
                     if (direct) SearchResult(DirectCms.search(source, kw), 0)
                     else serverSearch(kw, source)
-                }.getOrNull()
+                } }.getOrNull()
                 finished.offer(SearchSourceCompletion(source, result, direct))
             }
             if (direct) directPool.execute(task) else serverPool.execute(task)
@@ -4481,12 +4513,8 @@ class MainActivity : Activity() {
             sources.forEach { submit(it, it in directable) }
             for (i in 0 until total) {
                 if (!shouldContinue()) return snapshot()
-                val completion = runCatching { finished.take() }.getOrNull()
+                val completion = awaitCompletion() ?: return snapshot()
                 done++
-                if (completion == null) {
-                    failures++
-                    continue
-                }
                 val result = completion.result
                 if (result == null) {
                     // 直连失败留到下面回退服务端；服务端自己也失败才算真的失败
@@ -4507,14 +4535,14 @@ class MainActivity : Activity() {
                 val pending = failed.size
                 failed.forEach { source ->
                     serverPool.execute(Runnable {
-                        val result = runCatching { serverSearch(kw, source) }.getOrNull()
+                        val result = runCatching { requests.run { serverSearch(kw, source) } }.getOrNull()
                         finished.offer(SearchSourceCompletion(source, result, true))
                     })
                 }
                 for (i in 0 until pending) {
                     if (!shouldContinue()) return snapshot()
-                    val completion = runCatching { finished.take() }.getOrNull()
-                    val result = completion?.result
+                    val completion = awaitCompletion() ?: return snapshot()
+                    val result = completion.result
                     if (result == null) {
                         failures++
                     } else {
@@ -4624,7 +4652,13 @@ class MainActivity : Activity() {
                 val found = withContext(Dispatchers.IO) {
                     // 用户离开这个页面（job 被取消）就立刻停止等待剩下的源
                     val job = coroutineContext[Job]
-                    directThenServerSearch(title, enabledSources, shouldContinue = { job?.isActive != false })
+                    val connections = SearchConnections()
+                    try {
+                        directThenServerSearch(title, enabledSources, requests = connections,
+                            shouldContinue = { job?.isActive != false })
+                    } finally {
+                        connections.cancel()
+                    }
                 }
                 if (currentScreen != "playbacksources") return@launch
                 val matches = found.items.filter(::isSameTitle)

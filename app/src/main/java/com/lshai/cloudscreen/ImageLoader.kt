@@ -66,6 +66,8 @@ class ImageLoader(private val context: Context, api: Api) {
 
     private val diskDir = File(context.cacheDir, "poster_cache")
     private val maxDiskBytes = 50L * 1024 * 1024
+    private val diskLock = Any()
+    private val generation = AtomicLong(0)
     private val diskBytes = AtomicLong(0)
     private val diskScanned = AtomicBoolean(false)
 
@@ -75,6 +77,7 @@ class ImageLoader(private val context: Context, api: Api) {
             onReady(null)
             return
         }
+        val requestGeneration = generation.get()
         // 内存缓存仍按尺寸分：列表要小图、详情页要大图，混用会把缓存挤爆
         val key = "$url@${reqWidth}x$reqHeight"
         cache.get(key)?.let {
@@ -94,9 +97,9 @@ class ImageLoader(private val context: Context, api: Api) {
             val cached = readFromDisk(url, reqWidth, reqHeight)
             val bmp = cached ?: download(url, reqWidth, reqHeight)
             // 先交给界面显示，再在后台写磁盘。JPEG 压缩不应挡住首张海报出现。
-            main.post { if (!closed) deliver(key, bmp) }
+            main.post { if (!closed && generation.get() == requestGeneration) deliver(key, bmp) }
             if (cached == null && bmp != null && !closed) {
-                runCatching { diskPool.execute { writeToDisk(url, bmp, reqWidth) } }
+                runCatching { diskPool.execute { synchronized(diskLock) { if (generation.get() == requestGeneration) writeToDisk(url, bmp, reqWidth) } } }
             }
         }
     }
@@ -203,6 +206,10 @@ class ImageLoader(private val context: Context, api: Api) {
             val target = diskFile(url)
             // 覆盖前先记下旧文件的宽度：新图没有更大，说明原图已经到顶
             val oldWidth = if (target.isFile) storedWidth(target) else 0
+            if (oldWidth >= bmp.width && oldWidth > 0) {
+                if (bmp.width < reqWidth * 9 / 10) diskSmall.add(url)
+                return
+            }
             val oldLen = if (target.isFile) target.length() else 0L
             val tmp = File(diskDir, target.name + ".tmp")
             val ok = tmp.outputStream().use { out ->
@@ -256,12 +263,16 @@ class ImageLoader(private val context: Context, api: Api) {
 
     /** 清空内存与磁盘缓存，返回内存里清掉的张数（磁盘按文件数计入日志） */
     fun clearCache(): Int {
+        generation.incrementAndGet()
+        synchronized(inFlight) { inFlight.clear() }
         val n = cache.snapshot().size
         cache.evictAll()
-        runCatching { diskDir.deleteRecursively() }
-        diskBytes.set(0)
-        diskScanned.set(true)
-        diskSmall.clear()
+        synchronized(diskLock) {
+            runCatching { diskDir.deleteRecursively() }
+            diskBytes.set(0)
+            diskScanned.set(true)
+            diskSmall.clear()
+        }
         return n
     }
 

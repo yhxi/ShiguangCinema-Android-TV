@@ -2290,7 +2290,8 @@ class PlayerActivity : Activity() {
         // 点通知回到播放页
         val open = android.app.PendingIntent.getActivity(
             this, 1,
-            android.content.Intent(this, PlayerActivity::class.java),
+            android.content.Intent(intent).setClass(this, PlayerActivity::class.java)
+                .addFlags(android.content.Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or android.content.Intent.FLAG_ACTIVITY_SINGLE_TOP),
             android.app.PendingIntent.FLAG_UPDATE_CURRENT or immutable,
         )
         val builder = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
@@ -3410,26 +3411,21 @@ class PlayerActivity : Activity() {
         if (p.isPlaying || p.playbackState == Player.STATE_READY) {
             val url = currentUrl()
             if (url.isEmpty()) return
-            prefs.saveProgress(url, p.currentPosition)
-            // 再按「剧名 + 集号」记一份：换源之后地址变了，靠这份接上进度
-            prefs.saveEpisodeProgress(skipKey(), currentIndex, p.currentPosition)
-            if (p.currentPosition > 5_000L) {
-                prefs.upsertHistory(
-                    HistoryEntry(
-                        title = labelFor(currentIndex),
-                        playUrl = url,
-                        positionMs = p.currentPosition,
-                        durationMs = p.duration.coerceAtLeast(0L),
-                        updatedAt = System.currentTimeMillis(),
-                        cover = coverUrl,
-                        seriesTitle = seriesTitle,
-                        vodId = vodId,
-                        sourceUrl = sourceUrl,
-                        sourceName = sourceName,
-                        episodeIndex = currentIndex,
-                    ),
-                )
-            }
+            val position = p.currentPosition
+            val entry = if (position > 5_000L) HistoryEntry(
+                title = labelFor(currentIndex),
+                playUrl = url,
+                positionMs = position,
+                durationMs = p.duration.coerceAtLeast(0L),
+                updatedAt = System.currentTimeMillis(),
+                cover = coverUrl,
+                seriesTitle = seriesTitle,
+                vodId = vodId,
+                sourceUrl = sourceUrl,
+                sourceName = sourceName,
+                episodeIndex = currentIndex,
+            ) else null
+            prefs.savePlaybackSnapshot(url, skipKey(), currentIndex, position, entry)
         }
     }
 

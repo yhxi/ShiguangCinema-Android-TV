@@ -37,7 +37,50 @@ class Prefs(ctx: Context) {
     data class ServerProfile(val url: String, val password: String, val cookie: String)
 
     private val sp = ctx.applicationContext.getSharedPreferences("cloudscreen", Context.MODE_PRIVATE)
-    private fun scoped(key: String): String = "$key:${serverUrl.hashCode()}"
+    private companion object {
+        val keyMigrationLock = Any()
+        val playbackLock = Any()
+        var playbackRevision = 0L
+        val playbackWriter = java.util.concurrent.Executors.newSingleThreadExecutor { task ->
+            Thread(task, "playback-persistence").apply { isDaemon = true }
+        }
+    }
+
+    fun savePlaybackSnapshot(url: String, series: String, index: Int, position: Long, entry: HistoryEntry?) {
+        val revision = synchronized(playbackLock) { playbackRevision }
+        playbackWriter.execute {
+            synchronized(playbackLock) {
+                if (revision == playbackRevision) {
+                    saveProgress(url, position)
+                    saveEpisodeProgress(series, index, position)
+                    if (entry != null) upsertHistory(entry)
+                }
+            }
+        }
+    }
+
+    /** Migrate the old 32-bit key lazily, preserving its value type. */
+    private fun stableKey(prefix: String, value: String): String {
+        val digest = stableDigest(value)
+        val key = prefix + "v2:" + digest
+        val legacy = prefix + value.hashCode()
+        synchronized(keyMigrationLock) {
+            if (!sp.contains(key) && sp.contains(legacy)) {
+                val editor = sp.edit()
+                when (val old = sp.all[legacy]) {
+                    is String -> editor.putString(key, old)
+                    is Long -> editor.putLong(key, old)
+                    is Int -> editor.putInt(key, old)
+                    is Boolean -> editor.putBoolean(key, old)
+                    is Float -> editor.putFloat(key, old)
+                }
+                editor.remove(legacy).apply()
+            }
+        }
+        return key
+    }
+
+    private fun scoped(key: String): String = stableKey("$key:", serverUrl)
 
     private fun saveEncrypted(key: String, value: String) {
         val encrypted = runCatching { Secret.encrypt(value) }.getOrNull()
@@ -139,15 +182,16 @@ class Prefs(ctx: Context) {
     }
 
     /** 续播进度：按 m3u8 地址记（换线路就是另一条记录，符合预期）。 */
-    fun progressOf(playUrl: String): Long = sp.getLong("pos:" + playUrl.hashCode(), 0L)
+    fun progressOf(playUrl: String): Long = sp.getLong(stableKey("pos:", playUrl), 0L)
 
     fun saveProgress(playUrl: String, positionMs: Long) {
         if (positionMs <= 5_000L) return // 开头几秒不值得记
-        sp.edit().putLong("pos:" + playUrl.hashCode(), positionMs).apply()
+        sp.edit().putLong(stableKey("pos:", playUrl), positionMs).apply()
     }
 
-    fun clearProgress(playUrl: String) {
-        sp.edit().remove("pos:" + playUrl.hashCode()).apply()
+    fun clearProgress(playUrl: String) = synchronized(playbackLock) {
+        playbackRevision++
+        sp.edit().remove(stableKey("pos:", playUrl)).apply()
     }
 
     /*
@@ -163,7 +207,7 @@ class Prefs(ctx: Context) {
     private fun episodeKey(series: String, index: Int): String {
         val s = normalizeSeries(series)
         if (s.isEmpty() || index < 0) return ""
-        return "ep:" + (s + "#" + index).hashCode()
+        return stableKey("ep:", s + "#" + index)
     }
 
     fun episodeProgressOf(series: String, index: Int): Long {
@@ -175,9 +219,9 @@ class Prefs(ctx: Context) {
     fun watchedEpisodes(series: String, urls: List<String>, thresholdMs: Long): BooleanArray {
         val normalized = normalizeSeries(series)
         return BooleanArray(urls.size) { index ->
-            val byUrl = sp.getLong("pos:" + urls[index].hashCode(), 0L)
+            val byUrl = sp.getLong(stableKey("pos:", urls[index]), 0L)
             val byEpisode = if (normalized.isEmpty()) 0L else
-                sp.getLong("ep:" + (normalized + "#" + index).hashCode(), 0L)
+                sp.getLong(stableKey("ep:", normalized + "#" + index), 0L)
             maxOf(byUrl, byEpisode) > thresholdMs
         }
     }
@@ -188,7 +232,8 @@ class Prefs(ctx: Context) {
         sp.edit().putLong(k, positionMs).apply()
     }
 
-    fun clearEpisodeProgress(series: String, index: Int) {
+    fun clearEpisodeProgress(series: String, index: Int) = synchronized(playbackLock) {
+        playbackRevision++
         val k = episodeKey(series, index)
         if (k.isNotEmpty()) sp.edit().remove(k).apply()
     }
@@ -251,7 +296,7 @@ class Prefs(ctx: Context) {
         return if (name.isEmpty()) "" else normalizeSeries(name)
     }
 
-    fun history(): MutableList<HistoryEntry> {
+    fun history(): MutableList<HistoryEntry> = synchronized(playbackLock) {
         val raw = parseHistory()
         // 老版本只按播放地址去重，同一部剧每看一集就多一条 —— 「最近观看」里会出现
         // 海贼王 1134 / 1133 / 1132 三张并排的卡。这里按剧收成一条（保留最新的那条，
@@ -268,7 +313,7 @@ class Prefs(ctx: Context) {
             kept.add(e)
         }
         if (dropped) writeHistory(kept)
-        return kept
+        kept
     }
 
     private fun parseHistory(): MutableList<HistoryEntry> {
@@ -324,7 +369,7 @@ class Prefs(ctx: Context) {
      * 想回看更早的集，从详情页的选集面板进。
      * 最近观看排最前，最多 40 条。
      */
-    fun upsertHistory(entry: HistoryEntry) {
+    fun upsertHistory(entry: HistoryEntry) = synchronized(playbackLock) {
         val all = history()
         // 从历史页进入播放时拿不到封面（传的是旧记录里的空值），
         // 这里保留已有封面，避免"点一次历史，海报就没了"
@@ -361,11 +406,13 @@ class Prefs(ctx: Context) {
         sp.edit().putString("history", arr.toString()).apply()
     }
 
-    fun removeHistory(playUrl: String) {
+    fun removeHistory(playUrl: String) = synchronized(playbackLock) {
+        playbackRevision++
         writeHistory(history().filterNot { it.playUrl == playUrl })
     }
 
-    fun clearHistory() {
+    fun clearHistory() = synchronized(playbackLock) {
+        playbackRevision++
         sp.edit().remove("history").apply()
     }
 
@@ -457,29 +504,29 @@ class Prefs(ctx: Context) {
      *
      * 不按「剧名」记：同一部剧每集的 SRT 是不同文件，串了会直接对不上画面。
      */
-    fun subtitleOf(playUrl: String): String = sp.getString("sub:" + playUrl.hashCode(), "").orEmpty()
+    fun subtitleOf(playUrl: String): String = sp.getString(stableKey("sub:", playUrl), "").orEmpty()
 
     /** 返回给用户看的文件名（和 uri 一起存，取的时候不用再查一次 ContentResolver） */
     fun subtitleNameOf(playUrl: String): String =
-        sp.getString("subname:" + playUrl.hashCode(), "").orEmpty()
+        sp.getString(stableKey("subname:", playUrl), "").orEmpty()
 
     /** 字幕格式（SubRip / SSA / WebVTT），挂载时嗅探一次就存下来，避免每次播放都读文件头 */
     fun subtitleMimeOf(playUrl: String): String =
-        sp.getString("submime:" + playUrl.hashCode(), "").orEmpty()
+        sp.getString(stableKey("submime:", playUrl), "").orEmpty()
 
     fun saveSubtitle(playUrl: String, uri: String, name: String, mime: String) {
         sp.edit()
-            .putString("sub:" + playUrl.hashCode(), uri)
-            .putString("subname:" + playUrl.hashCode(), name)
-            .putString("submime:" + playUrl.hashCode(), mime)
+            .putString(stableKey("sub:", playUrl), uri)
+            .putString(stableKey("subname:", playUrl), name)
+            .putString(stableKey("submime:", playUrl), mime)
             .apply()
     }
 
     fun clearSubtitle(playUrl: String) {
         sp.edit()
-            .remove("sub:" + playUrl.hashCode())
-            .remove("subname:" + playUrl.hashCode())
-            .remove("submime:" + playUrl.hashCode())
+            .remove(stableKey("sub:", playUrl))
+            .remove(stableKey("subname:", playUrl))
+            .remove(stableKey("submime:", playUrl))
             .apply()
     }
 
@@ -547,12 +594,12 @@ class Prefs(ctx: Context) {
      * 老设备上整体变卡，而用户完全不知道发生了什么。这里按剧名记，只影响那一部。
      */
     fun softDecodeFor(key: String): Boolean =
-        key.isNotEmpty() && sp.getBoolean("soft_decode:" + key.hashCode(), false)
+        key.isNotEmpty() && sp.getBoolean(stableKey("soft_decode:", key), false)
 
     fun setSoftDecodeFor(key: String, value: Boolean) {
         if (key.isEmpty()) return
-        if (value) sp.edit().putBoolean("soft_decode:" + key.hashCode(), true).apply()
-        else sp.edit().remove("soft_decode:" + key.hashCode()).apply()
+        if (value) sp.edit().putBoolean(stableKey("soft_decode:", key), true).apply()
+        else sp.edit().remove(stableKey("soft_decode:", key)).apply()
     }
 
     /** 播放磁盘缓存上限（MB），默认 2048 */
@@ -593,26 +640,26 @@ class Prefs(ctx: Context) {
         set(v) = sp.edit().putBoolean("skip_outro_on", v).apply()
 
     fun introEndOf(key: String): Long =
-        if (key.isEmpty()) 0L else sp.getLong("intro_end:" + key.hashCode(), 0L)
+        if (key.isEmpty()) 0L else sp.getLong(stableKey("intro_end:", key), 0L)
 
     fun saveIntroEnd(key: String, ms: Long) {
         if (key.isEmpty()) return
-        sp.edit().putLong("intro_end:" + key.hashCode(), ms.coerceAtLeast(0L)).apply()
+        sp.edit().putLong(stableKey("intro_end:", key), ms.coerceAtLeast(0L)).apply()
     }
 
     fun outroStartOf(key: String): Long =
-        if (key.isEmpty()) 0L else sp.getLong("outro_start:" + key.hashCode(), 0L)
+        if (key.isEmpty()) 0L else sp.getLong(stableKey("outro_start:", key), 0L)
 
     fun saveOutroStart(key: String, ms: Long) {
         if (key.isEmpty()) return
-        sp.edit().putLong("outro_start:" + key.hashCode(), ms.coerceAtLeast(0L)).apply()
+        sp.edit().putLong(stableKey("outro_start:", key), ms.coerceAtLeast(0L)).apply()
     }
 
     fun clearSkipMarks(key: String) {
         if (key.isEmpty()) return
         sp.edit()
-            .remove("intro_end:" + key.hashCode())
-            .remove("outro_start:" + key.hashCode())
+            .remove(stableKey("intro_end:", key))
+            .remove(stableKey("outro_start:", key))
             .apply()
     }
 
@@ -700,9 +747,10 @@ class Prefs(ctx: Context) {
     /** 播放进度存在 pos:<hash> 键里，这里统计并整体清掉 */
     fun progressCount(): Int = sp.all.keys.count { it.startsWith("pos:") }
 
-    fun clearAllProgress() {
+    fun clearAllProgress() = synchronized(playbackLock) {
+        playbackRevision++
         val editor = sp.edit()
-        sp.all.keys.filter { it.startsWith("pos:") }.forEach { editor.remove(it) }
+        sp.all.keys.filter { it.startsWith("pos:") || it.startsWith("ep:") }.forEach { editor.remove(it) }
         editor.apply()
     }
     /** 首页顶部按钮顺序（id 列表） */
@@ -718,23 +766,23 @@ class Prefs(ctx: Context) {
 
     /** 记录某个源最近一次连通性测试结果（列表直接展示，不用每次重测） */
     fun saveSourceTest(url: String, ok: Boolean, ms: Long) {
-        val k = "st_ok:" + url.hashCode()
+        val k = stableKey("st_ok:", url)
         sp.edit()
             .putBoolean(k, ok)
-            .putLong("st_ms:" + url.hashCode(), ms)
-            .putLong("st_at:" + url.hashCode(), System.currentTimeMillis())
+            .putLong(stableKey("st_ms:", url), ms)
+            .putLong(stableKey("st_at:", url), System.currentTimeMillis())
             .apply()
     }
 
     /** 最近一次测试结果：null 表示没测过 */
     fun sourceTest(url: String): Pair<Boolean, Long>? {
-        val k = "st_ok:" + url.hashCode()
+        val k = stableKey("st_ok:", url)
         if (!sp.contains(k)) return null
-        return sp.getBoolean(k, false) to sp.getLong("st_ms:" + url.hashCode(), 0L)
+        return sp.getBoolean(k, false) to sp.getLong(stableKey("st_ms:", url), 0L)
     }
 
     /** 上次检测这条源的时间戳（毫秒）；没测过返回 0 */
-    fun sourceTestAt(url: String): Long = sp.getLong("st_at:" + url.hashCode(), 0L)
+    fun sourceTestAt(url: String): Long = sp.getLong(stableKey("st_at:", url), 0L)
     /** 首页顶部被隐藏的按钮 id */
     fun homeBarHidden(): Set<String> {
         val text = sp.getString("home_bar_hidden", "") ?: ""
@@ -746,10 +794,10 @@ class Prefs(ctx: Context) {
     }
 
     /** 给某条历史补封面（历史页自动补图用） */
-    fun updateHistoryCover(playUrl: String, cover: String) {
+    fun updateHistoryCover(playUrl: String, cover: String) = synchronized(playbackLock) {
         val list = history()
         val idx = list.indexOfFirst { it.playUrl == playUrl }
-        if (idx < 0) return
+        if (idx < 0) return@synchronized
         list[idx] = list[idx].copy(cover = cover)
         val arr = JSONArray()
         list.forEach { e ->

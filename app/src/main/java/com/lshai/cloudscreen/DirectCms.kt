@@ -56,7 +56,7 @@ object DirectCms {
     private fun getSourceJson(src: SourceConfig, url: String): JSONObject = try {
         getJson(url).also { synchronized(failures) { failures.remove(src.url) } }
     } catch (e: Exception) {
-        recordFailure(src.url)
+        if (!SearchConnections.currentCancelled()) recordFailure(src.url)
         throw e
     }
 
@@ -143,6 +143,7 @@ object DirectCms {
             setRequestProperty("Accept", "application/json,text/plain,*/*")
         }
         try {
+            SearchConnections.registerCurrent(conn)
             val code = conn.responseCode
             if (code !in 200..299) throw IllegalStateException("HTTP $code")
             val raw = conn.inputStream.use { input ->

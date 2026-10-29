@@ -118,6 +118,7 @@ class Api(baseUrl: String) {
         connectTimeoutMs: Int = 8000,
     ): HttpURLConnection {
         val conn = URL(baseUrl + path).openConnection() as HttpURLConnection
+        SearchConnections.registerCurrent(conn)
         conn.connectTimeout = connectTimeoutMs
         conn.readTimeout = readTimeoutMs
         conn.instanceFollowRedirects = true
@@ -290,6 +291,24 @@ class Api(baseUrl: String) {
     private val directFailures = HashMap<String, Pair<Int, Long>>()
     private val directRetryDelayMs = 5 * 60_000L
 
+    private fun boundedImageBytes(conn: HttpURLConnection): ByteArray? {
+        val limit = 8 * 1024 * 1024
+        if (conn.contentLengthLong > limit) return null
+        return conn.inputStream.use { input ->
+            val out = java.io.ByteArrayOutputStream()
+            val buffer = ByteArray(8192)
+            var total = 0
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                total += count
+                if (total > limit) return null
+                out.write(buffer, 0, count)
+            }
+            out.toByteArray()
+        }
+    }
+
     private fun directImageBytes(url: String): ByteArray? {
         if (!url.startsWith("http://") && !url.startsWith("https://")) return null
         val host = runCatching { URL(url).host.lowercase() }.getOrNull() ?: return null
@@ -317,7 +336,7 @@ class Api(baseUrl: String) {
             if (conn.responseCode !in 200..299) {
                 null
             } else {
-                val data = conn.inputStream.use { it.readBytes() }
+                val data = boundedImageBytes(conn) ?: return null
                 // 防盗链有时返 200 但内容是几十字节的占位/错误页，太小就当失败
                 if (data.size < 512) null else data
             }
@@ -344,7 +363,7 @@ class Api(baseUrl: String) {
             conn.connectTimeout = 8000
             conn.readTimeout = 15000
             cookie?.let { conn.setRequestProperty("Cookie", it) }
-            if (conn.responseCode !in 200..299) null else conn.inputStream.use { it.readBytes() }
+            if (conn.responseCode !in 200..299) null else boundedImageBytes(conn)
         } catch (e: Exception) {
             null
         } finally {
