@@ -3916,6 +3916,9 @@ class MainActivity : Activity() {
     /** 各分类的热门片名；豆瓣拉不到就用精选清单兜底，保证每一类都有内容 */
     private val hotTitles = linkedMapOf<String, List<String>>()
 
+    /** 各分类的完整榜单（「更多」弹层用）：精选 + 豆瓣整页，不截断到 12 条 */
+    private val hotAllTitles = linkedMapOf<String, List<String>>()
+
     /** 联想词池：片名 → 所属分类，首字母匹配的数据源 */
     private val suggestPool = linkedMapOf<String, String>()
 
@@ -3935,24 +3938,30 @@ class MainActivity : Activity() {
             // 热门词只用于提示，不该在用户刚打开搜索页时与手动搜索抢网络。
             delay(800)
             if (currentScreen != "home") return@launch
+            // 四类并发拉取：谁先回来谁先上屏。原来串行逐类请求，
+            // 最后一类要多等前三类的网络时间，「更多」也就跟着慢。
             for (cat in hotCategories) {
-                if (currentScreen != "home") break
                 if (hotTitles.containsKey(cat.label)) continue
-                val curated = curatedTitles(cat.label)
-                val fetched = if (cat.doubanType == null) {
-                    emptyList()
-                } else {
-                    withContext(kotlinx.coroutines.Dispatchers.IO) {
-                        runCatching {
-                            api.douban(cat.doubanType, cat.doubanTag!!, 0, 25)
-                        }.getOrDefault(emptyList())
-                    }.map { it.title }.filter { it.isNotBlank() }
-                }
-                // 精选排前面（顺序就是推荐顺序），豆瓣榜单接在后面补充
-                hotTitles[cat.label] = (curated + fetched).distinct().take(12)
-                rebuildSuggestPool()
-                withContext(kotlinx.coroutines.Dispatchers.Main) {
-                    if (currentScreen == "home") refreshHotChips()
+                launch {
+                    val curated = curatedTitles(cat.label)
+                    val fetched = if (cat.doubanType == null) {
+                        emptyList()
+                    } else {
+                        withContext(kotlinx.coroutines.Dispatchers.IO) {
+                            runCatching {
+                                api.douban(cat.doubanType, cat.doubanTag!!, 0, 25)
+                            }.getOrDefault(emptyList())
+                        }.map { it.title }.filter { it.isNotBlank() }
+                    }
+                    // 精选排前面（顺序就是推荐顺序），豆瓣榜单接在后面补充；
+                    // 完整列表给「更多」弹层，卡片上只放前 12 条
+                    val merged = (curated + fetched).distinct()
+                    hotAllTitles[cat.label] = merged
+                    hotTitles[cat.label] = merged.take(12)
+                    rebuildSuggestPool()
+                    withContext(kotlinx.coroutines.Dispatchers.Main) {
+                        if (currentScreen == "home") refreshHotChips()
+                    }
                 }
             }
         }
@@ -3967,7 +3976,8 @@ class MainActivity : Activity() {
         }
         prefs.searchHistory().forEach { add(it, "最近搜索") }
         prefs.history().take(20).forEach { add(it.seriesTitle.ifEmpty { historyTitle(it) }, "看过的") }
-        hotTitles.forEach { (label, titles) -> titles.forEach { add(it, label) } }
+        // 用完整榜单（含「更多」弹层里的全部词条）做联想池：能首字母命中的片名更多
+        hotAllTitles.forEach { (label, titles) -> titles.forEach { add(it, label) } }
         recommendItems.forEach { add(it.title, "推荐") }
         lastResults.forEach { add(it.name, "搜索结果") }
     }
@@ -4008,6 +4018,26 @@ class MainActivity : Activity() {
                 row.addView(rankChip(idx + 1, title) { doSearch(title) })
             }
         }
+    }
+
+    /**
+     * 「更多」：弹出一类的完整榜单。数据在进搜索页时就已经并发预取并缓存在本地，
+     * 点开是纯内存读取、零网络等待；万一还没拉到，先退回精选清单顶上。
+     */
+    private fun showHotMore(label: String) {
+        val titles = hotAllTitles[label].orEmpty()
+            .ifEmpty { hotTitles[label].orEmpty() }
+            .ifEmpty { curatedTitles(label) }
+        if (titles.isEmpty()) {
+            toast("榜单还在加载，稍后再点")
+            return
+        }
+        val shown = titles.mapIndexed { i, t -> "${i + 1}. $t" }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("$label · 共 ${titles.size} 个")
+            .setItems(shown) { _, which -> doSearch(titles[which]) }
+            .setNegativeButton("关闭", null)
+            .show()
     }
 
     /**
@@ -4139,7 +4169,8 @@ class MainActivity : Activity() {
                 else -> "豆瓣实时榜单"
             }
             val card = panelCard()
-            card.addView(cardHeader(cat.label, note))
+            // 「更多」弹完整榜单：数据早已预取缓存，点开即现，不用打字
+            card.addView(cardHeader(cat.label, note, "更多") { showHotMore(cat.label) })
             val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
             card.addView(hScroll(row).apply { setPadding(0, dp(6), 0, 0) })
             val box = LinearLayout(this).apply {
