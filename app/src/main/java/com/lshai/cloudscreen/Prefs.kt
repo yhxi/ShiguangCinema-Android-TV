@@ -757,7 +757,7 @@ class Prefs(ctx: Context) {
     fun homeBarOrder(): MutableList<String> {
         val text = sp.getString("home_bar_order", "") ?: ""
         if (text.isEmpty()) return HomeBar.DEFAULT.toMutableList()
-        return text.split(',').filter { it.isNotEmpty() }.toMutableList()
+        return migrateHomeOrder(text.split(',').filter { it.isNotEmpty() }).toMutableList()
     }
 
     fun saveHomeBarOrder(list: List<String>) {
@@ -808,7 +808,7 @@ class Prefs(ctx: Context) {
 }
 
 object HomeBar {
-    val DEFAULT = listOf("tv", "live", "search", "fav", "setup")
+    val DEFAULT = listOf("tv", "kids", "search", "fav", "setup")
 
     fun label(id: String): String = when (id) {
         "movie" -> "电影"
@@ -816,6 +816,7 @@ object HomeBar {
         "show" -> "综艺"
         "search" -> "搜索"
         "live" -> "直播"
+        "kids" -> "儿童"
         "history" -> "继续"
         "fav" -> "追剧"
         "sources" -> "片源"

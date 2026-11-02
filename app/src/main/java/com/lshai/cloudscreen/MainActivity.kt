@@ -526,7 +526,14 @@ class MainActivity : Activity() {
         when (currentScreen) {
             "files" -> showSources()
             "qradd" -> { qrServer?.stop(); qrServer = null; showSources() }
-            "results" -> showRecommend()
+            "children" -> showRecommend()
+            "children_more" -> showChildren()
+            "results" -> {
+                val section = childrenSearchOrigin
+                childrenSearchOrigin = null
+                if (section == null) showRecommend()
+                else if (section < 0) showChildren() else showChildrenMore(section)
+            }
             "playbacksources" -> { cancelJob("playbacksources"); showRecommend() }
             "serversettings" -> showSetup()
             "detail", "live", "setup", "history" -> showRecommend()
@@ -2480,6 +2487,7 @@ class MainActivity : Activity() {
         }
         section("观影设置")
         row("sources", "片源管理", "点播源 ${prefs.sources().size} 个 · 直播源 ${prefs.liveUrls().size} 个 · 管理") { showSources() }
+        row("live", "电视直播", "进入直播频道") { liveChannels = emptyList(); showLive() }
         row("tv", "播放设置", "续播、画质、缓冲与跳过片头片尾") { showPlaySettings() }
         row("setup", "切换服务端", "选择预设服务端，输入密码连接") { showServerSettings() }
         section("维护工具")
@@ -4330,6 +4338,11 @@ class MainActivity : Activity() {
     }
 
     private fun doSearch(keyword: String) {
+        childrenSearchOrigin = when (currentScreen) {
+            "children" -> -1
+            "children_more" -> childrenSectionIndex
+            else -> null
+        }
         homeMaintenanceJob?.cancel()
         favoriteCheckJob?.cancel()
         hotSearchJob?.cancel()
@@ -5839,6 +5852,7 @@ class MainActivity : Activity() {
         "show" -> homeTile("show", "综艺") { applyMediaType("show", "综艺") }
         "search" -> homeTile("search", "搜索") { showHome() }
         "live" -> homeTile("live", "直播") { liveChannels = emptyList(); showLive() }
+        "kids" -> homeTile("kids", "儿童") { showChildren() }
         "history" -> homeTile("history", "继续") { showHistoryCards() }
         "fav" -> {
             // 有更新时在标签上带一句，用户不用进页面才知道有新集
@@ -5848,6 +5862,198 @@ class MainActivity : Activity() {
         "sources" -> homeTile("sources", "片源") { showSources() }
         "setup" -> homeTile("setup", "设置") { showSetup() }
         else -> homeTile("other", HomeBar.label(id)) { }
+    }
+
+    // 儿童页封面只查询已启用源；同时最多三个请求，避免 50 部作品同时打满网络。
+    private var childrenSectionIndex = -1
+    private var childrenSearchOrigin: Int? = null
+    private val childrenCoverSlots = kotlinx.coroutines.sync.Semaphore(3)
+    private val childrenCovers = mutableMapOf<String, String>()
+    private val childrenCoverTried = mutableSetOf<String>()
+    private val childrenCoverWaiting = mutableMapOf<String, MutableList<java.lang.ref.WeakReference<ImageView>>>()
+
+    private fun bindChildrenCover(image: ImageView, title: String, width: Int, height: Int) {
+        image.tag = title
+        image.setImageDrawable(null)
+        fun display(url: String) {
+            if (url.isEmpty()) return
+            imageLoader.load(url, width, height) { bmp ->
+                if (image.tag == title && bmp != null) image.setImageBitmap(bmp)
+            }
+        }
+        childrenCovers[title]?.let { display(it); return }
+        if (title in childrenCoverTried) return
+        val sources = prefs.sources().filter { it.enabled }.take(2)
+        if (sources.isEmpty()) return
+        val waiting = childrenCoverWaiting.getOrPut(title) { mutableListOf() }
+        waiting.add(java.lang.ref.WeakReference(image))
+        if (waiting.size > 1) return
+        val requestApi = api
+        scope.launch {
+            try {
+                childrenCoverSlots.acquire()
+                val cover = try {
+                    withContext(Dispatchers.IO) {
+                        var result = ""
+                        for (source in sources) {
+                            fun match(items: List<SearchItem>): String = items.firstOrNull {
+                                it.pic.isNotBlank() && (it.name == title || it.name.startsWith(title))
+                            }?.pic.orEmpty()
+                            if (DirectCms.shouldTryDirect(source)) {
+                                result = match(runCatching { DirectCms.search(source, title) }.getOrDefault(emptyList()))
+                            }
+                            if (result.isEmpty()) {
+                                result = match(runCatching {
+                                    requestApi.search(title, listOf(source), readTimeoutMs = 6_000).items
+                                }.getOrDefault(emptyList()))
+                            }
+                            if (result.isNotEmpty()) break
+                        }
+                        result
+                    }
+                } finally { childrenCoverSlots.release() }
+                if (requestApi !== api) return@launch
+                childrenCoverTried.add(title)
+                if (cover.isNotEmpty()) childrenCovers[title] = cover
+                childrenCoverWaiting[title]?.forEach { ref ->
+                    val target = ref.get() ?: return@forEach
+                    if (target.tag == title && cover.isNotEmpty()) {
+                        imageLoader.load(cover, width, height) { bmp ->
+                            if (target.tag == title && bmp != null) target.setImageBitmap(bmp)
+                        }
+                    }
+                }
+            } finally { childrenCoverWaiting.remove(title) }
+        }
+    }
+
+    private fun childrenCard(width: Int, height: Int): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(6), dp(6), dp(6), dp(6))
+        isFocusable = true
+        isClickable = true
+        clipChildren = false
+        val art = FrameLayout(this@MainActivity).apply {
+            background = GradientDrawable().apply { setColor(0xFFD9F1E7.toInt()); cornerRadius = dp(10).toFloat() }
+            clipToOutline = true
+            addView(ChildrenArtworkView(this@MainActivity), FrameLayout.LayoutParams(-1, -1))
+            addView(ImageView(this@MainActivity).apply { scaleType = ImageView.ScaleType.CENTER_CROP },
+                FrameLayout.LayoutParams(-1, -1))
+        }
+        addView(art, LinearLayout.LayoutParams(-1, height))
+        addView(TextView(this@MainActivity).apply {
+            gravity = Gravity.CENTER
+            setTextColor(INK); setTextSize(if (isTvDevice) 16f else 14f)
+            setTypeface(null, Typeface.BOLD); maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            setPadding(dp(2), dp(7), dp(2), dp(3))
+        }, LinearLayout.LayoutParams(-1, -2))
+        applyFocusStyle(this, PANEL, focusScale = 1.02f)
+    }
+
+    private fun bindChildrenCard(card: LinearLayout, title: String, width: Int, height: Int) {
+        val frame = card.getChildAt(0) as FrameLayout
+        val image = frame.getChildAt(1) as ImageView
+        (card.getChildAt(1) as TextView).text = title
+        bindChildrenCover(image, title, width, height)
+        card.setOnClickListener { doSearch(title) }
+        card.contentDescription = title
+    }
+
+    private fun childrenHeader(title: String, back: () -> Unit): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.HORIZONTAL
+        gravity = Gravity.CENTER_VERTICAL
+        addView(button("← 返回") { back() })
+        addView(titleText(title, if (isTvDevice) 26f else 22f).apply {
+            setTypeface(null, Typeface.BOLD)
+            setPadding(dp(10), 0, 0, 0)
+        }, LinearLayout.LayoutParams(0, -2, 1f))
+    }
+
+    private fun showChildren() {
+        currentScreen = "children"
+        // Leaving and reopening the page allows failed lookups to retry after source changes.
+        childrenCoverTried.clear()
+        val col = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(pagePad(40), dp(18), pagePad(40), dp(24))
+        }
+        col.addView(childrenHeader("儿童乐园") { showRecommend() })
+        col.addView(hintText("按年龄推荐 · 点动画选择片源 · 年龄仅供参考").apply {
+            setPadding(dp(6), dp(4), dp(6), dp(12))
+        })
+        val width = if (isTvDevice) ((resources.displayMetrics.widthPixels - dp(220)) / 3).coerceAtLeast(dp(120)) else dp(150)
+        val height = if (isTvDevice) dp(110) else dp(92)
+        ChildrenCatalog.sections.forEachIndexed { index, section ->
+            val panel = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(10), dp(8), dp(10), dp(8))
+                background = GradientDrawable().apply {
+                    setColor(PANEL); cornerRadius = dp(16).toFloat()
+                    setStroke(dp(1), BORDER)
+                }
+            }
+            val head = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+            head.addView(titleText("${section.age}  ${section.title}", if (isTvDevice) 20f else 18f).apply {
+                setTypeface(null, Typeface.BOLD); setTextColor(ACCENT)
+            }, LinearLayout.LayoutParams(0, -2, 1f))
+            head.addView(button("更多 ›") { showChildrenMore(index) })
+            panel.addView(head)
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL; clipChildren = false; clipToPadding = false
+            }
+            section.titles.take(3).forEach { title ->
+                val card = childrenCard(width, height)
+                bindChildrenCard(card, title, width, height)
+                row.addView(card, LinearLayout.LayoutParams(width, -2).apply { rightMargin = dp(8) })
+            }
+            panel.addView(hScroll(row))
+            col.addView(panel, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) })
+        }
+        val scroll = ScrollView(this).apply {
+            isFillViewport = false; clipChildren = false; clipToPadding = false
+            addView(col)
+        }
+        setScreen(scroll)
+    }
+
+    private fun showChildrenMore(index: Int) {
+        val section = ChildrenCatalog.sections.getOrNull(index) ?: return
+        currentScreen = "children_more"
+        childrenSectionIndex = index
+        val rootColumn = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(pagePad(40), dp(18), pagePad(40), dp(18))
+        }
+        rootColumn.addView(childrenHeader("${section.age}  ${section.title}") { showChildren() })
+        rootColumn.addView(hintText("${section.titles.size} 部动画 · 年龄仅供参考"))
+        val columns = if (isTvDevice) 4 else 2
+        val width = ((resources.displayMetrics.widthPixels - pagePad(40) * 2 - dp(12) * (columns - 1)) / columns).coerceAtLeast(dp(110))
+        val height = if (isTvDevice) dp(130) else dp(105)
+        // GridView owns focus so D-pad can scroll to rows whose views do not exist yet.
+        val grid = newGrid().apply {
+            numColumns = columns
+            setDrawSelectorOnTop(true)
+            horizontalSpacing = dp(12); verticalSpacing = dp(12)
+            clipChildren = false; clipToPadding = false
+            setPadding(dp(4), dp(8), dp(4), dp(8))
+            adapter = object : BaseAdapter() {
+                override fun getCount() = section.titles.size
+                override fun getItem(position: Int) = section.titles[position]
+                override fun getItemId(position: Int) = position.toLong()
+                override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+                    val card = convertView as? LinearLayout ?: childrenCard(width, height)
+                    bindChildrenCard(card, section.titles[position], width, height)
+                    card.setOnClickListener(null)
+                    card.isFocusable = false
+                    card.isClickable = false
+                    return card
+                }
+            }
+            setOnItemClickListener { _, _, position, _ -> doSearch(section.titles[position]) }
+        }
+        rootColumn.addView(grid, LinearLayout.LayoutParams(-1, 0, 1f))
+        setScreen(rootColumn)
     }
 
     private fun showRecommend() {

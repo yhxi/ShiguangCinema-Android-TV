@@ -92,6 +92,13 @@ class HomeIconView(context: Context, private val kind: String) : View(context) {
                 canvas.drawCircle(10.5f, 10.5f, 6.3f, stroke)
                 canvas.drawLine(15.2f, 15.2f, 20f, 20f, stroke)
             }
+            // 儿童：笑脸，与其他入口保持一致的线条风格
+            "kids" -> {
+                canvas.drawCircle(12f, 12f, 8f, stroke)
+                canvas.drawCircle(9f, 10f, 0.9f, fill)
+                canvas.drawCircle(15f, 10f, 0.9f, fill)
+                canvas.drawArc(8f, 10f, 16f, 16f, 20f, 140f, false, stroke)
+            }
             // 直播：同心圆（外圈 + 实心点）
             "live" -> {
                 canvas.drawCircle(12f, 12f, 8f, stroke)
