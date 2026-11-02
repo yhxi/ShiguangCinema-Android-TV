@@ -705,6 +705,30 @@ class Prefs(ctx: Context) {
         }
     }
 
+    /** Children's poster URL index, isolated by server and enabled source set. */
+    fun loadChildrenCoverCache(signature: String): Map<String, String> {
+        val raw = sp.getString("children_cover_cache", "").orEmpty()
+        if (raw.isEmpty()) return emptyMap()
+        return try {
+            val root = JSONObject(raw)
+            if (root.optString("signature") != signature) return emptyMap()
+            val items = root.optJSONObject("items") ?: return emptyMap()
+            val result = mutableMapOf<String, String>()
+            for (section in ChildrenCatalog.sections) for (title in section.titles) {
+                val cover = items.optString(title, "")
+                if (cover.isNotEmpty()) result[title] = cover
+            }
+            result
+        } catch (_: Exception) { emptyMap() }
+    }
+
+    fun saveChildrenCoverCache(signature: String, covers: Map<String, String>) {
+        val items = JSONObject()
+        covers.forEach { (title, cover) -> if (cover.isNotEmpty()) items.put(title, cover) }
+        val raw = JSONObject().put("signature", signature).put("items", items).toString()
+        sp.edit().putString("children_cover_cache", raw).apply()
+    }
+
     /** 首页右上角更新提示开关（关闭后只在设置页页脚显示红点） */
     var updateBannerEnabled: Boolean
         get() = sp.getBoolean("update_banner", true)

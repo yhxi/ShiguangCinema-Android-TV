@@ -5547,117 +5547,107 @@ class MainActivity : Activity() {
         }
     }
 
-    /** 方案 B 的续看主卡：海报完整保留纵向比例，右侧集中呈现进度与操作。 */
+    /** Compact recent items: two on phones, three on TV; full history stays available. */
     private fun addContinueWatchingB(col: LinearLayout) {
-        val h = prefs.history().firstOrNull() ?: return
+        val recent = prefs.history().take(if (isTvDevice) 3 else 2)
+        if (recent.isEmpty()) return
         val head = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(18), 0, dp(8))
+            setPadding(0, dp(14), 0, dp(6))
         }
         head.addView(titleText("最近观看", if (isTvDevice) 25f else 21f).apply {
             setTypeface(null, Typeface.BOLD)
         }, LinearLayout.LayoutParams(0, -2, 1f))
         head.addView(button("全部记录") { showHistoryCards() })
         col.addView(head)
-
-        val height = dp(if (isTvDevice) 210 else 176)
-        val coverWidth = dp(if (isTvDevice) 145 else 118)
-        val card = LinearLayout(this).apply {
+        val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            background = GradientDrawable().apply {
-                setColor(PANEL)
-                cornerRadius = dp(18).toFloat()
-                setStroke(dp(1), BORDER)
-            }
-            clipToOutline = true
-            elevation = dp(3).toFloat()
-            isClickable = true
-            isFocusable = true
-            setOnClickListener { playFromHistory(h) }
-            setOnLongClickListener { confirmRemoveHistory(h); true }
-            setOnFocusChangeListener { v, focused ->
-                v.background = GradientDrawable().apply {
-                    setColor(PANEL)
-                    cornerRadius = dp(18).toFloat()
-                    setStroke(dp(if (focused) 3 else 1), if (focused) ACCENT else BORDER)
+            clipChildren = false
+            clipToPadding = false
+        }
+        val height = dp(if (isTvDevice) 140 else 112)
+        val coverWidth = dp(if (isTvDevice) 78 else 52)
+        recent.forEachIndexed { index, h ->
+            val card = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                isClickable = true
+                isFocusable = true
+                setOnClickListener { playFromHistory(h) }
+                setOnLongClickListener { confirmRemoveHistory(h); true }
+                setOnKeyListener { _, code, event ->
+                    if (code == KeyEvent.KEYCODE_MENU && event.action == KeyEvent.ACTION_DOWN) {
+                        confirmRemoveHistory(h); true
+                    } else false
                 }
+                setPadding(dp(4), dp(4), dp(4), dp(4))
+                applyFocusStyle(this, PANEL, focusScale = 1f)
             }
-        }
-        val poster = FrameLayout(this).apply {
-            background = GradientDrawable().apply { setColor(0xFFD7E9DF.toInt()) }
-        }
-        poster.addView(TextView(this).apply {
-            text = historyTitle(h).take(2)
-            gravity = Gravity.CENTER
-            setTypeface(null, Typeface.BOLD)
-            setTextSize(26f)
-            setTextColor(ACCENT)
-        }, FrameLayout.LayoutParams(-1, -1))
-        val image = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
-        poster.addView(image, FrameLayout.LayoutParams(-1, -1))
-        homeHistoryCoverViews[h.playUrl] = Triple(image, coverWidth, height)
-        if (h.cover.isNotBlank()) updateHomeHistoryCover(h.playUrl, h.cover)
-        card.addView(poster, LinearLayout.LayoutParams(coverWidth, height))
-
-        val detail = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(if (isTvDevice) 26 else 16), dp(12), dp(16), dp(12))
-        }
-        detail.addView(TextView(this).apply {
-            text = "继续观看"
-            setTextColor(ACCENT)
-            setTextSize(12f)
-            setTypeface(null, Typeface.BOLD)
-        })
-        detail.addView(TextView(this).apply {
-            text = historyTitle(h)
-            setTextColor(INK)
-            setTextSize(if (isTvDevice) 24f else 19f)
-            setTypeface(null, Typeface.BOLD)
-            maxLines = 2
-            setPadding(0, dp(5), 0, 0)
-        })
-        detail.addView(TextView(this).apply {
-            text = h.title.substringAfter(" · ", "继续播放") +
-                if (h.positionMs > 0) " · ${formatTime(h.positionMs)}" else ""
-            setTextColor(BRIGHTER_TEXT)
-            setTextSize(if (isTvDevice) 15f else 12f)
-            maxLines = 1
-            setPadding(0, dp(7), 0, dp(9))
-        })
-        val fraction = if (h.durationMs > 0) {
-            (h.positionMs.toFloat() / h.durationMs).coerceIn(0f, 1f)
-        } else 0f
-        val track = FrameLayout(this).apply {
-            background = GradientDrawable().apply {
-                setColor(0xFFDDE7E2.toInt())
-                cornerRadius = dp(3).toFloat()
+            val poster = FrameLayout(this).apply {
+                background = GradientDrawable().apply {
+                    setColor(0xFFD7E9DF.toInt()); cornerRadius = dp(10).toFloat()
+                }
+                clipToOutline = true
             }
-        }
-        track.addView(View(this).apply {
-            background = GradientDrawable().apply {
-                setColor(ACCENT)
-                cornerRadius = dp(3).toFloat()
+            poster.addView(TextView(this).apply {
+                text = historyTitle(h).take(2)
+                gravity = Gravity.CENTER
+                setTypeface(null, Typeface.BOLD)
+                setTextSize(if (isTvDevice) 20f else 16f)
+                setTextColor(ACCENT)
+            }, FrameLayout.LayoutParams(-1, -1))
+            val image = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
+            poster.addView(image, FrameLayout.LayoutParams(-1, -1))
+            homeHistoryCoverViews[h.playUrl] = Triple(image, coverWidth, height)
+            if (h.cover.isNotBlank()) updateHomeHistoryCover(h.playUrl, h.cover)
+            card.addView(poster, LinearLayout.LayoutParams(coverWidth, -1))
+            val detail = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(if (isTvDevice) 12 else 7), dp(4), dp(3), dp(4))
             }
-        }, FrameLayout.LayoutParams(0, dp(4)))
-        track.post {
-            track.getChildAt(0).layoutParams =
-                FrameLayout.LayoutParams((track.width * fraction).toInt(), dp(4))
+            detail.addView(TextView(this).apply {
+                text = historyTitle(h)
+                setTextColor(INK)
+                setTextSize(if (isTvDevice) 18f else 14f)
+                setTypeface(null, Typeface.BOLD)
+                maxLines = 2
+                ellipsize = android.text.TextUtils.TruncateAt.END
+            })
+            detail.addView(TextView(this).apply {
+                text = h.title.substringAfter(" · ", "继续播放") +
+                    if (h.positionMs > 0) " · ${formatTime(h.positionMs)}" else ""
+                setTextColor(BRIGHTER_TEXT)
+                setTextSize(if (isTvDevice) 13f else 11f)
+                maxLines = 1
+                ellipsize = android.text.TextUtils.TruncateAt.END
+                setPadding(0, dp(5), 0, dp(7))
+            })
+            val fraction = if (h.durationMs > 0) (h.positionMs.toFloat() / h.durationMs).coerceIn(0f, 1f) else 0f
+            val track = FrameLayout(this).apply {
+                background = GradientDrawable().apply { setColor(0xFFDDE7E2.toInt()); cornerRadius = dp(3).toFloat() }
+            }
+            track.addView(View(this).apply {
+                background = GradientDrawable().apply { setColor(ACCENT); cornerRadius = dp(3).toFloat() }
+            }, FrameLayout.LayoutParams(0, dp(4)))
+            track.post { track.getChildAt(0).layoutParams = FrameLayout.LayoutParams((track.width * fraction).toInt(), dp(4)) }
+            detail.addView(track, LinearLayout.LayoutParams(-1, dp(4)))
+            detail.addView(TextView(this).apply {
+                text = "▶ 继续播放"
+                setTextColor(ACCENT)
+                setTextSize(if (isTvDevice) 14f else 11f)
+                setTypeface(null, Typeface.BOLD)
+                maxLines = 1
+                setPadding(0, dp(7), 0, 0)
+            })
+            card.addView(detail, LinearLayout.LayoutParams(0, -1, 1f))
+            row.addView(card, LinearLayout.LayoutParams(0, height, 1f).apply {
+                if (index > 0) leftMargin = dp(if (isTvDevice) 10 else 6)
+            })
+            if (homeHistoryFirst == null) homeHistoryFirst = card
         }
-        detail.addView(track, LinearLayout.LayoutParams(-1, dp(4)))
-        detail.addView(TextView(this).apply {
-            text = "▶  继续播放"
-            setTextColor(ACCENT)
-            setTextSize(if (isTvDevice) 15f else 13f)
-            setTypeface(null, Typeface.BOLD)
-            setPadding(0, dp(10), 0, 0)
-        })
-        card.addView(detail, LinearLayout.LayoutParams(0, -1, 1f))
-        col.addView(card, LinearLayout.LayoutParams(-1, height))
-        homeHistoryFirst = card
+        col.addView(row, LinearLayout.LayoutParams(-1, height))
     }
 
     private fun addContinueWatching(col: LinearLayout) {
@@ -5864,30 +5854,61 @@ class MainActivity : Activity() {
         else -> homeTile("other", HomeBar.label(id)) { }
     }
 
-    // 儿童页封面只查询已启用源；同时最多三个请求，避免 50 部作品同时打满网络。
+    // Resolve and preload all 100 titles with bounded concurrency; visible cards are queued first.
     private var childrenSectionIndex = -1
     private var childrenSearchOrigin: Int? = null
     private val childrenCoverSlots = kotlinx.coroutines.sync.Semaphore(3)
     private val childrenCovers = mutableMapOf<String, String>()
     private val childrenCoverTried = mutableSetOf<String>()
     private val childrenCoverWaiting = mutableMapOf<String, MutableList<java.lang.ref.WeakReference<ImageView>>>()
+    private var childrenCoverSignature = ""
+    private var childrenSources: List<SourceConfig> = emptyList()
+    private var childrenCacheWriteJob: Job? = null
+    private var childrenPreloadedSignature = ""
+    private var childrenLastPreloadAt = 0L
 
-    private fun bindChildrenCover(image: ImageView, title: String, width: Int, height: Int) {
-        image.tag = title
-        image.setImageDrawable(null)
-        fun display(url: String) {
-            if (url.isEmpty()) return
-            imageLoader.load(url, width, height) { bmp ->
-                if (image.tag == title && bmp != null) image.setImageBitmap(bmp)
+    private fun prepareChildrenCovers() {
+        val sources = prefs.sources().filter { it.enabled }
+        val signature = stableDigest(prefs.serverUrl + "\n" + sources.joinToString("\n") { it.url })
+        childrenSources = sources
+        if (signature == childrenCoverSignature) {
+            val pending = childrenCoverWaiting.keys.any { it.startsWith("$signature:") }
+            if (!pending && android.os.SystemClock.elapsedRealtime() - childrenLastPreloadAt >= 60_000L) {
+                childrenCoverTried.clear()
+                childrenPreloadedSignature = ""
+            }
+            return
+        }
+        childrenCacheWriteJob?.cancel()
+        childrenCoverSignature = signature
+        childrenPreloadedSignature = ""
+        childrenLastPreloadAt = 0L
+        childrenCovers.clear()
+        childrenCoverTried.clear()
+        childrenCovers.putAll(prefs.loadChildrenCoverCache(signature))
+    }
+
+    private fun queueChildrenCover(title: String, width: Int, height: Int, image: ImageView? = null) {
+        image?.let { target ->
+            childrenCovers[title]?.let { cover ->
+                imageLoader.load(cover, width, height) { bmp ->
+                    if (target.tag == title && bmp != null) target.setImageBitmap(bmp)
+                }
+                return
             }
         }
-        childrenCovers[title]?.let { display(it); return }
-        if (title in childrenCoverTried) return
-        val sources = prefs.sources().filter { it.enabled }.take(2)
-        if (sources.isEmpty()) return
-        val waiting = childrenCoverWaiting.getOrPut(title) { mutableListOf() }
-        waiting.add(java.lang.ref.WeakReference(image))
-        if (waiting.size > 1) return
+        if (childrenCovers.containsKey(title) || title in childrenCoverTried || childrenSources.isEmpty()) return
+        val signature = childrenCoverSignature
+        val key = "$signature:$title"
+        val existing = childrenCoverWaiting[key]
+        if (existing != null) {
+            if (image != null) existing.add(java.lang.ref.WeakReference(image))
+            return
+        }
+        val waiting = mutableListOf<java.lang.ref.WeakReference<ImageView>>()
+        if (image != null) waiting.add(java.lang.ref.WeakReference(image))
+        childrenCoverWaiting[key] = waiting
+        val sources = childrenSources
         val requestApi = api
         scope.launch {
             try {
@@ -5912,10 +5933,22 @@ class MainActivity : Activity() {
                         result
                     }
                 } finally { childrenCoverSlots.release() }
-                if (requestApi !== api) return@launch
+                if (requestApi !== api || signature != childrenCoverSignature) return@launch
                 childrenCoverTried.add(title)
-                if (cover.isNotEmpty()) childrenCovers[title] = cover
-                childrenCoverWaiting[title]?.forEach { ref ->
+                if (cover.isNotEmpty()) {
+                    childrenCovers[title] = cover
+                    // Fetch the actual image too, so a later visit can use the disk cache.
+                    imageLoader.load(cover, width, height) { }
+                    childrenCacheWriteJob?.cancel()
+                    childrenCacheWriteJob = scope.launch {
+                        delay(1_000)
+                        if (signature == childrenCoverSignature) {
+                            val snapshot = childrenCovers.toMap()
+                            withContext(Dispatchers.IO) { prefs.saveChildrenCoverCache(signature, snapshot) }
+                        }
+                    }
+                }
+                waiting.forEach { ref ->
                     val target = ref.get() ?: return@forEach
                     if (target.tag == title && cover.isNotEmpty()) {
                         imageLoader.load(cover, width, height) { bmp ->
@@ -5923,7 +5956,24 @@ class MainActivity : Activity() {
                         }
                     }
                 }
-            } finally { childrenCoverWaiting.remove(title) }
+            } finally { childrenCoverWaiting.remove(key) }
+        }
+    }
+
+    private fun bindChildrenCover(image: ImageView, title: String, width: Int, height: Int) {
+        image.tag = title
+        image.setImageDrawable(null)
+        queueChildrenCover(title, width, height, image)
+    }
+
+    private fun prefetchChildrenCovers(width: Int, height: Int) {
+        if (childrenSources.isEmpty() || childrenPreloadedSignature == childrenCoverSignature) return
+        childrenPreloadedSignature = childrenCoverSignature
+        childrenLastPreloadAt = android.os.SystemClock.elapsedRealtime()
+        for (title in ChildrenCatalog.preloadOrder()) {
+            val cover = childrenCovers[title]
+            if (cover != null) imageLoader.load(cover, width, height) { }
+            else queueChildrenCover(title, width, height)
         }
     }
 
@@ -5972,8 +6022,7 @@ class MainActivity : Activity() {
 
     private fun showChildren() {
         currentScreen = "children"
-        // Leaving and reopening the page allows failed lookups to retry after source changes.
-        childrenCoverTried.clear()
+        prepareChildrenCovers()
         val col = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(pagePad(40), dp(18), pagePad(40), dp(24))
@@ -6015,6 +6064,7 @@ class MainActivity : Activity() {
             addView(col)
         }
         setScreen(scroll)
+        prefetchChildrenCovers(maxOf(width, dp(240)), maxOf(height, dp(130)))
     }
 
     private fun showChildrenMore(index: Int) {
