@@ -21,6 +21,24 @@ class ChildrenCatalogTest {
         assertEquals(ChildrenCatalog.sections.flatMap { it.titles }.toSet(), order.toSet())
     }
 
+    @Test fun coverCandidatesPreferExactNamesAndIgnoreBadUrls() {
+        val entries = listOf(
+            "小猪佩奇 第三季" to "https://example.com/season.jpg",
+            "小猪佩奇" to "//example.com/exact.jpg",
+            "其他动画" to "https://example.com/wrong.jpg",
+            "小猪佩奇" to "javascript:bad",
+            "小猪佩奇" to "https://example.com/exact.jpg",
+        )
+        assertEquals(listOf("https://example.com/exact.jpg", "https://example.com/season.jpg"),
+            childrenCoverCandidates("小猪佩奇", entries))
+    }
+
+    @Test fun coverCandidatesNormalizePunctuationAndDoNotMatchEmptyTitles() {
+        assertEquals(listOf("https://example.com/a.jpg"), childrenCoverCandidates("小猪·佩奇",
+            listOf("小猪佩奇" to "https://example.com/a.jpg")))
+        assertTrue(childrenCoverCandidates("", listOf("任意" to "https://example.com/a.jpg")).isEmpty())
+    }
+
     @Test fun replacesLegacyLiveTileWithoutDisturbingOtherOrder() {
         assertEquals(listOf("tv", "kids", "search", "setup"),
             migrateHomeOrder(listOf("tv", "live", "search", "setup")))

@@ -93,14 +93,19 @@ class ImageLoader(private val context: Context, api: Api) {
             }
             inFlight[key] = mutableListOf(onReady)
         }
-        pool.execute {
-            val cached = readFromDisk(url, reqWidth, reqHeight)
-            val bmp = cached ?: download(url, reqWidth, reqHeight)
-            // 先交给界面显示，再在后台写磁盘。JPEG 压缩不应挡住首张海报出现。
-            main.post { if (!closed && generation.get() == requestGeneration) deliver(key, bmp) }
-            if (cached == null && bmp != null && !closed) {
-                runCatching { diskPool.execute { synchronized(diskLock) { if (generation.get() == requestGeneration) writeToDisk(url, bmp, reqWidth) } } }
+        try {
+            pool.execute {
+                val cached = runCatching { readFromDisk(url, reqWidth, reqHeight) }.getOrNull()
+                val bmp = cached ?: runCatching { download(url, reqWidth, reqHeight) }.getOrNull()
+                // Always finish the request, including malformed URLs and network exceptions.
+                main.post { if (!closed && generation.get() == requestGeneration) deliver(key, bmp) }
+                if (cached == null && bmp != null && !closed) {
+                    runCatching { diskPool.execute { synchronized(diskLock) { if (generation.get() == requestGeneration) writeToDisk(url, bmp, reqWidth) } } }
+                }
             }
+        } catch (_: java.util.concurrent.RejectedExecutionException) {
+            synchronized(inFlight) { inFlight.remove(key) }
+            onReady(null)
         }
     }
 

@@ -5861,6 +5861,9 @@ class MainActivity : Activity() {
     private val childrenCovers = mutableMapOf<String, String>()
     private val childrenCoverTried = mutableSetOf<String>()
     private val childrenCoverWaiting = mutableMapOf<String, MutableList<java.lang.ref.WeakReference<ImageView>>>()
+    private val childrenCoverJobs = mutableMapOf<String, Job>()
+    private val childrenBadCovers = mutableMapOf<String, MutableSet<String>>()
+    private var childrenPrefetchJob: Job? = null
     private var childrenCoverSignature = ""
     private var childrenSources: List<SourceConfig> = emptyList()
     private var childrenCacheWriteJob: Job? = null
@@ -5868,18 +5871,21 @@ class MainActivity : Activity() {
     private var childrenLastPreloadAt = 0L
 
     private fun prepareChildrenCovers() {
-        val sources = prefs.sources().filter { it.enabled }
+        val sources = prefs.sources().filter { it.enabled && !it.isAdult }
         val signature = stableDigest(prefs.serverUrl + "\n" + sources.joinToString("\n") { it.url })
         childrenSources = sources
         if (signature == childrenCoverSignature) {
             val pending = childrenCoverWaiting.keys.any { it.startsWith("$signature:") }
             if (!pending && android.os.SystemClock.elapsedRealtime() - childrenLastPreloadAt >= 60_000L) {
                 childrenCoverTried.clear()
+                childrenBadCovers.clear()
                 childrenPreloadedSignature = ""
             }
             return
         }
         childrenCacheWriteJob?.cancel()
+        childrenPrefetchJob?.cancel()
+        childrenBadCovers.clear()
         childrenCoverSignature = signature
         childrenPreloadedSignature = ""
         childrenLastPreloadAt = 0L
@@ -5888,76 +5894,111 @@ class MainActivity : Activity() {
         childrenCovers.putAll(prefs.loadChildrenCoverCache(signature))
     }
 
-    private fun queueChildrenCover(title: String, width: Int, height: Int, image: ImageView? = null) {
-        image?.let { target ->
-            childrenCovers[title]?.let { cover ->
-                imageLoader.load(cover, width, height) { bmp ->
-                    if (target.tag == title && bmp != null) target.setImageBitmap(bmp)
-                }
-                return
+    private fun persistChildrenCovers(signature: String) {
+        childrenCacheWriteJob?.cancel()
+        childrenCacheWriteJob = scope.launch {
+            delay(1_000)
+            if (signature == childrenCoverSignature) {
+                val snapshot = childrenCovers.toMap()
+                withContext(Dispatchers.IO) { prefs.saveChildrenCoverCache(signature, snapshot) }
             }
         }
-        if (childrenCovers.containsKey(title) || title in childrenCoverTried || childrenSources.isEmpty()) return
+    }
+
+    private suspend fun awaitChildrenImage(url: String, width: Int, height: Int): android.graphics.Bitmap? =
+        kotlinx.coroutines.withTimeoutOrNull(35_000) {
+            kotlinx.coroutines.suspendCancellableCoroutine { continuation ->
+                imageLoader.load(url, width, height) { bitmap ->
+                    if (continuation.isActive) continuation.resumeWith(Result.success(bitmap))
+                }
+            }
+        }
+
+    private fun invalidateChildrenCover(title: String, url: String, signature: String) {
+        if (signature != childrenCoverSignature || childrenCovers[title] != url) return
+        childrenCovers.remove(title)
+        childrenCoverTried.remove(title)
+        childrenBadCovers.getOrPut(title) { mutableSetOf() }.add(url)
+        persistChildrenCovers(signature)
+    }
+
+    private fun queueChildrenCover(title: String, width: Int, height: Int, image: ImageView? = null): Job? {
         val signature = childrenCoverSignature
+        val cached = childrenCovers[title]
+        if (cached != null) {
+            if (image != null) imageLoader.load(cached, width, height) { bmp ->
+                if (image.tag != title || signature != childrenCoverSignature) return@load
+                if (bmp != null) image.setImageBitmap(bmp)
+                else {
+                    invalidateChildrenCover(title, cached, signature)
+                    queueChildrenCover(title, width, height, image)
+                }
+            }
+            return null
+        }
+        if (title in childrenCoverTried || childrenSources.isEmpty()) return null
         val key = "$signature:$title"
         val existing = childrenCoverWaiting[key]
         if (existing != null) {
             if (image != null) existing.add(java.lang.ref.WeakReference(image))
-            return
+            return childrenCoverJobs[key]
         }
         val waiting = mutableListOf<java.lang.ref.WeakReference<ImageView>>()
         if (image != null) waiting.add(java.lang.ref.WeakReference(image))
         childrenCoverWaiting[key] = waiting
         val sources = childrenSources
         val requestApi = api
-        scope.launch {
+        val job = scope.launch {
             try {
                 childrenCoverSlots.acquire()
-                val cover = try {
-                    withContext(Dispatchers.IO) {
-                        var result = ""
-                        for (source in sources) {
-                            fun match(items: List<SearchItem>): String = items.firstOrNull {
-                                it.pic.isNotBlank() && (it.name == title || it.name.startsWith(title))
-                            }?.pic.orEmpty()
-                            if (DirectCms.shouldTryDirect(source)) {
-                                result = match(runCatching { DirectCms.search(source, title) }.getOrDefault(emptyList()))
+                try {
+                    var chosen = ""
+                    for (source in sources) {
+                        suspend fun tryCandidates(items: List<SearchItem>): String {
+                            val candidates = childrenCoverCandidates(title, items.map { it.name to it.pic }).take(4)
+                            for (candidate in candidates) {
+                                if (candidate in childrenBadCovers[title].orEmpty()) continue
+                                val bitmap = awaitChildrenImage(candidate, width, height)
+                                if (bitmap != null) return candidate
+                                childrenBadCovers.getOrPut(title) { mutableSetOf() }.add(candidate)
                             }
-                            if (result.isEmpty()) {
-                                result = match(runCatching {
-                                    requestApi.search(title, listOf(source), readTimeoutMs = 6_000).items
-                                }.getOrDefault(emptyList()))
-                            }
-                            if (result.isNotEmpty()) break
+                            return ""
                         }
-                        result
+                        if (DirectCms.shouldTryDirect(source)) {
+                            val items = withContext(Dispatchers.IO) {
+                                runCatching { DirectCms.search(source, title) }.getOrDefault(emptyList())
+                            }
+                            chosen = tryCandidates(items)
+                        }
+                        if (chosen.isEmpty()) {
+                            val items = withContext(Dispatchers.IO) {
+                                runCatching { requestApi.search(title, listOf(source), readTimeoutMs = 6_000).items }
+                                    .getOrDefault(emptyList())
+                            }
+                            chosen = tryCandidates(items)
+                        }
+                        if (chosen.isNotEmpty() || signature != childrenCoverSignature || requestApi !== api) break
+                    }
+                    if (requestApi !== api || signature != childrenCoverSignature) return@launch
+                    childrenCoverTried.add(title)
+                    if (chosen.isNotEmpty()) {
+                        childrenCovers[title] = chosen
+                        persistChildrenCovers(signature)
+                        waiting.forEach { ref ->
+                            val target = ref.get() ?: return@forEach
+                            if (target.tag == title) imageLoader.load(chosen, width, height) { bmp ->
+                                if (target.tag == title && bmp != null) target.setImageBitmap(bmp)
+                            }
+                        }
                     }
                 } finally { childrenCoverSlots.release() }
-                if (requestApi !== api || signature != childrenCoverSignature) return@launch
-                childrenCoverTried.add(title)
-                if (cover.isNotEmpty()) {
-                    childrenCovers[title] = cover
-                    // Fetch the actual image too, so a later visit can use the disk cache.
-                    imageLoader.load(cover, width, height) { }
-                    childrenCacheWriteJob?.cancel()
-                    childrenCacheWriteJob = scope.launch {
-                        delay(1_000)
-                        if (signature == childrenCoverSignature) {
-                            val snapshot = childrenCovers.toMap()
-                            withContext(Dispatchers.IO) { prefs.saveChildrenCoverCache(signature, snapshot) }
-                        }
-                    }
-                }
-                waiting.forEach { ref ->
-                    val target = ref.get() ?: return@forEach
-                    if (target.tag == title && cover.isNotEmpty()) {
-                        imageLoader.load(cover, width, height) { bmp ->
-                            if (target.tag == title && bmp != null) target.setImageBitmap(bmp)
-                        }
-                    }
-                }
-            } finally { childrenCoverWaiting.remove(key) }
+            } finally {
+                childrenCoverWaiting.remove(key)
+                childrenCoverJobs.remove(key)
+            }
         }
+        childrenCoverJobs[key] = job
+        return job
     }
 
     private fun bindChildrenCover(image: ImageView, title: String, width: Int, height: Int) {
@@ -5970,10 +6011,24 @@ class MainActivity : Activity() {
         if (childrenSources.isEmpty() || childrenPreloadedSignature == childrenCoverSignature) return
         childrenPreloadedSignature = childrenCoverSignature
         childrenLastPreloadAt = android.os.SystemClock.elapsedRealtime()
-        for (title in ChildrenCatalog.preloadOrder()) {
-            val cover = childrenCovers[title]
-            if (cover != null) imageLoader.load(cover, width, height) { }
-            else queueChildrenCover(title, width, height)
+        val signature = childrenCoverSignature
+        childrenPrefetchJob?.cancel()
+        // Keep at most two speculative lookups in flight, reserving a slot for visible cards.
+        childrenPrefetchJob = scope.launch {
+            for (batch in ChildrenCatalog.preloadOrder().chunked(2)) {
+                if (signature != childrenCoverSignature) break
+                batch.map { title -> async {
+                    val cover = childrenCovers[title]
+                    if (cover != null) {
+                        if (awaitChildrenImage(cover, width, height) == null) {
+                            invalidateChildrenCover(title, cover, signature)
+                            queueChildrenCover(title, width, height)?.join()
+                        }
+                    } else {
+                        queueChildrenCover(title, width, height)?.join()
+                    }
+                } }.awaitAll()
+            }
         }
     }
 
