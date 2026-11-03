@@ -39,6 +39,14 @@ class ChildrenCatalogTest {
         assertTrue(childrenCoverCandidates("", listOf("任意" to "https://example.com/a.jpg")).isEmpty())
     }
 
+    @Test fun filtersChildrenWithoutChangingCatalogOrder() {
+        val titles = listOf("小猪佩奇", "大耳朵图图", "舒克和贝塔")
+        assertEquals(titles, filterChildrenTitles(titles, 0, emptySet(), emptySet()))
+        assertEquals(listOf("大耳朵图图"), filterChildrenTitles(titles, 1, setOf("大耳朵图图"), emptySet()))
+        assertEquals(listOf("小猪佩奇", "舒克和贝塔"), filterChildrenTitles(titles, 2, emptySet(), setOf("舒克和贝塔", "小猪·佩奇")))
+        assertTrue(filterChildrenTitles(titles, 1, emptySet(), emptySet()).isEmpty())
+    }
+
     @Test fun replacesLegacyLiveTileWithoutDisturbingOtherOrder() {
         assertEquals(listOf("tv", "kids", "search", "setup"),
             migrateHomeOrder(listOf("tv", "live", "search", "setup")))

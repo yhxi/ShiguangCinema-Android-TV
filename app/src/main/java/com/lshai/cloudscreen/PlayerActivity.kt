@@ -7,6 +7,7 @@ import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.content.res.Configuration
 import android.graphics.Canvas
+import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.RectF
 import android.graphics.drawable.GradientDrawable
@@ -176,6 +177,7 @@ class PlayerActivity : Activity() {
     private var baseText = ""
     private var pendingSeek = -1L
     private var hasError = false
+    private var errorActions: View? = null
     /** 已经挂上的外挂字幕（每集一份，跟着播放地址存） */
     private var subtitleUri = ""
     private var subtitleMime = ""
@@ -946,6 +948,7 @@ class PlayerActivity : Activity() {
                     }
 
                     override fun onPlaybackStateChanged(playbackState: Int) {
+                        if (playbackState == Player.STATE_READY) hidePlaybackErrorActions()
                         val buffering = playbackState == Player.STATE_BUFFERING
                         // 中央「缓冲中…」延迟 700ms 才出现：HLS 换分片经常卡几百毫秒，
                         // 每次都弹大字会闪个不停；短暂卡顿用户根本无感，长卡才需要解释。
@@ -1012,8 +1015,8 @@ class PlayerActivity : Activity() {
                                 }, 1_000L)
                                 return
                             }
-                            toast("这个源打不开，正在查找其他来源…")
-                            handler.postDelayed({ backToSources() }, 600L)
+                            hasError = true
+                            showPlaybackErrorActions("这个来源暂时无法播放")
                             return
                         }
                         val msg = if (decodeFail) {
@@ -1029,6 +1032,7 @@ class PlayerActivity : Activity() {
                         bufferingText.visibility = View.GONE
                         speedText.visibility = View.GONE
                         updateChrome()
+                        showPlaybackErrorActions(if (decodeFail) "解码失败，请尝试其他来源" else "播放失败，请重试或换源")
                     }
 
                     override fun onVideoSizeChanged(videoSize: VideoSize) {
@@ -1959,6 +1963,44 @@ class PlayerActivity : Activity() {
         }
         handler.removeCallbacks(hideActions)
         handler.postDelayed(hideActions, HIDE_ACTIONS_DELAY_MS)
+    }
+
+    private fun hidePlaybackErrorActions() {
+        errorActions?.let { rootBox.removeView(it) }
+        errorActions = null
+    }
+
+    private fun showPlaybackErrorActions(message: String) {
+        if (!::rootBox.isInitialized || isFinishing || isDestroyed) return
+        hidePlaybackErrorActions()
+        val panel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding(dp(20), dp(14), dp(20), dp(14))
+            background = GradientDrawable().apply { setColor(0xE8172523.toInt()); cornerRadius = dp(14).toFloat() }
+        }
+        panel.addView(TextView(this).apply {
+            text = message; setTextColor(Color.WHITE); setTextSize(if (isTvDevice) 19f else 16f)
+            gravity = Gravity.CENTER; maxLines = 2
+        })
+        val actions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER }
+        actions.addView(actionButton("重试") {
+            hidePlaybackErrorActions()
+            hasError = false; autoRetried = false
+            baseText = labelFor(currentIndex); titleText.text = baseText
+            titleText.setTextColor(0xFFCBD5E1.toInt())
+            player?.prepare(); player?.playWhenReady = true
+            updateChrome()
+        })
+        val changeSource = actionButton("换源") { hidePlaybackErrorActions(); backToSources() }
+        actions.addView(changeSource)
+        actions.addView(actionButton("返回") { hidePlaybackErrorActions(); persistProgress(); finish() })
+        panel.addView(actions)
+        errorActions = panel
+        rootBox.addView(panel, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER,
+        ))
+        if (isTvDevice) changeSource.post { if (errorActions === panel) changeSource.requestFocus() }
     }
 
     /**
@@ -3635,6 +3677,7 @@ class PlayerActivity : Activity() {
         handler.removeCallbacks(nextTick)
         episodeDialog?.dismiss()
         episodeDialog = null
+        hidePlaybackErrorActions()
         player?.release()
         player = null
         PlaybackCache.playerClosed()

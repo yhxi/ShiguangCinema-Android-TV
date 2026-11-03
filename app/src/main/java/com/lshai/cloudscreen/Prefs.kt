@@ -39,6 +39,7 @@ class Prefs(ctx: Context) {
     private val sp = ctx.applicationContext.getSharedPreferences("cloudscreen", Context.MODE_PRIVATE)
     private companion object {
         val keyMigrationLock = Any()
+        val serverProfileLock = Any()
         val playbackLock = Any()
         var playbackRevision = 0L
         val playbackWriter = java.util.concurrent.Executors.newSingleThreadExecutor { task ->
@@ -84,14 +85,15 @@ class Prefs(ctx: Context) {
 
     private fun saveEncrypted(key: String, value: String) {
         val encrypted = runCatching { Secret.encrypt(value) }.getOrNull()
-        val editor = sp.edit()
-        if (encrypted == null) editor.remove(key) else editor.putString(key, encrypted)
-        editor.apply()
+        if (encrypted == null) return
+        sp.edit().putString(key, encrypted).apply()
     }
 
     var serverUrl: String
         get() = sp.getString("server_url", "") ?: ""
-        set(v) = sp.edit().putString("server_url", v.trim().trimEnd('/')).apply()
+        set(v) = synchronized(serverProfileLock) {
+            sp.edit().putString("server_url", v.trim().trimEnd('/')).apply()
+        }
 
     /** 访问密码：落盘前用 AndroidKeyStore 的 AES-GCM 加密（兼容旧的明文值） */
     var password: String
@@ -115,35 +117,49 @@ class Prefs(ctx: Context) {
         emptyList()
     }
 
-    fun rememberServer(url: String, password: String, cookie: String): Boolean {
+    fun rememberServer(
+        url: String, password: String, cookie: String,
+        expectedCurrentUrl: String? = null, makeCurrent: Boolean = false,
+    ): Boolean = synchronized(serverProfileLock) {
+        if (expectedCurrentUrl != null && serverUrl != expectedCurrentUrl) return@synchronized false
         val normalized = url.trim().trimEnd('/')
-        return try {
+        try {
+            val stored = sp.getString("server_profiles", "[]").orEmpty()
+            val decoded = Secret.decrypt(stored)
+            // A temporarily inaccessible keystore must not turn existing profiles into an empty list.
+            if (!serverProfilesReadable(stored, decoded)) return@synchronized false
             val profiles = savedServers().filterNot { it.url == normalized }.toMutableList()
             profiles.add(0, ServerProfile(normalized, password, cookie))
             val arr = JSONArray()
             profiles.take(8).forEach { profile ->
                 arr.put(JSONObject().apply {
-                    put("url", profile.url)
-                    put("password", profile.password)
-                    put("cookie", profile.cookie)
+                    put("url", profile.url); put("password", profile.password); put("cookie", profile.cookie)
                 })
             }
             val encryptedProfiles = Secret.encrypt(arr.toString())
             val encryptedPassword = Secret.encrypt(password)
             val encryptedCookie = Secret.encrypt(cookie)
-            sp.edit()
-                .putString("server_profiles", encryptedProfiles)
-                .putString("password", encryptedPassword)
-                .putString("cookie", encryptedCookie)
-                .commit()
+            val oldProfiles = sp.getString("server_profiles", null)
+            val oldUrl = sp.getString("server_url", null)
+            val oldPassword = sp.getString("password", null)
+            val oldCookie = sp.getString("cookie", null)
+            val editor = sp.edit().putString("server_profiles", encryptedProfiles)
+                .putString("password", encryptedPassword).putString("cookie", encryptedCookie)
+            if (makeCurrent) editor.putString("server_url", normalized)
+            val saved = editor.commit()
+            if (!saved) {
+                // commit() can fail after changing the in-memory map: restore the prior values too.
+                val rollback = sp.edit()
+                fun restore(key: String, value: String?) {
+                    if (value == null) rollback.remove(key) else rollback.putString(key, value)
+                }
+                restore("server_profiles", oldProfiles); restore("password", oldPassword); restore("cookie", oldCookie)
+                if (makeCurrent) restore("server_url", oldUrl)
+                rollback.apply()
+            }
+            saved
         } catch (_: Exception) {
-            // If secure storage fails, clear the credential slots rather than leaving
-            // legacy/plaintext values behind or silently weakening protection.
-            sp.edit()
-                .remove("server_profiles")
-                .remove("password")
-                .remove("cookie")
-                .apply()
+            // Keep existing stored credentials; never replace them with unencrypted new values.
             false
         }
     }

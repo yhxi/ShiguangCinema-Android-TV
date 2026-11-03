@@ -408,10 +408,15 @@ class NetDiagActivity : Activity() {
     private fun enableServer(preset: ServerPreset) {
         Thread {
             runCatching {
-                val candidate = Api(preset.url).apply { restoreCookie(prefs.cookie) }
+                val normalized = preset.url.trim().trimEnd('/')
+                val current = normalized.equals(prefs.serverUrl.trimEnd('/'), ignoreCase = true)
+                val profile = prefs.savedServers().firstOrNull { it.url.trimEnd('/').equals(normalized, ignoreCase = true) }
+                val password = preset.password.ifEmpty { profile?.password.orEmpty().ifEmpty { if (current) prefs.password else "" } }
+                val cookie = if (current) prefs.cookie else profile?.cookie.orEmpty()
+                val candidate = Api(preset.url).apply { restoreCookie(cookie) }
                 val st = candidate.status()
                 val verified = if (st.passwordRequired && !st.verified) {
-                    candidate.login(preset.password).verified
+                    candidate.login(password).verified
                 } else {
                     st.verified
                 }
@@ -419,13 +424,14 @@ class NetDiagActivity : Activity() {
                     ui { Toast.makeText(this, "密码未通过验证，无法启用 ${preset.name}", Toast.LENGTH_SHORT).show() }
                     return@Thread
                 }
-                api = candidate
-                serverHost = runCatching { URL(preset.url).host }.getOrDefault("")
-                prefs.serverUrl = preset.url.trimEnd('/')
-                val savedSecurely = prefs.rememberServer(preset.url, preset.password, candidate.currentCookie().orEmpty())
+                val savedSecurely = prefs.rememberServer(preset.url, password, candidate.currentCookie().orEmpty(), makeCurrent = true)
+                if (savedSecurely) {
+                    api = candidate
+                    serverHost = runCatching { URL(preset.url).host }.getOrDefault("")
+                }
                 ui {
                     subtitleTv.text = subtitleText()
-                    Toast.makeText(this, if (savedSecurely) "已启用 ${preset.name}" else "已启用 ${preset.name}，但密码未能安全保存", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this, if (savedSecurely) "已启用 ${preset.name}" else "服务器设置未能安全保存，已保留原来的服务器", Toast.LENGTH_SHORT).show()
                 }
             }.onFailure {
                 ui { Toast.makeText(this, "启用失败：${it.message}", Toast.LENGTH_SHORT).show() }

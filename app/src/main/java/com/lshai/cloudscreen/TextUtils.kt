@@ -36,3 +36,6 @@ internal fun seriesNameOf(label: String): String =
  */
 internal fun normalizeSeries(series: String): String =
     series.replace(Regex("[\\s·・\\-—_()（）\\[\\]【】:：,，.。]"), "").lowercase()
+
+/** Empty results stay retryable, including after a successful but stale source response. */
+internal fun shouldCacheSearchResult(itemCount: Int, failures: Int): Boolean = itemCount > 0

@@ -423,6 +423,15 @@ class MainActivity : Activity() {
         super.onResume()
         hideSystemUi()
         resumePendingUpdateInstall()
+        // A server can also be changed in network diagnostics while this Activity is stopped.
+        val savedServer = prefs.serverUrl
+        if (::api.isInitialized && ::imageLoader.isInitialized && savedServer.isNotEmpty() && api.baseUrl != savedServer.trimEnd('/')) {
+            api = Api(savedServer).apply { restoreCookie(prefs.cookie) }
+            imageLoader.updateApi(api)
+            searchCache.clear(); detailCache.clear()
+            recommendItems = emptyList(); recommendRequested = false
+            if (currentScreen == "recommend") showRecommend()
+        }
         // 只在从播放器返回时重建首页；首次 onResume 和从系统界面返回无需白画一遍。
         if (refreshHomeAfterPlayback && ::root.isInitialized &&
             currentScreen == "recommend" && recommendItems.isNotEmpty()) {
@@ -528,6 +537,7 @@ class MainActivity : Activity() {
             "qradd" -> { qrServer?.stop(); qrServer = null; showSources() }
             "children" -> showRecommend()
             "children_more" -> showChildren()
+            "children_empty" -> returnToChildrenOrigin()
             "results" -> {
                 val section = childrenSearchOrigin
                 childrenSearchOrigin = null
@@ -536,8 +546,9 @@ class MainActivity : Activity() {
             }
             "playbacksources" -> { cancelJob("playbacksources"); showRecommend() }
             "serversettings" -> showSetup()
-            "detail", "live", "setup", "history" -> showRecommend()
-            "sources" -> if (sourcesOrigin == "setup") showSetup() else showRecommend()
+            "detail" -> if (childrenSearchOrigin != null && lastResults.isNotEmpty()) showResultsFromDetail() else showRecommend()
+            "live", "setup", "history" -> showRecommend()
+            "sources" -> returnFromSources()
             "vodsources" -> showSources()
             "home", "recommend" -> super.onBackPressed()
             // 导入流程内的页面：逐级退回上一级，而不是退出 App
@@ -1253,6 +1264,11 @@ class MainActivity : Activity() {
      *   只把原因写到首页顶部的那行小字上。启动时走这条路。
      */
     private fun autoConnect(silent: Boolean = false) {
+        if (jobOf("connect")?.isCompleted == false) return
+        val connectionApi = api
+        val connectionUrl = prefs.serverUrl
+        val connectionPassword = prefs.password
+        val oldCookie = prefs.cookie
         if (silent) {
             val oldNotice = bootNotice
             val wasFailed = bootFailed
@@ -1264,9 +1280,9 @@ class MainActivity : Activity() {
             key = "status",
             loading = if (silent) null else "加载中…",
             block = {
-                val first = api.status()
+                val first = connectionApi.status()
                 val st = if (first.passwordRequired && !first.verified) {
-                    api.login(prefs.password)
+                    connectionApi.login(connectionPassword)
                 } else {
                     first
                 }
@@ -1277,20 +1293,20 @@ class MainActivity : Activity() {
                 // 解析失败（例如内网地址被防 SSRF 拦掉）不影响其它通道
                 val subSources = if (prefs.sources().isEmpty() && st.defaultSources.isEmpty()) {
                     st.defaultSubscriptions.flatMap { url ->
-                        runCatching { api.importSourceList(url) }.getOrDefault(emptyList())
+                        runCatching { connectionApi.importSourceList(url) }.getOrDefault(emptyList())
                     }
                 } else {
                     emptyList()
                 }
-                val cookie = api.currentCookie() ?: prefs.cookie
+                val cookie = connectionApi.currentCookie() ?: oldCookie
                 if (coroutineContext[Job]?.isActive == false) throw kotlinx.coroutines.CancellationException()
-                prefs.rememberServer(prefs.serverUrl, prefs.password, cookie)
-                st to subSources
+                val saved = prefs.rememberServer(connectionUrl, connectionPassword, cookie, expectedCurrentUrl = connectionUrl)
+                Triple(st, subSources, saved)
             },
-            then = { (st, subSources) ->
+            then = { (st, subSources, saved) ->
                 seedLiveFromServer(st)
                 seedDefaultSourcesAsync(st, subSources)
-                bootNotice = null
+                bootNotice = if (saved) null else "已连接，但服务器凭据未能安全保存"
                 bootFailed = false
                 bootRetryAttempt = 0
                 bootRetryJob?.cancel()
@@ -2214,7 +2230,13 @@ class MainActivity : Activity() {
                 // 删几 GB 分片在老盒子上要好几秒，放后台做，界面给个"正在清理"
                 progress("正在清理…", "clear", cancellable = false)
                 scope.launch {
+                    // Stop old metadata lookups as well as image downloads before clearing.
+                    childrenPrefetchJob?.cancel()
+                    childrenCoverJobs.values.toList().forEach { it.cancel() }
                     val n = withContext(Dispatchers.IO) { imageLoader.clearCache() }
+                    childrenPreloadedSignature = ""
+                    childrenCoverTried.clear()
+                    childrenBadCovers.clear()
                     val mediaCleared = withContext(Dispatchers.IO) { PlaybackCache.clear(this@MainActivity) }
                     prefs.clearHistory()
                     prefs.clearSearchHistory()
@@ -2273,7 +2295,7 @@ class MainActivity : Activity() {
                 4096 -> "4 GB"
                 else -> "2 GB"
             },
-            "后台播放          ${if (prefs.backgroundPlay) "开（按 Home 后继续播）" else "关（进入后台暂停）"}",
+            "后台播放          ${if (prefs.backgroundPlay) "开（回到桌面后继续播）" else "关（进入后台暂停）"}",
             "起播缓冲          " + when (prefs.bufferMode) {
                 0 -> "快速（秒开）"
                 2 -> "稳定（抗卡顿）"
@@ -2318,16 +2340,19 @@ class MainActivity : Activity() {
                         listOf(512, 1024, 2048, 4096).indexOf(prefs.cacheLimitMb).let { if (it < 0) 2 else it },
                     ) { i ->
                         prefs.cacheLimitMb = listOf(512, 1024, 2048, 4096)[i]
-                        PlaybackCache.recreate(this)
-                        toast("已设为 ${listOf("512 MB", "1 GB", "2 GB", "4 GB")[i]}，下次播放生效")
-                        refresh()
+                        scope.launch {
+                            val immediate = withContext(Dispatchers.IO) { PlaybackCache.recreate(this@MainActivity) }
+                            toast("已设为 ${listOf("512 MB", "1 GB", "2 GB", "4 GB")[i]}" +
+                                if (immediate) "，下次播放生效" else "，当前播放结束后生效")
+                            if (currentScreen == "playsettings") refresh()
+                        }
                     }
-                    6 -> chooseOption("后台播放", listOf("开：按 Home 后继续播放", "关：进入后台暂停"),
+                    6 -> chooseOption("后台播放", listOf("开：回到桌面后继续播放", "关：进入后台暂停"),
                         if (prefs.backgroundPlay) 0 else 1
                     ) { i ->
                         prefs.backgroundPlay = (i == 0)
                         if (i == 0) ensureNotificationPermission()
-                        toast(if (i == 0) "已开启：按返回键退出播放页，声音继续" else "已关闭：退出播放页即停止")
+                        toast(if (i == 0) "已开启：回到桌面后继续播放，退出播放页会停止" else "已关闭：进入后台暂停")
                         refresh()
                     }
                     7 -> chooseOption(
@@ -2618,7 +2643,14 @@ class MainActivity : Activity() {
             val storedCookie = if (normalizedUrl.equals(prefs.serverUrl.trimEnd('/'), ignoreCase = true)) prefs.cookie
                 else profile?.cookie.orEmpty()
             candidate.restoreCookie(storedCookie)
+            // Do not allow an older boot or login write to race a newer server choice.
+            val previousStatus = jobOf("status")
+            val previousConnect = jobOf("connect")
+            bootRetryJob?.cancel()
+            cancelJob("status")
             runApiK("connect", "正在连接…", {
+                previousStatus?.join()
+                previousConnect?.join()
                 val st = candidate.status()
                 val verified = if (st.passwordRequired && !st.verified) {
                     candidate.login(effectivePassword).verified
@@ -2627,7 +2659,7 @@ class MainActivity : Activity() {
                 }
                 val saved = if (!st.passwordRequired || verified) {
                     if (coroutineContext[Job]?.isActive == false) throw kotlinx.coroutines.CancellationException()
-                    prefs.rememberServer(url, effectivePassword, candidate.currentCookie().orEmpty())
+                    prefs.rememberServer(url, effectivePassword, candidate.currentCookie().orEmpty(), makeCurrent = true)
                 } else false
                 Triple(st, verified, saved)
             }, { (st, verified, savedSecurely) ->
@@ -2635,11 +2667,13 @@ class MainActivity : Activity() {
                     toast("密码未通过验证，请检查后重试")
                     return@runApiK
                 }
+                if (!savedSecurely) {
+                    toast("服务器设置未能安全保存，已保留原来的服务器")
+                    return@runApiK
+                }
                 api = candidate
                 // 只换 Api 绑定，保留已下载的海报缓存（重建 loader 会白下一遍图）
                 imageLoader.updateApi(candidate)
-                prefs.serverUrl = url
-                if (!savedSecurely) toast("已连接，但设备无法安全保存密码，下次连接需重新输入")
                 toast(if (verified) "已连接 v${st.version}" else "已连接，但登录未生效")
                 seedLiveFromServer(st)
                 seedDefaultSourcesAsync(st)
@@ -2705,9 +2739,17 @@ class MainActivity : Activity() {
         }
 
     /** 片源入口：点播与直播分开显示，避免把两类来源混在同一份长列表里。 */
+    private fun returnFromSources() {
+        when (sourcesOrigin) {
+            "setup" -> showSetup()
+            "children_empty" -> showChildrenEmpty(lastSearchKeyword, "")
+            else -> showRecommend()
+        }
+    }
+
     private fun showSources() {
         if (currentScreen !in setOf("sources", "vodsources", "addsource", "import", "qradd")) {
-            sourcesOrigin = if (currentScreen == "setup") "setup" else "home"
+            sourcesOrigin = when (currentScreen) { "setup" -> "setup"; "children_empty" -> "children_empty"; else -> "home" }
         }
         currentScreen = "sources"
         ensureBuiltInLiveSources()
@@ -2761,7 +2803,7 @@ class MainActivity : Activity() {
         }
         category("点播源 ${vodSources.size} 个 · 管理", "已启用 $enabledVodCount 个 · 影视采集站", ::showVodSources)
         category("直播源 ${liveSources.size} 个 · 管理", "IPTV 频道 · 默认使用第一个直播源", ::showLive)
-        col.addView(button("返回") { if (sourcesOrigin == "setup") showSetup() else showRecommend() })
+        col.addView(button("返回") { returnFromSources() })
         setScreen(col)
     }
 
@@ -3704,7 +3746,9 @@ class MainActivity : Activity() {
                 }
                 .show()
         })
-        bar.addView(button("返回推荐") { showRecommend() })
+        bar.addView(button(if (childrenSearchOrigin != null) "返回儿童乐园" else "返回推荐") {
+            if (childrenSearchOrigin != null) returnToChildrenOrigin() else showRecommend()
+        })
         bar.addView(button("重新搜索") { showHome() })
         col.addView(hScroll(bar))
         // 这一行在搜索过程中一直存在，只改文字 —— 增减视图会让下面的网格整体位移
@@ -3727,7 +3771,10 @@ class MainActivity : Activity() {
         }
         grid.adapter = resultsAdapter()
         grid.setOnItemClickListener { _, _, pos, _ ->
-            resultGroups.getOrNull(pos)?.let { openDetail(it.second.first()) }
+            resultGroups.getOrNull(pos)?.let {
+                selectedResultTitle = it.first
+                openDetail(it.second.first())
+            }
         }
         // 长按（或按菜单键）挑源：默认点进去的是第一个源，它挂了的话这里能直接改
         grid.setOnItemLongClickListener { _, _, pos, _ ->
@@ -3879,8 +3926,9 @@ class MainActivity : Activity() {
             val srcs = items.map { it.sourceName }.distinct()
             val bad = prefs.sourceTest(first.sourceUrl)?.first == false
             (info.getChildAt(2) as TextView).text = buildString {
-                if (srcs.size > 1) append("${srcs.size} 个来源 · ${srcs.joinToString(" / ")}")
-                else append(srcs.firstOrNull().orEmpty())
+                val sourceCount = items.distinctBy { it.sourceUrl }.size
+                append("${sourceCount} 个来源")
+                if (srcs.isNotEmpty()) append(" · ${srcs.joinToString(" / ")}")
                 if (bad) {
                     append("   ·⚠ 这个源上次检测失败，长按可换源")
                 }
@@ -4338,6 +4386,7 @@ class MainActivity : Activity() {
     }
 
     private fun doSearch(keyword: String) {
+        if (currentScreen == "children") childrenOverviewScrollY = childrenOverviewScroll?.scrollY ?: childrenOverviewScrollY
         childrenSearchOrigin = when (currentScreen) {
             "children" -> -1
             "children_more" -> childrenSectionIndex
@@ -4350,7 +4399,12 @@ class MainActivity : Activity() {
         if (kw.isEmpty()) { toast("请输入片名"); return }
         // 只搜「已启用」的源：停用的源不该再被请求，也不该出现在缓存键里
         val enabledSources = prefs.sources().filter { it.enabled }
-        if (enabledSources.isEmpty()) { toast("没有启用的片源，去「片源管理」开启或添加"); showSources(); return }
+        if (enabledSources.isEmpty()) {
+            lastSearchKeyword = kw
+            if (childrenSearchOrigin != null) showChildrenEmpty(kw, "当前没有启用的片源。")
+            else { toast("没有启用的片源，去「片源管理」开启或添加"); showSources() }
+            return
+        }
         // 全部启用源一起搜索；优先展示已完成源的结果，慢源在后台继续补齐。
         val sources = enabledSources
         searchConnections?.cancel()
@@ -4376,7 +4430,7 @@ class MainActivity : Activity() {
                 lastResults = items
                 searchInProgress = false
                 toast("用刚才的结果（${items.size} 个）")
-                showResults()
+                if (items.isEmpty() && childrenSearchOrigin != null) showChildrenEmpty(kw, "") else showResults()
                 return
             }
         }
@@ -4424,7 +4478,9 @@ class MainActivity : Activity() {
             searchInProgress = false
             searchProgressNote = ""
             prefs.addSearchHistory(kw)
-            searchCache[cacheKey] = System.currentTimeMillis() to result.items
+            if (shouldCacheSearchResult(result.items.size, result.failures)) {
+                searchCache[cacheKey] = System.currentTimeMillis() to result.items
+            }
             if (searchCache.size > 20) {
                 // 只留最近 20 条，按时间清掉最旧的
                 searchCache.entries.sortedBy { it.value.first }.take(searchCache.size - 20)
@@ -4435,8 +4491,11 @@ class MainActivity : Activity() {
             if (screenEpoch != searchOriginEpoch && screenEpoch != searchResultsEpoch) return@runApiK
             val failedNote = if (result.failures > 0) "（${result.failures} 个源无响应）" else ""
             if (result.items.isEmpty()) {
-                toast("没有找到结果$failedNote，换个片名或别的源试试")
-                showHome()
+                if (childrenSearchOrigin != null) showChildrenEmpty(kw, failedNote)
+                else {
+                    toast("没有找到结果$failedNote，换个片名或别的源试试")
+                    showHome()
+                }
             } else {
                 toast("找到 ${result.items.size} 个结果$failedNote")
                 // 已经停在结果页就原地收尾，不重建整页（会打断滚动与焦点）
@@ -4696,6 +4755,7 @@ class MainActivity : Activity() {
      * 现在失败时把同片名的其他源列出来让用户点。
      */
     private fun openDetail(item: SearchItem) {
+        if (currentScreen == "results") selectedResultTitle = item.name
         // 详情页返回列表、再点进同一部剧（或者来回换源比较）是常见动作，
         // 而每开一次都要一次跨境请求（1~2 秒）。5 分钟内的同一部剧直接复用。
         val cacheKey = item.vodId + "|" + item.sourceUrl
@@ -4757,6 +4817,9 @@ class MainActivity : Activity() {
         }
         // 详情页以前只有 BACK 键能回去，遥控器用户进来就「出不去」了
         col.addView(topBar())
+        if (childrenSearchOrigin != null && lastResults.isNotEmpty()) {
+            col.addView(button("← 返回搜索结果") { showResultsFromDetail() })
+        }
         // 手机只在封面旁放标题和摘要；长文本放到下方，避免把选集列表挤出屏幕。
         val header = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         val cover = ImageView(this).apply {
@@ -4824,6 +4887,17 @@ class MainActivity : Activity() {
         val alternatives = lastResults
             .filter { it.name == item.name }
             .distinctBy { it.sourceUrl }
+        val sourceHeader = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        sourceHeader.addView(hintText("当前来源：${item.sourceName.ifEmpty { "未知" }}  ·  ${alternatives.size.coerceAtLeast(1)} 个来源"),
+            LinearLayout.LayoutParams(0, -2, 1f))
+        sourceHeader.addView(button("切换来源") {
+            if (alternatives.size <= 1) toast("当前只找到一个来源")
+            else AlertDialog.Builder(this).setTitle("选择来源")
+                .setItems(alternatives.map { (if (it.sourceUrl == item.sourceUrl) "● " else "") + it.sourceName.ifEmpty { "来源" } }.toTypedArray()) { _, i ->
+                    if (alternatives[i].sourceUrl != item.sourceUrl) openDetail(alternatives[i])
+                }.setNegativeButton("取消", null).show()
+        })
+        col.addView(sourceHeader)
         if (alternatives.size > 1) {
             val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
             row.addView(hintText("来源（${alternatives.size}）："), LinearLayout.LayoutParams(dp(96), dp(44)))
@@ -5566,7 +5640,7 @@ class MainActivity : Activity() {
             clipChildren = false
             clipToPadding = false
         }
-        val height = dp(if (isTvDevice) 140 else 112)
+        val height = dp(if (isTvDevice) 140 else (112 * resources.configuration.fontScale.coerceIn(1f, 1.5f)).toInt())
         val coverWidth = dp(if (isTvDevice) 78 else 52)
         recent.forEachIndexed { index, h ->
             val card = LinearLayout(this).apply {
@@ -5616,7 +5690,8 @@ class MainActivity : Activity() {
                 ellipsize = android.text.TextUtils.TruncateAt.END
             })
             detail.addView(TextView(this).apply {
-                text = h.title.substringAfter(" · ", "继续播放") +
+                val number = Regex("第\\s*(\\d+)").find(h.title)?.groupValues?.getOrNull(1)
+                text = (if (number != null) "第 ${number} 集" else "继续播放") +
                     if (h.positionMs > 0) " · ${formatTime(h.positionMs)}" else ""
                 setTextColor(BRIGHTER_TEXT)
                 setTextSize(if (isTvDevice) 13f else 11f)
@@ -5854,9 +5929,53 @@ class MainActivity : Activity() {
         else -> homeTile("other", HomeBar.label(id)) { }
     }
 
+    private fun returnToChildrenOrigin() {
+        val section = childrenSearchOrigin
+        childrenSearchOrigin = null
+        if (section == null || section < 0) showChildren() else showChildrenMore(section)
+    }
+
+    private fun showResultsFromDetail() {
+        val title = selectedResultTitle
+        showResults()
+        val position = resultGroups.indexOfFirst { it.first == title }
+        resultsGrid?.post {
+            if (position >= 0) resultsGrid?.setSelection(position)
+            resultsGrid?.requestFocus()
+        }
+    }
+
+    private fun showChildrenEmpty(keyword: String, failedNote: String) {
+        currentScreen = "children_empty"
+        val col = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(pagePad(40), dp(22), pagePad(40), dp(20))
+        }
+        col.addView(childrenHeader("暂未找到《$keyword》") { returnToChildrenOrigin() })
+        col.addView(hintText("可以重试，或检查已启用的片源。$failedNote"))
+        val actions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        actions.addView(button("重试") {
+            val section = childrenSearchOrigin
+            if (section == null || section < 0) showChildren() else showChildrenMore(section)
+            doSearch(keyword)
+        })
+        actions.addView(button("片源管理") { showSources() })
+        actions.addView(button("返回儿童乐园") { returnToChildrenOrigin() })
+        col.addView(hScroll(actions))
+        setScreen(col)
+    }
+
     // Resolve and preload all 100 titles with bounded concurrency; visible cards are queued first.
     private var childrenSectionIndex = -1
     private var childrenSearchOrigin: Int? = null
+    private var selectedResultTitle: String? = null
+    private var childrenOverviewScroll: ScrollView? = null
+    private var childrenOverviewScrollY = 0
+    private var childrenOverviewFocus: String? = null
+    private var childrenMoreGrid: GridView? = null
+    private var childrenMoreTitle: String? = null
+    private var childrenMoreFilter = 0
+    private var childrenMoreFilterSection = -1
     private val childrenCoverSlots = kotlinx.coroutines.sync.Semaphore(3)
     private val childrenCovers = mutableMapOf<String, String>()
     private val childrenCoverTried = mutableSetOf<String>()
@@ -5905,11 +6024,16 @@ class MainActivity : Activity() {
         }
     }
 
-    private suspend fun awaitChildrenImage(url: String, width: Int, height: Int): android.graphics.Bitmap? =
+    private data class ChildrenImageResult(val bitmap: android.graphics.Bitmap?)
+
+    /** Null means the wait expired; a result with a null bitmap means an actual load failure. */
+    private suspend fun awaitChildrenImage(url: String, width: Int, height: Int): ChildrenImageResult? =
         kotlinx.coroutines.withTimeoutOrNull(35_000) {
             kotlinx.coroutines.suspendCancellableCoroutine { continuation ->
-                imageLoader.load(url, width, height) { bitmap ->
-                    if (continuation.isActive) continuation.resumeWith(Result.success(bitmap))
+                imageLoader.load(url, width, height, onCancelled = {
+                    continuation.cancel(kotlinx.coroutines.CancellationException("图片缓存已清理"))
+                }) { bitmap ->
+                    if (continuation.isActive) continuation.resumeWith(Result.success(ChildrenImageResult(bitmap)))
                 }
             }
         }
@@ -5922,13 +6046,33 @@ class MainActivity : Activity() {
         persistChildrenCovers(signature)
     }
 
+    private fun updateChildrenCoverStatus(image: ImageView, text: String?) {
+        val badge = (image.parent as? FrameLayout)?.getChildAt(2) as? TextView ?: return
+        badge.text = text.orEmpty()
+        badge.visibility = if (text == null) View.GONE else View.VISIBLE
+    }
+
+    private fun retryChildrenCover(title: String, image: ImageView, width: Int, height: Int) {
+        val key = "$childrenCoverSignature:$title"
+        if (childrenCoverWaiting.containsKey(key)) { toast("正在获取封面，请稍候"); return }
+        if (childrenSources.isEmpty()) { toast("请先启用片源，再重试封面"); return }
+        childrenCoverTried.remove(title)
+        childrenBadCovers.remove(title)
+        childrenCovers.remove(title)
+        persistChildrenCovers(childrenCoverSignature)
+        updateChildrenCoverStatus(image, "加载中")
+        queueChildrenCover(title, width, height, image)
+    }
+
     private fun queueChildrenCover(title: String, width: Int, height: Int, image: ImageView? = null): Job? {
         val signature = childrenCoverSignature
         val cached = childrenCovers[title]
         if (cached != null) {
-            if (image != null) imageLoader.load(cached, width, height) { bmp ->
+            if (image != null) imageLoader.load(cached, width, height, onCancelled = {
+                if (image.tag == title) updateChildrenCoverStatus(image, "可重试")
+            }) { bmp ->
                 if (image.tag != title || signature != childrenCoverSignature) return@load
-                if (bmp != null) image.setImageBitmap(bmp)
+                if (bmp != null) { image.setImageBitmap(bmp); updateChildrenCoverStatus(image, null) }
                 else {
                     invalidateChildrenCover(title, cached, signature)
                     queueChildrenCover(title, width, height, image)
@@ -5936,7 +6080,11 @@ class MainActivity : Activity() {
             }
             return null
         }
-        if (title in childrenCoverTried || childrenSources.isEmpty()) return null
+        if (title in childrenCoverTried || childrenSources.isEmpty()) {
+            image?.let { updateChildrenCoverStatus(it, "暂无封面") }
+            return null
+        }
+        image?.let { updateChildrenCoverStatus(it, "加载中") }
         val key = "$signature:$title"
         val existing = childrenCoverWaiting[key]
         if (existing != null) {
@@ -5951,28 +6099,36 @@ class MainActivity : Activity() {
         val job = scope.launch {
             try {
                 childrenCoverSlots.acquire()
+                val coverConnections = SearchConnections()
+                val deadline = android.os.SystemClock.elapsedRealtime() + 60_000L
+                val watchdog = scope.launch { delay(60_000); coverConnections.cancel() }
                 try {
                     var chosen = ""
                     for (source in sources) {
+                        if (coverConnections.isCancelled() || android.os.SystemClock.elapsedRealtime() >= deadline) break
                         suspend fun tryCandidates(items: List<SearchItem>): String {
                             val candidates = childrenCoverCandidates(title, items.map { it.name to it.pic }).take(4)
                             for (candidate in candidates) {
                                 if (candidate in childrenBadCovers[title].orEmpty()) continue
-                                val bitmap = awaitChildrenImage(candidate, width, height)
-                                if (bitmap != null) return candidate
-                                childrenBadCovers.getOrPut(title) { mutableSetOf() }.add(candidate)
+                                val remaining = (deadline - android.os.SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+                                if (remaining == 0L) break
+                                val result = kotlinx.coroutines.withTimeoutOrNull(remaining) { awaitChildrenImage(candidate, width, height) }
+                                if (result?.bitmap != null) return candidate
+                                if (result != null && android.os.SystemClock.elapsedRealtime() < deadline) {
+                                    childrenBadCovers.getOrPut(title) { mutableSetOf() }.add(candidate)
+                                }
                             }
                             return ""
                         }
                         if (DirectCms.shouldTryDirect(source)) {
                             val items = withContext(Dispatchers.IO) {
-                                runCatching { DirectCms.search(source, title) }.getOrDefault(emptyList())
+                                runCatching { coverConnections.run { DirectCms.search(source, title) } }.getOrDefault(emptyList())
                             }
                             chosen = tryCandidates(items)
                         }
                         if (chosen.isEmpty()) {
                             val items = withContext(Dispatchers.IO) {
-                                runCatching { requestApi.search(title, listOf(source), readTimeoutMs = 6_000).items }
+                                runCatching { coverConnections.run { requestApi.search(title, listOf(source), readTimeoutMs = 6_000).items } }
                                     .getOrDefault(emptyList())
                             }
                             chosen = tryCandidates(items)
@@ -5986,12 +6142,32 @@ class MainActivity : Activity() {
                         persistChildrenCovers(signature)
                         waiting.forEach { ref ->
                             val target = ref.get() ?: return@forEach
-                            if (target.tag == title) imageLoader.load(chosen, width, height) { bmp ->
-                                if (target.tag == title && bmp != null) target.setImageBitmap(bmp)
+                            if (target.tag == title) imageLoader.load(chosen, width, height, onCancelled = {
+                                if (target.tag == title) updateChildrenCoverStatus(target, "可重试")
+                            }) { bmp ->
+                                if (target.tag == title && bmp != null) {
+                                    target.setImageBitmap(bmp)
+                                    updateChildrenCoverStatus(target, null)
+                                }
                             }
                         }
+                    } else {
+                        waiting.forEach { ref ->
+                            val target = ref.get() ?: return@forEach
+                            if (target.tag == title) updateChildrenCoverStatus(target, "暂无封面")
+                        }
                     }
-                } finally { childrenCoverSlots.release() }
+                } finally {
+                    watchdog.cancel()
+                    coverConnections.cancel()
+                    childrenCoverSlots.release()
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                waiting.forEach { ref ->
+                    val target = ref.get() ?: return@forEach
+                    if (target.tag == title) updateChildrenCoverStatus(target, "可重试")
+                }
+                throw e
             } finally {
                 childrenCoverWaiting.remove(key)
                 childrenCoverJobs.remove(key)
@@ -6004,6 +6180,7 @@ class MainActivity : Activity() {
     private fun bindChildrenCover(image: ImageView, title: String, width: Int, height: Int) {
         image.tag = title
         image.setImageDrawable(null)
+        updateChildrenCoverStatus(image, "加载中")
         queueChildrenCover(title, width, height, image)
     }
 
@@ -6020,7 +6197,8 @@ class MainActivity : Activity() {
                 batch.map { title -> async {
                     val cover = childrenCovers[title]
                     if (cover != null) {
-                        if (awaitChildrenImage(cover, width, height) == null) {
+                        val result = awaitChildrenImage(cover, width, height)
+                        if (result != null && result.bitmap == null) {
                             invalidateChildrenCover(title, cover, signature)
                             queueChildrenCover(title, width, height)?.join()
                         }
@@ -6044,12 +6222,17 @@ class MainActivity : Activity() {
             addView(ChildrenArtworkView(this@MainActivity), FrameLayout.LayoutParams(-1, -1))
             addView(ImageView(this@MainActivity).apply { scaleType = ImageView.ScaleType.CENTER_CROP },
                 FrameLayout.LayoutParams(-1, -1))
+            addView(TextView(this@MainActivity).apply {
+                text = "加载中"; setTextColor(Color.WHITE); setTextSize(10f)
+                setPadding(dp(6), dp(3), dp(6), dp(3))
+                background = GradientDrawable().apply { setColor(0xAA173B35.toInt()); cornerRadius = dp(6).toFloat() }
+            }, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.END).apply { setMargins(dp(4), dp(4), dp(4), dp(4)) })
         }
         addView(art, LinearLayout.LayoutParams(-1, height))
         addView(TextView(this@MainActivity).apply {
             gravity = Gravity.CENTER
             setTextColor(INK); setTextSize(if (isTvDevice) 16f else 14f)
-            setTypeface(null, Typeface.BOLD); maxLines = 1
+            setTypeface(null, Typeface.BOLD); maxLines = 2; minLines = 2
             ellipsize = android.text.TextUtils.TruncateAt.END
             setPadding(dp(2), dp(7), dp(2), dp(3))
         }, LinearLayout.LayoutParams(-1, -2))
@@ -6061,14 +6244,21 @@ class MainActivity : Activity() {
         val image = frame.getChildAt(1) as ImageView
         (card.getChildAt(1) as TextView).text = title
         bindChildrenCover(image, title, width, height)
-        card.setOnClickListener { doSearch(title) }
+        card.setOnClickListener {
+            if (currentScreen == "children") {
+                childrenOverviewFocus = title
+                childrenOverviewScrollY = childrenOverviewScroll?.scrollY ?: 0
+            }
+            doSearch(title)
+        }
+        card.setOnLongClickListener { retryChildrenCover(title, image, width, height); true }
         card.contentDescription = title
     }
 
     private fun childrenHeader(title: String, back: () -> Unit): LinearLayout = LinearLayout(this).apply {
         orientation = LinearLayout.HORIZONTAL
         gravity = Gravity.CENTER_VERTICAL
-        addView(button("← 返回") { back() })
+        addView(button("← 返回") { back() }.apply { tag = SKIP_FIRST_FOCUS })
         addView(titleText(title, if (isTvDevice) 26f else 22f).apply {
             setTypeface(null, Typeface.BOLD)
             setPadding(dp(10), 0, 0, 0)
@@ -6083,6 +6273,8 @@ class MainActivity : Activity() {
             setPadding(pagePad(40), dp(18), pagePad(40), dp(24))
         }
         col.addView(childrenHeader("儿童乐园") { showRecommend() })
+        val focusViews = mutableMapOf<String, View>()
+        var firstCard: View? = null
         col.addView(hintText("按年龄推荐 · 点动画选择片源 · 年龄仅供参考").apply {
             setPadding(dp(6), dp(4), dp(6), dp(12))
         })
@@ -6101,7 +6293,13 @@ class MainActivity : Activity() {
             head.addView(titleText("${section.age}  ${section.title}", if (isTvDevice) 20f else 18f).apply {
                 setTypeface(null, Typeface.BOLD); setTextColor(ACCENT)
             }, LinearLayout.LayoutParams(0, -2, 1f))
-            head.addView(button("更多 ›") { showChildrenMore(index) })
+            val more = button("更多 ›") {
+                childrenOverviewFocus = "more:$index"
+                childrenOverviewScrollY = childrenOverviewScroll?.scrollY ?: 0
+                showChildrenMore(index)
+            }
+            focusViews["more:$index"] = more
+            head.addView(more)
             panel.addView(head)
             val row = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL; clipChildren = false; clipToPadding = false
@@ -6109,6 +6307,8 @@ class MainActivity : Activity() {
             section.titles.take(3).forEach { title ->
                 val card = childrenCard(width, height)
                 bindChildrenCard(card, title, width, height)
+                focusViews[title] = card
+                if (firstCard == null) firstCard = card
                 row.addView(card, LinearLayout.LayoutParams(width, -2).apply { rightMargin = dp(8) })
             }
             panel.addView(hScroll(row))
@@ -6118,12 +6318,24 @@ class MainActivity : Activity() {
             isFillViewport = false; clipChildren = false; clipToPadding = false
             addView(col)
         }
-        setScreen(scroll)
+        childrenOverviewScroll = scroll
+        setScreen(scroll, focusFirst = false)
+        scroll.post {
+            if (currentScreen != "children") return@post
+            scroll.scrollTo(0, childrenOverviewScrollY)
+            if (isTvDevice) (focusViews[childrenOverviewFocus] ?: firstCard)?.requestFocus()
+        }
         prefetchChildrenCovers(maxOf(width, dp(240)), maxOf(height, dp(130)))
     }
 
     private fun showChildrenMore(index: Int) {
         val section = ChildrenCatalog.sections.getOrNull(index) ?: return
+        prepareChildrenCovers()
+        if (childrenMoreFilterSection != index) {
+            childrenMoreFilterSection = index
+            childrenMoreFilter = 0
+            childrenMoreTitle = null
+        }
         currentScreen = "children_more"
         childrenSectionIndex = index
         val rootColumn = LinearLayout(this).apply {
@@ -6131,38 +6343,94 @@ class MainActivity : Activity() {
             setPadding(pagePad(40), dp(18), pagePad(40), dp(18))
         }
         rootColumn.addView(childrenHeader("${section.age}  ${section.title}") { showChildren() })
-        rootColumn.addView(hintText("${section.titles.size} 部动画 · 年龄仅供参考"))
+        val hint = hintText("")
+        val selectedName = hintText("").apply { maxLines = 2; ellipsize = android.text.TextUtils.TruncateAt.END }
         val columns = if (isTvDevice) 4 else 2
         val width = ((resources.displayMetrics.widthPixels - pagePad(40) * 2 - dp(12) * (columns - 1)) / columns).coerceAtLeast(dp(110))
         val height = if (isTvDevice) dp(130) else dp(105)
-        // GridView owns focus so D-pad can scroll to rows whose views do not exist yet.
-        val grid = newGrid().apply {
+        var items: List<String> = section.titles
+        lateinit var grid: GridView
+        val actions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val filter = button("") { }
+        fun updateFilter() {
+            val watched = if (childrenMoreFilter == 2) prefs.history().map(::historyTitle).toSet() else emptySet()
+            items = filterChildrenTitles(section.titles, childrenMoreFilter, childrenCovers.keys, watched)
+            filter.text = when (childrenMoreFilter) { 1 -> "筛选：已有封面"; 2 -> "筛选：最近看过"; else -> "筛选：全部" }
+            hint.text = "${items.size} / ${section.titles.size} 部 · 年龄仅供参考" +
+                if (items.isEmpty()) " · 当前没有符合条件的作品" else ""
+            (grid.adapter as? BaseAdapter)?.notifyDataSetChanged()
+            val position = items.indexOf(childrenMoreTitle).coerceAtLeast(0)
+            grid.post { if (items.isNotEmpty()) grid.setSelection(position) }
+        }
+        filter.setOnClickListener { childrenMoreFilter = (childrenMoreFilter + 1) % 3; updateFilter() }
+        actions.addView(filter)
+        actions.addView(button("重试当前封面") {
+            val position = grid.selectedItemPosition
+            val card = grid.selectedView as? LinearLayout
+            if (position !in items.indices || card == null) toast("请先选择一部作品；手机可长按卡片")
+            else {
+                val image = (card.getChildAt(0) as FrameLayout).getChildAt(1) as ImageView
+                retryChildrenCover(items[position], image, width, height)
+            }
+        })
+        rootColumn.addView(hScroll(actions))
+        rootColumn.addView(hint)
+        rootColumn.addView(selectedName)
+        grid = newGrid().apply {
             numColumns = columns
             setDrawSelectorOnTop(true)
             horizontalSpacing = dp(12); verticalSpacing = dp(12)
             clipChildren = false; clipToPadding = false
             setPadding(dp(4), dp(8), dp(4), dp(8))
             adapter = object : BaseAdapter() {
-                override fun getCount() = section.titles.size
-                override fun getItem(position: Int) = section.titles[position]
+                override fun getCount() = items.size
+                override fun getItem(position: Int) = items[position]
                 override fun getItemId(position: Int) = position.toLong()
                 override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
                     val card = convertView as? LinearLayout ?: childrenCard(width, height)
-                    bindChildrenCard(card, section.titles[position], width, height)
+                    bindChildrenCard(card, items[position], width, height)
                     card.setOnClickListener(null)
-                    card.isFocusable = false
-                    card.isClickable = false
+                    card.setOnLongClickListener(null)
+                    card.isFocusable = false; card.isClickable = false; card.isLongClickable = false
                     return card
                 }
             }
-            setOnItemClickListener { _, _, position, _ -> doSearch(section.titles[position]) }
+            onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+                override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: View?, pos: Int, id: Long) {
+                    val title = items.getOrNull(pos) ?: return
+                    childrenMoreTitle = title
+                    selectedName.text = "当前选择：$title"
+                }
+                override fun onNothingSelected(parent: android.widget.AdapterView<*>?) { selectedName.text = "选择作品查看完整片名" }
+            }
+            setOnItemClickListener { _, _, position, _ ->
+                childrenMoreTitle = items.getOrNull(position)
+                childrenMoreTitle?.let { doSearch(it) }
+            }
+            setOnItemLongClickListener { _, view, position, _ ->
+                val card = view as? LinearLayout ?: return@setOnItemLongClickListener false
+                val title = items.getOrNull(position) ?: return@setOnItemLongClickListener false
+                val image = (card.getChildAt(0) as FrameLayout).getChildAt(1) as ImageView
+                retryChildrenCover(title, image, width, height)
+                true
+            }
         }
+        childrenMoreGrid = grid
         rootColumn.addView(grid, LinearLayout.LayoutParams(-1, 0, 1f))
-        setScreen(rootColumn)
+        val savedTitle = childrenMoreTitle
+        updateFilter()
+        setScreen(rootColumn, focusFirst = false)
+        grid.post {
+            if (currentScreen != "children_more") return@post
+            val position = items.indexOf(savedTitle)
+            if (position >= 0) grid.setSelection(position)
+            if (isTvDevice && items.isNotEmpty()) grid.requestFocus()
+        }
     }
 
     private fun showRecommend() {
         currentScreen = "recommend"
+        childrenSearchOrigin = null
         homeHistoryCoverViews.clear()
         if (recommendItems.isEmpty() && !recommendRequested) {
             recommendRequested = true

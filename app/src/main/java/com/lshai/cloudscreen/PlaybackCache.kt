@@ -33,43 +33,50 @@ object PlaybackCache {
     @Volatile
     private var cachedAtMs = 0L
 
-    /** 存活中的播放器个数。>0 时绝不能 release 缓存实例，否则播放器下次读分片会崩。 */
-    private val activePlayers = java.util.concurrent.atomic.AtomicInteger(0)
-
-    fun playerOpened() {
-        activePlayers.incrementAndGet()
+    /** All player and cache state transitions use the same lock. */
+    private val state = PlaybackCacheState()
+    private val maintenance = java.util.concurrent.Executors.newSingleThreadExecutor { task ->
+        Thread(task, "playback-cache-maintenance").apply { isDaemon = true }
     }
+
+    fun playerOpened() = synchronized(this) { state.opened() }
 
     fun playerClosed() {
-        activePlayers.decrementAndGet()
-    }
-
-    fun isInUse(): Boolean = activePlayers.get() > 0
-
-    fun get(context: Context): SimpleCache {
-        instance?.let { return it }
-        synchronized(this) {
-            instance?.let { return it }
-            val dir = File(context.cacheDir, "media_cache")
-            if (!dir.exists()) dir.mkdirs()
-            val limitMb = runCatching { Prefs(context).cacheLimitMb }.getOrDefault(DEFAULT_MAX_MB)
-            val cache = SimpleCache(
-                dir,
-                LeastRecentlyUsedCacheEvictor(limitMb * 1024L * 1024L),
-                StandaloneDatabaseProvider(context.applicationContext),
-            )
-            instance = cache
-            return cache
+        val shouldSchedule = synchronized(this) {
+            state.closed()
+        }
+        if (shouldSchedule) maintenance.execute {
+            synchronized(this) {
+                if (state.consumeDeferred()) {
+                    runCatching { instance?.release() }
+                    instance = null
+                }
+            }
         }
     }
 
-    /** 上限变更后重建缓存实例（淘汰策略只在创建时生效） */
-    fun recreate(context: Context) {
-        synchronized(this) {
+    fun isInUse(): Boolean = synchronized(this) { state.activePlayers > 0 }
+
+    fun get(context: Context): SimpleCache = synchronized(this) {
+        // A new player may arrive before asynchronous maintenance has had a chance to run.
+        if (state.consumeBeforeUse()) {
             runCatching { instance?.release() }
             instance = null
         }
-        get(context)
+        instance?.let { return@synchronized it }
+        val dir = File(context.cacheDir, "media_cache")
+        if (!dir.exists()) dir.mkdirs()
+        val limitMb = runCatching { Prefs(context).cacheLimitMb }.getOrDefault(DEFAULT_MAX_MB)
+        SimpleCache(dir, LeastRecentlyUsedCacheEvictor(limitMb * 1024L * 1024L),
+            StandaloneDatabaseProvider(context.applicationContext)).also { instance = it }
+    }
+
+    /** Defer changes while any player holds this cache. New cache is created lazily. */
+    fun recreate(context: Context): Boolean = synchronized(this) {
+        if (!state.requestRecreate()) return@synchronized false
+        runCatching { instance?.release() }
+        instance = null
+        true
     }
 
     /**
@@ -108,11 +115,12 @@ object PlaybackCache {
      */
     fun clear(context: Context): Boolean {
         synchronized(this) {
-            if (activePlayers.get() > 0) return false
+            if (state.activePlayers > 0) return false
             runCatching {
                 instance?.release()
             }
             instance = null
+            state.cleared()
             val dir = File(context.cacheDir, "media_cache")
             runCatching { dir.deleteRecursively() }
             cachedSize = 0L

@@ -62,7 +62,8 @@ class ImageLoader(private val context: Context, api: Api) {
     @Volatile private var closed = false
 
     /** 正在下载的图：同一个 key 的后续请求排队等结果，不再各自发起下载 */
-    private val inFlight = ConcurrentHashMap<String, MutableList<(Bitmap?) -> Unit>>()
+    private data class ImageCallback(val ready: (Bitmap?) -> Unit, val cancelled: (() -> Unit)?)
+    private val inFlight = ConcurrentHashMap<String, MutableList<ImageCallback>>()
 
     private val diskDir = File(context.cacheDir, "poster_cache")
     private val maxDiskBytes = 50L * 1024 * 1024
@@ -71,71 +72,85 @@ class ImageLoader(private val context: Context, api: Api) {
     private val diskBytes = AtomicLong(0)
     private val diskScanned = AtomicBoolean(false)
 
-    fun load(url: String, reqWidth: Int, reqHeight: Int, onReady: (Bitmap?) -> Unit) {
-        if (closed) return
-        if (url.isEmpty()) {
-            onReady(null)
-            return
-        }
-        val requestGeneration = generation.get()
-        // 内存缓存仍按尺寸分：列表要小图、详情页要大图，混用会把缓存挤爆
+    fun load(
+        url: String, reqWidth: Int, reqHeight: Int,
+        onCancelled: (() -> Unit)? = null, onReady: (Bitmap?) -> Unit,
+    ) {
+        if (closed) { onCancelled?.invoke(); return }
+        if (url.isEmpty()) { onReady(null); return }
         val key = "$url@${reqWidth}x$reqHeight"
-        cache.get(key)?.let {
-            onReady(it)
-            return
-        }
-        // 已在下载中：挂到回调列表后面，等同一批结果，避免重复请求同一张图
+        cache.get(key)?.let { onReady(it); return }
+        val callback = ImageCallback(onReady, onCancelled)
+        val requestGeneration: Long
         synchronized(inFlight) {
+            if (closed) { onCancelled?.invoke(); return }
+            requestGeneration = generation.get()
             val waiting = inFlight[key]
-            if (waiting != null) {
-                waiting.add(onReady)
-                return
-            }
-            inFlight[key] = mutableListOf(onReady)
+            if (waiting != null) { waiting.add(callback); return }
+            inFlight[key] = mutableListOf(callback)
         }
         try {
             pool.execute {
                 val cached = runCatching { readFromDisk(url, reqWidth, reqHeight) }.getOrNull()
                 val bmp = cached ?: runCatching { download(url, reqWidth, reqHeight) }.getOrNull()
-                // Always finish the request, including malformed URLs and network exceptions.
-                main.post { if (!closed && generation.get() == requestGeneration) deliver(key, bmp) }
+                main.post { deliver(key, requestGeneration, bmp) }
                 if (cached == null && bmp != null && !closed) {
-                    runCatching { diskPool.execute { synchronized(diskLock) { if (generation.get() == requestGeneration) writeToDisk(url, bmp, reqWidth) } } }
+                    runCatching { diskPool.execute { synchronized(diskLock) {
+                        if (generation.get() == requestGeneration) writeToDisk(url, bmp, reqWidth)
+                    } } }
                 }
             }
         } catch (_: java.util.concurrent.RejectedExecutionException) {
-            synchronized(inFlight) { inFlight.remove(key) }
-            onReady(null)
+            val callbacks = synchronized(inFlight) {
+                if (generation.get() == requestGeneration) inFlight.remove(key) else null
+            }
+            callbacks?.forEach { it.ready(null) }
         }
+    }
+
+    private fun cancelCallbacks(callbacks: List<ImageCallback>) {
+        if (callbacks.isEmpty()) return
+        main.post { callbacks.forEach { it.cancelled?.invoke() ?: it.ready(null) } }
     }
 
     fun close() {
-        closed = true
+        val callbacks = synchronized(inFlight) {
+            closed = true
+            generation.incrementAndGet()
+            inFlight.values.flatMap { it.toList() }.also { inFlight.clear() }
+        }
         pool.shutdownNow()
         diskPool.shutdown()
-        synchronized(inFlight) { inFlight.clear() }
+        cancelCallbacks(callbacks)
     }
 
-    private fun deliver(key: String, bmp: Bitmap?) {
-        if (bmp != null) cache.put(key, bmp)
-        val waiting = synchronized(inFlight) { inFlight.remove(key) }
-        waiting?.forEach { it(bmp) }
+    private fun deliver(key: String, requestGeneration: Long, bmp: Bitmap?) {
+        val waiting = synchronized(inFlight) {
+            if (closed || generation.get() != requestGeneration) return
+            if (bmp != null) cache.put(key, bmp)
+            inFlight.remove(key)
+        }
+        waiting?.forEach { it.ready(bmp) }
     }
 
     private fun download(url: String, reqWidth: Int, reqHeight: Int): Bitmap? {
-        val bytes = api.imageBytes(url) ?: return null
-        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
-        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
-        val opts = BitmapFactory.Options().apply {
-            inSampleSize = sampleFor(bounds.outWidth, bounds.outHeight, reqWidth, reqHeight)
-            inPreferredConfig = configFor(reqWidth)
+        fun decode(bytes: ByteArray): Bitmap? {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+            val opts = BitmapFactory.Options().apply {
+                inSampleSize = sampleFor(bounds.outWidth, bounds.outHeight, reqWidth, reqHeight)
+                inPreferredConfig = configFor(reqWidth)
+            }
+            return try { BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts) }
+            catch (_: OutOfMemoryError) { null }
         }
-        return try {
-            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
-        } catch (e: OutOfMemoryError) {
-            null
-        }
+        val requestApi = api
+        return loadImageWithFallback(
+            direct = { runCatching { requestApi.probeDirectImage(url) }.getOrNull() },
+            proxy = { runCatching { requestApi.probeProxiedImage(url) }.getOrNull() },
+            decode = ::decode,
+        )
     }
 
     /** 2 的幂降采样：两个方向都不能小于请求值 */
@@ -268,8 +283,11 @@ class ImageLoader(private val context: Context, api: Api) {
 
     /** 清空内存与磁盘缓存，返回内存里清掉的张数（磁盘按文件数计入日志） */
     fun clearCache(): Int {
-        generation.incrementAndGet()
-        synchronized(inFlight) { inFlight.clear() }
+        val callbacks = synchronized(inFlight) {
+            generation.incrementAndGet()
+            inFlight.values.flatMap { it.toList() }.also { inFlight.clear() }
+        }
+        cancelCallbacks(callbacks)
         val n = cache.snapshot().size
         cache.evictAll()
         synchronized(diskLock) {

@@ -58,3 +58,14 @@ internal fun childrenCoverCandidates(title: String, entries: List<Pair<String, S
         rank to url
     }.sortedBy { it.first }.map { it.second }.distinct()
 }
+
+/** Keep catalog order when filtering; a cover does not imply a playable source. */
+internal fun filterChildrenTitles(titles: List<String>, filter: Int, covered: Set<String>, watched: Set<String>): List<String> =
+    when (filter) {
+        1 -> titles.filter { it in covered }
+        2 -> {
+            val normalized = watched.map(::normalizeSeries).toSet()
+            titles.filter { normalizeSeries(it) in normalized }
+        }
+        else -> titles
+    }
