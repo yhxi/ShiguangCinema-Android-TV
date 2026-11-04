@@ -161,6 +161,11 @@ class MainActivity : Activity() {
     private var homeRecycler: RecyclerView? = null
     /** 手机端记住「第一个可见项」，从播放页返回时按它还原 */
     private var homeRvPosition = -1
+    private var homeRvOffset = 0
+    private var uiMonitor: UiFrameMonitor? = null
+    private var lastRepeatKeyAt = 0L
+    private var homeFocusedTitle: String? = null
+    private var homeLastHeaderFocus: View? = null
     /** 追剧自动检查的节流：本次进程内最近一次检查时间 */
     private var lastFavoriteCheckAt = 0L
     /** 搜索结果短时缓存：key = 关键词 + 源集合，value = (写入时间, 结果) */
@@ -302,7 +307,7 @@ class MainActivity : Activity() {
             // （早期用蓝底+深色字，深色主题下反而显得脏；白框在深色背景上已经足够醒目）
             view.background = if (focusedNow) focused else normal
             view.setPadding(padLeft, padTop, padRight, padBottom)
-            val s = if (focusedNow) focusScale else 1f
+            val s = if (focusedNow && !prefs.smoothUi) focusScale else 1f
             view.scaleX = s
             view.scaleY = s
         }
@@ -413,6 +418,7 @@ class MainActivity : Activity() {
     }
 
     override fun onPause() {
+        uiMonitor?.stop()
         homeMaintenanceJob?.cancel()
         favoriteCheckJob?.cancel()
         hotSearchJob?.cancel()
@@ -426,9 +432,25 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        if (BuildConfig.TEST_BUILD && prefs.uiStatsEnabled) startUiMonitor()
         hideSystemUi()
-        if (currentScreen == "children") showChildren()
-        else if (currentScreen == "children_more") showChildrenMore(childrenSectionIndex)
+        if (currentScreen == "children" || currentScreen == "children_more") {
+            root.post {
+                if (currentScreen != "children" && currentScreen != "children_more") return@post
+                fun resumeVisibleCovers(view: View) {
+                    if (view is ImageView) {
+                        val title = view.tag as? String
+                        if (title != null && ChildrenCatalog.preloadOrder().contains(title)) {
+                            bindChildrenCover(view, title, view.width.coerceAtLeast(dp(120)), view.height.coerceAtLeast(dp(90)))
+                        }
+                    } else if (view is ViewGroup) {
+                        for (index in 0 until view.childCount) resumeVisibleCovers(view.getChildAt(index))
+                    }
+                }
+                resumeVisibleCovers(root)
+                prefetchChildrenCovers(dp(240), dp(130))
+            }
+        }
         resumePendingUpdateInstall()
         // A server can also be changed in network diagnostics while this Activity is stopped.
         val savedServer = prefs.serverUrl
@@ -445,6 +467,15 @@ class MainActivity : Activity() {
             showRecommend()
         }
         refreshHomeAfterPlayback = false
+    }
+
+    private fun startUiMonitor() {
+        if (uiMonitor == null) {
+            @Suppress("DEPRECATION")
+            val refresh = windowManager.defaultDisplay.refreshRate.coerceIn(30f, 240f)
+            uiMonitor = UiFrameMonitor((1_000_000_000L / refresh).toLong())
+        }
+        uiMonitor?.start()
     }
 
     /** 子页面（如网络诊断）点「← 返回主页」时带着 nav_home 回来，直接落到首页 */
@@ -578,6 +609,13 @@ class MainActivity : Activity() {
      *    以前完全不响应，用户只能一格一格按上下。
      */
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (isTvDevice && event.action == KeyEvent.ACTION_DOWN && event.repeatCount > 0 &&
+            event.keyCode in listOf(KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN,
+                KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT)) {
+            val now = android.os.SystemClock.uptimeMillis()
+            if (now - lastRepeatKeyAt < 70L) return true
+            lastRepeatKeyAt = now
+        }
         if (event.action == KeyEvent.ACTION_DOWN) {
             when (event.keyCode) {
                 KeyEvent.KEYCODE_CHANNEL_UP, KeyEvent.KEYCODE_PAGE_UP -> {
@@ -655,12 +693,13 @@ class MainActivity : Activity() {
             resultsTitle = null
             resultsHint = null
         }
-        if (lastRenderedScreen != null && lastRenderedScreen != currentScreen) {
+        if (lastRenderedScreen != null && lastRenderedScreen != currentScreen && !prefs.smoothUi) {
             // 用 withLayer() 让动画走硬件层，老盒子上比逐帧重绘稳
             view.alpha = 0f
             view.animate().alpha(1f).setDuration(120L).withLayer().start()
         }
         lastRenderedScreen = currentScreen
+        uiMonitor?.recordPage()
         if (focusFirst) focusFirstAvailable(view)
     }
 
@@ -2522,6 +2561,21 @@ class MainActivity : Activity() {
         row("sources", "片源管理", "点播源 ${prefs.sources().size} 个 · 直播源 ${prefs.liveUrls().size} 个 · 管理") { showSources() }
         row("live", "电视直播", "进入直播频道") { liveChannels = emptyList(); showLive() }
         row("tv", "播放设置", "续播、画质、缓冲与跳过片头片尾") { showPlaySettings() }
+        row("setup", "流畅模式：${if (prefs.smoothUi) "开" else "关"}", "减少页面淡入和焦点放大，保留焦点描边") {
+            prefs.smoothUi = !prefs.smoothUi
+            showSetupCompact()
+        }
+        if (BuildConfig.TEST_BUILD) row("history", "界面流畅度统计", "调试版：${if (prefs.uiStatsEnabled) "已开启" else "已关闭"}") {
+            AlertDialog.Builder(this).setTitle("界面流畅度统计")
+                .setMessage(uiMonitor?.summary() ?: "统计尚未开启")
+                .setPositiveButton(if (prefs.uiStatsEnabled) "关闭统计" else "开启统计") { _, _ ->
+                    prefs.uiStatsEnabled = !prefs.uiStatsEnabled
+                    if (prefs.uiStatsEnabled) startUiMonitor() else uiMonitor?.stop()
+                    showSetupCompact()
+                }
+                .setNegativeButton("关闭", null)
+                .setNeutralButton("重置") { _, _ -> uiMonitor?.reset() }.show()
+        }
         row("setup", "切换服务端", "选择预设服务端，输入密码连接") { showServerSettings() }
         section("维护工具")
         row("history", "清理缓存", "管理本地缓存占用") { showClearCache() }
@@ -3825,7 +3879,8 @@ class MainActivity : Activity() {
      * 点进去默认用第一个源，上次测过失败的就往后排，让能看的先露头。
      * @return 过滤后的条目数
      */
-    private fun applyResultsData(): Int {
+    private fun applyResultsData(preserveOrder: Boolean = false): Int {
+        val previousOrder = if (preserveOrder) resultGroups.map { it.first } else emptyList()
         val visible = if (sourceFilter.isEmpty()) {
             lastResults
         } else {
@@ -3841,6 +3896,7 @@ class MainActivity : Activity() {
             }
             .sortedBy { it.first }
             .map { it.second }
+        resultGroups = keepExistingResultOrder(resultGroups, previousOrder) { it.first }
         return visible.size
     }
 
@@ -3854,8 +3910,18 @@ class MainActivity : Activity() {
     private fun updateResultsInPlace(): Boolean {
         val grid = resultsGrid ?: return false
         if (!grid.isAttachedToWindow) return false
-        val visibleCount = applyResultsData()
+        val selected = resultGroups.getOrNull(grid.selectedItemPosition)?.first
+        val hadFocus = grid.hasFocus()
+        val first = grid.firstVisiblePosition
+        val top = grid.getChildAt(0)?.top ?: grid.paddingTop
+        val visibleCount = applyResultsData(preserveOrder = true)
         (grid.adapter as? BaseAdapter)?.notifyDataSetChanged()
+        val selectedPosition = resultGroups.indexOfFirst { it.first == selected }
+        grid.post {
+            if (currentScreen != "results" || !grid.isAttachedToWindow) return@post
+            if (hadFocus && selectedPosition >= 0) { grid.setSelection(selectedPosition); grid.requestFocus() }
+            else if (!hadFocus && first in resultGroups.indices) grid.setSelectionFromTop(first, top - grid.paddingTop)
+        }
         resultsTitle?.text = "${resultGroups.size} 部 · $visibleCount 条结果"
         resultsHint?.apply {
             if (searchInProgress) {
@@ -6603,111 +6669,7 @@ class MainActivity : Activity() {
             }
         }
 
-        // 手机：整页是一个 RecyclerView，「头部」作为第 0 项占满整行，后面接海报网格。
-        // 电视保持原来的 GridView（遥控器焦点是自己逐行接管的，换列表控件风险大于收益，
-        // 而且电视上一屏能放二十多个，本来也到不了性能瓶颈）。
-        if (compact) {
-            showRecommendFeed(col)
-            return
-        }
-
-        val grid = newGrid().apply {
-            numColumns = if (isTvDevice) 6 else 2
-            horizontalSpacing = dp(if (isTvDevice) 18 else 12)
-            verticalSpacing = dp(20)
-            setPadding(0, dp(16), 0, 0)
-        }
-        grid.adapter = recommendAdapter()
-            // 顶部入口栏可能是一行（TV）也可能是两行（手机 3×2），且都在 ScrollView/嵌套容器里，
-            // 系统的焦点搜索找不到下方网格。这里逐行接管上下键：
-            // 最后一行往下进网格，其余行往下/往上在行间移动。
-            homeBarRows.forEachIndexed { rowIndex, row ->
-                for (bi in 0 until row.childCount) {
-                    row.getChildAt(bi).setOnKeyListener { _, code, ev ->
-                        if (ev.action != android.view.KeyEvent.ACTION_DOWN) {
-                            false
-                        } else when (code) {
-                            android.view.KeyEvent.KEYCODE_DPAD_DOWN -> {
-                                if (rowIndex == homeBarRows.lastIndex) {
-                                    (homeHistoryFirst ?: grid).requestFocus()
-                                    true
-                                } else {
-                                    val next = homeBarRows[rowIndex + 1]
-                                    if (bi < next.childCount) {
-                                        next.getChildAt(bi).requestFocus()
-                                        true
-                                    } else {
-                                        false
-                                    }
-                                }
-                            }
-                            android.view.KeyEvent.KEYCODE_DPAD_UP -> {
-                                if (rowIndex == 0) {
-                                    false
-                                } else {
-                                    val prev = homeBarRows[rowIndex - 1]
-                                    if (bi < prev.childCount) {
-                                        prev.getChildAt(bi).requestFocus()
-                                        true
-                                    } else {
-                                        false
-                                    }
-                                }
-                            }
-                            else -> false
-                        }
-                    }
-                }
-            }
-            // 网格已在第一行时，上方向键回到顶部按钮
-            grid.setOnKeyListener { _, code, ev ->
-                if (code == android.view.KeyEvent.KEYCODE_DPAD_UP &&
-                    ev.action == android.view.KeyEvent.ACTION_DOWN &&
-                    grid.selectedItemPosition < grid.numColumns
-                ) {
-                    homeBarRows.firstOrNull()?.getChildAt(0)?.requestFocus()
-                    true
-                } else {
-                    false
-                }
-            }
-        grid.setOnItemClickListener { _, _, pos, _ ->
-            recommendItems.getOrNull(pos)?.let { doSearch(it.title) }
-        }
-        homeGrid = grid
-        // 整页放进 ScrollView 一起滚。
-        // 以前是「头部固定 + 网格自己内部滚动」，手机上头部（入口栏 + 最近观看）就占了三分之二屏，
-        // 网格只剩一两行，用户在上面滑半天历史记录纹丝不动、下面的推荐根本露不出来。
-        col.addView(grid, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        syncHomeGridHeight()
-
-        val scroll = ScrollView(this).apply {
-            isVerticalScrollBarEnabled = false
-            isFillViewport = true
-            addView(col)
-        }
-        homeScroll = scroll
-        scroll.setOnScrollChangeListener { _, _, scrollY, _, _ ->
-            homeScrollY = scrollY
-            if (suppressAutoLoad) {
-                suppressAutoLoad = false
-                return@setOnScrollChangeListener
-            }
-            val content = scroll.getChildAt(0) ?: return@setOnScrollChangeListener
-            val remaining = content.height - scrollY - scroll.height
-            if (remaining < dp(600) && !isLoadingMore && !noMoreRecommend && recommendItems.isNotEmpty()) {
-                loadRecommend(true)
-            }
-        }
-
-        // 回到首页恢复上次的滚动位置：从播放器返回时整页会重建，不还原又跳回顶部
-        setScreen(scroll, focusFirst = homeScrollY <= 0)
-        if (homeScrollY > 0) {
-            suppressAutoLoad = true
-            scroll.post { scroll.scrollTo(0, homeScrollY) }
-        }
-        scheduleHomeMaintenance()
+        showRecommendFeed(col)
     }
 
     /**
@@ -6721,14 +6683,22 @@ class MainActivity : Activity() {
     private fun showRecommendFeed(header: LinearLayout) {
         // 手机端没有 GridView，清掉引用免得 loadRecommend 去同步一个不存在的高度
         homeGrid = null
+        homeScroll = null
+        val columns = if (isTvDevice) 6 else 2
+        val restorePosition = homeRvPosition
+        val restoreOffset = homeRvOffset
+        val restoreTitle = homeFocusedTitle
+        val restoreTitlePosition = restoreTitle?.let { title -> recommendItems.indexOfFirst { it.title == title } + 1 } ?: 0
+        homeLastHeaderFocus = null
         val rv = RecyclerView(this).apply {
-            layoutManager = GridLayoutManager(this@MainActivity, 2).apply {
+            layoutManager = GridLayoutManager(this@MainActivity, columns).apply {
                 spanSizeLookup = object : GridLayoutManager.SpanSizeLookup() {
-                    override fun getSpanSize(position: Int): Int = if (position == 0) 2 else 1
+                    override fun getSpanSize(position: Int): Int = if (position == 0) columns else 1
                 }
             }
             setPadding(dp(20), 0, dp(20), dp(16))
             clipToPadding = false
+            clipChildren = false
             isVerticalScrollBarEnabled = false
             overScrollMode = View.OVER_SCROLL_NEVER
             // 首页不需要增删动画：翻页时那一排卡片会挨个淡入，反而像卡了一下
@@ -6741,6 +6711,7 @@ class MainActivity : Activity() {
             override fun onScrolled(recyclerView: RecyclerView, dx: Int, dy: Int) {
                 val lm = recyclerView.layoutManager as? LinearLayoutManager ?: return
                 homeRvPosition = lm.findFirstVisibleItemPosition()
+                homeRvOffset = lm.findViewByPosition(homeRvPosition)?.top?.minus(recyclerView.paddingTop) ?: 0
                 if (suppressAutoLoad) {
                     // 刚恢复位置的那一次回滚不算「用户滑到底」
                     suppressAutoLoad = false
@@ -6754,12 +6725,40 @@ class MainActivity : Activity() {
                 }
             }
         })
-        setScreen(rv, focusFirst = homeRvPosition <= 0)
-        if (homeRvPosition > 0) {
+        if (isTvDevice) {
+            homeBarRows.forEachIndexed { rowIndex, row ->
+                for (i in 0 until row.childCount) row.getChildAt(i).setOnKeyListener { v, code, event ->
+                    if (event.action != KeyEvent.ACTION_DOWN) false
+                    else if (code == KeyEvent.KEYCODE_DPAD_DOWN && rowIndex == homeBarRows.lastIndex) {
+                        homeLastHeaderFocus = v
+                        val history = homeHistoryFirst
+                        if (history != null && history.isShown) history.requestFocus()
+                        else if (recommendItems.isNotEmpty()) {
+                            rv.scrollToPosition(1)
+                            rv.postOnAnimation { rv.findViewHolderForAdapterPosition(1)?.itemView?.requestFocus() }
+                        }
+                        history != null && history.isShown || recommendItems.isNotEmpty()
+                    } else false
+                }
+            }
+        }
+        setScreen(rv, focusFirst = restorePosition <= 0 && restoreOffset == 0 && !(isTvDevice && restoreTitlePosition > 0))
+        if (restorePosition >= 0 && (restorePosition > 0 || restoreOffset != 0 || (isTvDevice && restoreTitlePosition > 0))) {
             suppressAutoLoad = true
             rv.post {
                 (rv.layoutManager as? LinearLayoutManager)
-                    ?.scrollToPositionWithOffset(homeRvPosition, 0)
+                    ?.scrollToPositionWithOffset(restorePosition, restoreOffset)
+                if (isTvDevice && restoreTitlePosition > 0) {
+                    val pos = restoreTitlePosition
+                    if (pos > 0) {
+                        val target = rv.findViewHolderForAdapterPosition(pos)?.itemView
+                        if (target != null) target.requestFocus()
+                        else {
+                            rv.scrollToPosition(pos)
+                            rv.postOnAnimation { rv.findViewHolderForAdapterPosition(pos)?.itemView?.requestFocus() }
+                        }
+                    }
+                }
             }
         }
         scheduleHomeMaintenance()
@@ -6879,6 +6878,7 @@ class MainActivity : Activity() {
                 }
             } else {
                 val appending = more && recommendItems.isNotEmpty() && currentScreen == "recommend"
+                val previousCount = recommendItems.size
                 val updated = (if (more) recommendItems + items else items)
                     .distinctBy { it.title.trim() }
                 val unchanged = !more && updated == recommendItems
@@ -6891,7 +6891,8 @@ class MainActivity : Activity() {
                     // 追加数据只刷新适配器。以前每翻一页都把整页重建一遍，
                     // 滚到底部会整屏闪一下、焦点也掉回顶部入口栏。
                     (homeGrid?.adapter as? BaseAdapter)?.notifyDataSetChanged()
-                    homeRecycler?.adapter?.notifyDataSetChanged()
+                    val added = recommendItems.size - previousCount
+                    if (added > 0) homeRecycler?.adapter?.notifyItemRangeInserted(previousCount + 1, added)
                     // 电视端网格是撑到内容全高的（外头是 ScrollView），新增一页要同步加高；
                     // 手机端 RecyclerView 自己算高度，不需要
                     syncHomeGridHeight()
@@ -6963,8 +6964,9 @@ class MainActivity : Activity() {
         val rating = cell.getChildAt(2) as TextView
         label.text = item.title
         rating.text = if (item.rating.isEmpty()) "新剧 · 热播" else "★ ${item.rating}  ·  热播"
+        val previousCover = img.tag as? String
         img.tag = item.cover
-        img.setImageBitmap(null)
+        if (previousCover != item.cover) img.setImageDrawable(null)
         imageLoader.load(item.cover, posterWidth, posterHeight) { bmp ->
             if (img.tag == item.cover) img.setImageBitmap(bmp)
         }
@@ -7014,11 +7016,28 @@ class MainActivity : Activity() {
                 )
                 Holder(box)
             } else {
-                Holder(recommendCellView())
+                val cell = recommendCellView()
+                if (isTvDevice) {
+                    cell.isFocusable = true
+                    applyFocusStyle(cell, PANEL, onFocusChanged = { focused ->
+                        if (focused) {
+                            homeFocusedTitle = cell.tag as? String
+                            cell.requestRectangleOnScreen(android.graphics.Rect(-dp(8), -dp(8), cell.width + dp(8), cell.height + dp(8)))
+                        }
+                    }, focusScale = 1.02f)
+                    cell.setOnKeyListener { _, code, event ->
+                        val position = (cell.layoutParams as? RecyclerView.LayoutParams)?.viewAdapterPosition ?: -1
+                        if (code == KeyEvent.KEYCODE_DPAD_UP && event.action == KeyEvent.ACTION_DOWN && position in 1..6) {
+                            (homeHistoryFirst?.takeIf { it.isShown } ?: homeLastHeaderFocus ?: homeBarRows.lastOrNull()?.getChildAt(0))?.requestFocus() == true
+                        } else false
+                    }
+                }
+                Holder(cell)
             }
 
         override fun onBindViewHolder(holder: Holder, position: Int) {
             if (position == 0) return
+            holder.itemView.tag = recommendItems.getOrNull(position - 1)?.title
             bindRecommendCell(holder.itemView as LinearLayout, position - 1)
         }
     }

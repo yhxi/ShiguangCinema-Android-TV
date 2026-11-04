@@ -34,6 +34,13 @@ data class HistoryEntry(
 /** 本地配置：服务器、会话 Cookie、片源列表。全部存在应用私有 SharedPreferences。 */
 class Prefs(ctx: Context) {
 
+    var smoothUi: Boolean
+        get() = sp.getBoolean("smooth_ui", false)
+        set(value) { sp.edit().putBoolean("smooth_ui", value).apply() }
+    var uiStatsEnabled: Boolean
+        get() = sp.getBoolean("ui_stats_enabled", false)
+        set(value) { sp.edit().putBoolean("ui_stats_enabled", value).apply() }
+
     data class ServerProfile(val url: String, val password: String, val cookie: String)
 
     private val sp = ctx.applicationContext.getSharedPreferences("cloudscreen", Context.MODE_PRIVATE)

@@ -191,6 +191,7 @@ class PlayerActivity : Activity() {
     // 选集面板分页状态：一季动辄上千集，一次性铺满几千个 TextView 会明显卡顿，
     // 所以按页渲染（默认每页 120 集），只在翻页时才重建网格。
     private val epPageSize = 120
+    private var epFocusColumn = 0
     private var epPage = 0
     private var epPageCount = 1
     private var epColumns = 5
@@ -3181,15 +3182,21 @@ class PlayerActivity : Activity() {
             if (epPage > 0) {
                 epPage--
                 renderEpisodePage()
-                focusEpisodePage()
+                focusEpisodePage(epFocusColumn)
             }
         }
         epNextBtn = pagerButton("下一页 ›") {
             if (epPage < epPageCount - 1) {
                 epPage++
                 renderEpisodePage()
-                focusEpisodePage()
+                focusEpisodePage(epFocusColumn)
             }
+        }
+        epPrevBtn?.setOnLongClickListener {
+            epPage = 0; renderEpisodePage(); focusEpisodePage(epFocusColumn); true
+        }
+        epNextBtn?.setOnLongClickListener {
+            epPage = epPageCount - 1; renderEpisodePage(); focusEpisodePage(epFocusColumn); true
         }
         epPageLabel = TextView(this).apply {
             setTextColor(0xFF94A3B8.toInt())
@@ -3324,6 +3331,7 @@ class PlayerActivity : Activity() {
                     }
                     styleEpisodeCell(this, isCurrent, watched, false)
                     setOnFocusChangeListener { v, hasFocus ->
+                        if (hasFocus) epFocusColumn = (idx - start) % epColumns
                         styleEpisodeCell(v as TextView, isCurrent, watched, hasFocus)
                     }
                 }
@@ -3336,7 +3344,7 @@ class PlayerActivity : Activity() {
             }
             box.addView(row, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, epRowHeight))
         }
-        epPageLabel?.text = "第 ${epPage + 1}/${epPageCount} 页 · 第 ${start + 1}–${end} 集"
+        epPageLabel?.text = "第 ${epPage + 1}/${epPageCount} 页 · 第 ${start + 1}–${end} 集（长按翻页到首页/末页）"
         val multi = epPageCount > 1
         epPrevBtn?.apply {
             alpha = if (multi && epPage > 0) 1f else 0.35f
@@ -3349,11 +3357,14 @@ class PlayerActivity : Activity() {
     }
 
     /** 把焦点放到「当前集」；若当前集不在本页，则放到本页第一格 */
-    private fun focusEpisodePage() {
+    private fun focusEpisodePage(preferredColumn: Int? = null) {
         val box = epGridBox ?: return
         epContent?.post {
-            val target = epCurrentCell
-                ?: ((box.getChildAt(0) as? ViewGroup)?.getChildAt(0) as? TextView)
+            val firstRow = box.getChildAt(0) as? ViewGroup
+            val target = if (preferredColumn != null) {
+                (firstRow?.getChildAt(preferredColumn.coerceAtMost((firstRow.childCount - 1).coerceAtLeast(0))) as? TextView)
+                    ?: (firstRow?.getChildAt(0) as? TextView)
+            } else epCurrentCell ?: (firstRow?.getChildAt(0) as? TextView)
             target?.requestFocus()
             val idx = (target?.tag as? Int) ?: (epPage * epPageSize)
             val rowInPage = ((idx - epPage * epPageSize) / epColumns).coerceAtLeast(0)
