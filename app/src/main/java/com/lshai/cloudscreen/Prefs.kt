@@ -37,6 +37,11 @@ class Prefs(ctx: Context) {
     data class ServerProfile(val url: String, val password: String, val cookie: String)
 
     private val sp = ctx.applicationContext.getSharedPreferences("cloudscreen", Context.MODE_PRIVATE)
+    // The raw preference string is the cache key, so writes by other Prefs instances invalidate it.
+    private var cachedHistoryRaw: String? = null
+    private var cachedHistory: List<HistoryEntry> = emptyList()
+    private var cachedFavoritesRaw: String? = null
+    private var cachedFavorites: List<Favorite> = emptyList()
     private companion object {
         val keyMigrationLock = Any()
         val serverProfileLock = Any()
@@ -334,6 +339,7 @@ class Prefs(ctx: Context) {
 
     private fun parseHistory(): MutableList<HistoryEntry> {
         val text = sp.getString("history", "[]") ?: "[]"
+        if (text == cachedHistoryRaw) return cachedHistory.toMutableList()
         val out = ArrayList<HistoryEntry>()
         try {
             val arr = JSONArray(text)
@@ -359,6 +365,8 @@ class Prefs(ctx: Context) {
             }
         } catch (_: Exception) {
         }
+        cachedHistoryRaw = text
+        cachedHistory = out.toList()
         return out
     }
 
@@ -444,9 +452,10 @@ class Prefs(ctx: Context) {
         .put("checkedAt", f.checkedAt)
         .put("newEpisodes", f.newEpisodes)
 
-    fun favorites(): MutableList<Favorite> {
-        val raw = sp.getString("favorites", null) ?: return mutableListOf()
-        return runCatching {
+    fun favorites(): MutableList<Favorite> = synchronized(playbackLock) {
+        val raw = sp.getString("favorites", null) ?: return@synchronized mutableListOf()
+        if (raw == cachedFavoritesRaw) return@synchronized cachedFavorites.toMutableList()
+        val result = runCatching {
             val arr = JSONArray(raw)
             val out = mutableListOf<Favorite>()
             for (i in 0 until arr.length()) {
@@ -468,6 +477,9 @@ class Prefs(ctx: Context) {
             }
             out
         }.getOrDefault(mutableListOf())
+        cachedFavoritesRaw = raw
+        cachedFavorites = result.toList()
+        result
     }
 
     private fun saveFavorites(list: List<Favorite>) {

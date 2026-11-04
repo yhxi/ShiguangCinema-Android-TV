@@ -43,7 +43,7 @@ object UpdateChecker {
                     conn.setRequestProperty("Accept", "application/vnd.github+json")
                     val code = conn.responseCode
                     if (code == HttpURLConnection.HTTP_OK) {
-                        val body = conn.inputStream.use { it.readBytes().toString(Charsets.UTF_8) }
+                        val body = conn.inputStream.use { String(readBounded(it, 2 * 1024 * 1024), Charsets.UTF_8) }
                         val o = JSONObject(body)
                         val tag = o.optString("tag_name", "")
                         if (tag.isBlank()) {

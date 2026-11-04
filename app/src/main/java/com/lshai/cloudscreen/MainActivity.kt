@@ -416,12 +416,19 @@ class MainActivity : Activity() {
         homeMaintenanceJob?.cancel()
         favoriteCheckJob?.cancel()
         hotSearchJob?.cancel()
+        if (currentScreen == "children") childrenOverviewScrollY = childrenOverviewScroll?.scrollY ?: 0
+        // Do not keep speculative cover requests running while the app is in the background.
+        childrenPrefetchJob?.cancel()
+        childrenCoverJobs.values.toList().forEach { it.cancel() }
+        childrenPreloadedSignature = ""
         super.onPause()
     }
 
     override fun onResume() {
         super.onResume()
         hideSystemUi()
+        if (currentScreen == "children") showChildren()
+        else if (currentScreen == "children_more") showChildrenMore(childrenSectionIndex)
         resumePendingUpdateInstall()
         // A server can also be changed in network diagnostics while this Activity is stopped.
         val savedServer = prefs.serverUrl
@@ -964,7 +971,8 @@ class MainActivity : Activity() {
             setTextColor(if (primary) Color.WHITE else TEXT_COLOR)
             // 按内容自适应宽度：固定 dp 宽度在低分辨率电视上会被挤出屏幕
             layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, dp(46))
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                dp((46 * resources.configuration.fontScale.coerceIn(1f, 1.5f)).toInt()))
             minWidth = dp(76)
             minimumWidth = dp(76)
             // 替换背景后按钮自带的内边距会丢，显式补上，避免文字贴边
@@ -4887,9 +4895,12 @@ class MainActivity : Activity() {
         val alternatives = lastResults
             .filter { it.name == item.name }
             .distinctBy { it.sourceUrl }
-        val sourceHeader = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        val sourceHeader = LinearLayout(this).apply {
+            orientation = if (compact) LinearLayout.VERTICAL else LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
         sourceHeader.addView(hintText("当前来源：${item.sourceName.ifEmpty { "未知" }}  ·  ${alternatives.size.coerceAtLeast(1)} 个来源"),
-            LinearLayout.LayoutParams(0, -2, 1f))
+            if (compact) LinearLayout.LayoutParams(-1, -2) else LinearLayout.LayoutParams(0, -2, 1f))
         sourceHeader.addView(button("切换来源") {
             if (alternatives.size <= 1) toast("当前只找到一个来源")
             else AlertDialog.Builder(this).setTitle("选择来源")
@@ -5991,7 +6002,7 @@ class MainActivity : Activity() {
 
     private fun prepareChildrenCovers() {
         val sources = prefs.sources().filter { it.enabled && !it.isAdult }
-        val signature = stableDigest(prefs.serverUrl + "\n" + sources.joinToString("\n") { it.url })
+        val signature = stableDigest("cover-match-v2\n" + prefs.serverUrl + "\n" + sources.joinToString("\n") { it.url })
         childrenSources = sources
         if (signature == childrenCoverSignature) {
             val pending = childrenCoverWaiting.keys.any { it.startsWith("$signature:") }
@@ -6360,7 +6371,13 @@ class MainActivity : Activity() {
                 if (items.isEmpty()) " · 当前没有符合条件的作品" else ""
             (grid.adapter as? BaseAdapter)?.notifyDataSetChanged()
             val position = items.indexOf(childrenMoreTitle).coerceAtLeast(0)
-            grid.post { if (items.isNotEmpty()) grid.setSelection(position) }
+            grid.post {
+                if (items.isNotEmpty()) grid.setSelection(position)
+                else {
+                    selectedName.text = "当前筛选没有作品，可切换筛选条件"
+                    if (isTvDevice) filter.requestFocus()
+                }
+            }
         }
         filter.setOnClickListener { childrenMoreFilter = (childrenMoreFilter + 1) % 3; updateFilter() }
         actions.addView(filter)

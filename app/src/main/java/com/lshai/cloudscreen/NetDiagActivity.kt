@@ -816,7 +816,7 @@ class NetDiagActivity : Activity() {
             conn.connectTimeout = 6_000
             conn.readTimeout = 6_000
             conn.setRequestProperty("accept", "application/dns-json")
-            val text = conn.inputStream.use { it.readBytes().toString(Charsets.UTF_8) }
+            val text = conn.inputStream.use { String(readBounded(it, 16 * 1024 * 1024), Charsets.UTF_8) }
             runCatching { conn.disconnect() }
             val arr = org.json.JSONObject(text).optJSONArray("Answer")
             val out = ArrayList<String>()

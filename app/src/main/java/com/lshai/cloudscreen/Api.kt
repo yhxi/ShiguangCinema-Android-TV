@@ -131,13 +131,13 @@ class Api(baseUrl: String) {
         val code = conn.responseCode
         if (code !in 200..299) {
             val err = try {
-                conn.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
+                conn.errorStream?.use { String(readBounded(it, 128 * 1024), Charsets.UTF_8) } ?: ""
             } catch (e: Exception) {
                 ""
             }
             throw HttpError(code, err)
         }
-        val text = conn.inputStream.bufferedReader().use { it.readText() }
+        val text = conn.inputStream.use { String(readBounded(it, 16 * 1024 * 1024), Charsets.UTF_8) }
         // 抓 Set-Cookie（LibreTV 只发一条 ltv_session）
         conn.headerFields.entries
             .firstOrNull { it.key.equals("Set-Cookie", ignoreCase = true) }
@@ -258,7 +258,7 @@ class Api(baseUrl: String) {
             conn.readTimeout = readTimeoutMs
             conn.instanceFollowRedirects = true
             if (conn.responseCode !in 200..299) throw HttpError(conn.responseCode, "")
-            conn.inputStream.bufferedReader().use { it.readText() }
+            conn.inputStream.use { String(readBounded(it, 16 * 1024 * 1024), Charsets.UTF_8) }
         } finally {
             conn.disconnect()
         }

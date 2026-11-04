@@ -134,6 +134,8 @@ class PlayerActivity : Activity() {
     }
 
     private var player: ExoPlayer? = null
+    private var activityPlayerListener: Player.Listener? = null
+    private var adoptedPlayer: ExoPlayer? = null
     private lateinit var playerView: PlayerView
     private lateinit var titleText: TextView
     private lateinit var progressRow: LinearLayout
@@ -380,8 +382,21 @@ class PlayerActivity : Activity() {
         prefs = Prefs(this)
         // 告诉缓存层「有播放器活着」：此时清播放缓存会 release 分片缓存，播放器会崩
         PlaybackCache.playerOpened()
+        if (BackgroundPlayback.detached) {
+            if (intent.getStringExtra(BackgroundPlayback.SESSION_EXTRA) == BackgroundPlayback.token) {
+                adoptedPlayer = BackgroundPlayback.player
+                BackgroundPlayback.detached = false
+                // Transfer the cache lease from the service to this Activity.
+                PlaybackCache.playerClosed()
+            } else {
+                BackgroundPlayback.releaseDetached()
+                stopService(Intent(this, PlaybackService::class.java))
+            }
+        }
         urls = intent.getStringArrayListExtra(EXTRA_URLS)?.toList().orEmpty()
+        if (adoptedPlayer != null) urls = BackgroundPlayback.urls
         currentIndex = intent.getIntExtra(EXTRA_INDEX, 0).coerceIn(0, (urls.size - 1).coerceAtLeast(0))
+        adoptedPlayer?.let { currentIndex = it.currentMediaItemIndex.coerceIn(0, (urls.size - 1).coerceAtLeast(0)) }
         singleLabel = intent.getStringExtra(EXTRA_TITLE).orEmpty()
         seriesName = intent.getStringExtra(EXTRA_SERIES_NAME).orEmpty()
         vodId = intent.getStringExtra(EXTRA_VOD_ID).orEmpty()
@@ -704,11 +719,14 @@ class PlayerActivity : Activity() {
                 gravity = Gravity.CENTER_VERTICAL
                 setPadding(dp(8), dp(1), dp(8), dp(7))
             }
+            val largeTouchLabels = resources.configuration.fontScale > 1.15f
             fun addTouchAction(button: TextView) {
                 button.setTextSize(13f)
                 button.gravity = Gravity.CENTER
                 button.setPadding(dp(2), dp(10), dp(2), dp(10))
-                touchBar.addView(button, LinearLayout.LayoutParams(0, dp(43), 1f).apply {
+                touchBar.addView(button, (if (largeTouchLabels)
+                    LinearLayout.LayoutParams(dp(68), dp(52))
+                else LinearLayout.LayoutParams(0, dp(43), 1f)).apply {
                     rightMargin = dp(2)
                 })
             }
@@ -755,8 +773,13 @@ class PlayerActivity : Activity() {
             addTouchAction(fullscreenButton())
             addTouchAction(actionButton("更多") { showMoreMenu() })
             updateSkipButtons()
+            val touchBarContainer: View = if (largeTouchLabels) HorizontalScrollView(this).apply {
+                isHorizontalScrollBarEnabled = false
+                isFocusable = false
+                addView(touchBar)
+            } else touchBar
             bottomChrome.addView(
-                touchBar,
+                touchBarContainer,
                 LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -906,18 +929,20 @@ class PlayerActivity : Activity() {
         val mediaSourceFactory =
             androidx.media3.exoplayer.source.DefaultMediaSourceFactory(cacheFactory)
 
-        player = ExoPlayer.Builder(this)
+        player = (adoptedPlayer ?: ExoPlayer.Builder(applicationContext)
             .setLoadControl(loadControl)
             .setRenderersFactory(buildRenderers())
             .setMediaSourceFactory(mediaSourceFactory)
-            .build()
+            .setAudioAttributes(androidx.media3.common.AudioAttributes.DEFAULT, true)
+            .setHandleAudioBecomingNoisy(true)
+            .build())
             .also { exo ->
                 playerView.player = exo
                 exo.addAnalyticsListener(statsListener)
                 exo.setPlaybackSpeed(prefs.playbackSpeed)
                 exo.pauseAtEndOfMediaItems = !prefs.autoNext
 
-                exo.addListener(object : Player.Listener {
+                exo.addListener((object : Player.Listener {
                     override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
                         currentIndex = exo.currentMediaItemIndex
                         currentVideoWidth = 0
@@ -1045,18 +1070,20 @@ class PlayerActivity : Activity() {
                     override fun onTracksChanged(tracks: Tracks) {
                         updateQualityButton()
                     }
-                })
+                }).also { activityPlayerListener = it })
 
-                val items = buildMediaItems()
-                val resume = resumePositionOf(currentUrl(), currentIndex)
-                val threshold = prefs.resumeThresholdSeconds * 1000L
-                exo.setMediaItems(items, currentIndex, if (resume > threshold) resume else 0L)
-                exo.prepare()
-                if (resume > threshold) {
-                    toast("从上次位置继续（${formatTime(resume)}）")
+                if (adoptedPlayer == null) {
+                    val items = buildMediaItems()
+                    val resume = resumePositionOf(currentUrl(), currentIndex)
+                    val threshold = prefs.resumeThresholdSeconds * 1000L
+                    exo.setMediaItems(items, currentIndex, if (resume > threshold) resume else 0L)
+                    exo.prepare()
+                    if (resume > threshold) toast("从上次位置继续（${formatTime(resume)}）")
+                    exo.playWhenReady = true
                 }
-                exo.playWhenReady = true
             }
+
+        if (prefs.backgroundPlay) startBackgroundService()
 
         updateSpeedAction()
         if (kotlin.math.abs(prefs.playbackSpeed - 1f) > 0.01f) {
@@ -2291,6 +2318,37 @@ class PlayerActivity : Activity() {
 
     /* ------------------------------------------------------- 后台播放通知 */
 
+    private fun updateBackgroundSnapshot() {
+        val p = player ?: return
+        if (BackgroundPlayback.player !== p) return
+        BackgroundPlayback.urls = urls.toList()
+        BackgroundPlayback.title = labelFor(p.currentMediaItemIndex)
+        BackgroundPlayback.series = skipKey()
+        BackgroundPlayback.vodId = vodId
+        BackgroundPlayback.sourceUrl = sourceUrl
+        BackgroundPlayback.sourceName = sourceName
+        BackgroundPlayback.cover = coverUrl
+        BackgroundPlayback.returnIntent = Intent(intent).setClass(this, PlayerActivity::class.java)
+            .putStringArrayListExtra(EXTRA_URLS, ArrayList(urls))
+            .putExtra(EXTRA_INDEX, p.currentMediaItemIndex)
+            .putExtra(BackgroundPlayback.SESSION_EXTRA, BackgroundPlayback.token)
+            .addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+    }
+
+    private fun startBackgroundService() {
+        val p = player ?: return
+        if (adoptedPlayer == null) BackgroundPlayback.token = java.util.UUID.randomUUID().toString()
+        BackgroundPlayback.player = p
+        updateBackgroundSnapshot()
+        try {
+            val service = Intent(this, PlaybackService::class.java)
+            if (Build.VERSION.SDK_INT >= 26) startForegroundService(service) else startService(service)
+        } catch (_: Exception) {
+            BackgroundPlayback.player = null
+            toast("后台播放服务启动失败，离开播放页后可能停止")
+        }
+    }
+
     private fun notificationChannel(): String {
         val id = "cloudscreen_playback"
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
@@ -2314,6 +2372,7 @@ class PlayerActivity : Activity() {
             android.content.pm.PackageManager.PERMISSION_GRANTED
 
     private fun showPlaybackNotification() {
+        if (BackgroundPlayback.running) return
         if (!canNotify()) return
         val nm = getSystemService(android.app.NotificationManager::class.java) ?: return
         val p = player
@@ -3402,7 +3461,7 @@ class PlayerActivity : Activity() {
 
     /** 解码方式：0 自动 / 1 强制软解 / 2 强制硬解 / 3 硬解优先（默认） */
     private fun buildRenderers(): DefaultRenderersFactory {
-        val factory = DefaultRenderersFactory(this).setEnableDecoderFallback(true)
+        val factory = DefaultRenderersFactory(applicationContext).setEnableDecoderFallback(true)
         // 全局设置优先；此外「这部剧以前硬解失败过」也走软解（只影响这一部）。
         // 0 和 3 都属于「会自动挑硬解」的档位，所以要一并让本剧软解标记生效，
         // 否则默认档改成 3 之后，历史标记会被忽略、每次进这一集都重新撞一次硬解失败。
@@ -3649,6 +3708,7 @@ class PlayerActivity : Activity() {
         handler.removeCallbacks(nextTick)
         hideNextHint()
         persistProgress()
+        updateBackgroundSnapshot()
         // 后台播放开着就不暂停：用户按 Home 或返回后声音继续；
         // 关着则立刻暂停，配合退出时的 release 把播放器内存还给系统。
         if (!prefs.backgroundPlay) {
@@ -3678,9 +3738,26 @@ class PlayerActivity : Activity() {
         episodeDialog?.dismiss()
         episodeDialog = null
         hidePlaybackErrorActions()
-        player?.release()
+        val p = player
+        p?.let { exo ->
+            activityPlayerListener?.let { exo.removeListener(it) }
+            exo.removeAnalyticsListener(statsListener)
+        }
+        playerView.player = null
+        val keepPlaying = !isFinishing && prefs.backgroundPlay && BackgroundPlayback.running &&
+            p != null && BackgroundPlayback.player === p
+        if (keepPlaying) {
+            updateBackgroundSnapshot()
+            BackgroundPlayback.detached = true
+        } else {
+            if (BackgroundPlayback.player === p) {
+                BackgroundPlayback.player = null
+                stopService(Intent(this, PlaybackService::class.java))
+            }
+            p?.release()
+            PlaybackCache.playerClosed()
+        }
         player = null
-        PlaybackCache.playerClosed()
         super.onDestroy()
     }
 }

@@ -24,6 +24,7 @@ class ChildrenCatalogTest {
     @Test fun coverCandidatesPreferExactNamesAndIgnoreBadUrls() {
         val entries = listOf(
             "小猪佩奇 第三季" to "https://example.com/season.jpg",
+            "小猪佩奇过大年" to "https://example.com/film.jpg",
             "小猪佩奇" to "//example.com/exact.jpg",
             "其他动画" to "https://example.com/wrong.jpg",
             "小猪佩奇" to "javascript:bad",

@@ -146,11 +146,7 @@ object DirectCms {
             SearchConnections.registerCurrent(conn)
             val code = conn.responseCode
             if (code !in 200..299) throw IllegalStateException("HTTP $code")
-            val raw = conn.inputStream.use { input ->
-                val buf = ByteArrayOutputStream()
-                input.copyTo(buf)
-                buf.toByteArray()
-            }
+            val raw = conn.inputStream.use { input -> readBounded(input, 16 * 1024 * 1024) }
             val text = String(raw, Charsets.UTF_8).trim().removePrefix("\uFEFF")
             if (text.startsWith("<")) throw IllegalStateException("返回 HTML（反爬）")
             val start = text.indexOf('{')
