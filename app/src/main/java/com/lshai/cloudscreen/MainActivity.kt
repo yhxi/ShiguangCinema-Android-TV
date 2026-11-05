@@ -3911,16 +3911,13 @@ class MainActivity : Activity() {
         val grid = resultsGrid ?: return false
         if (!grid.isAttachedToWindow) return false
         val selected = resultGroups.getOrNull(grid.selectedItemPosition)?.first
-        val hadFocus = grid.hasFocus()
-        val first = grid.firstVisiblePosition
-        val top = grid.getChildAt(0)?.top ?: grid.paddingTop
+        val restoreFocus = grid.hasFocus() && !grid.isInTouchMode
         val visibleCount = applyResultsData(preserveOrder = true)
         (grid.adapter as? BaseAdapter)?.notifyDataSetChanged()
-        val selectedPosition = resultGroups.indexOfFirst { it.first == selected }
-        grid.post {
-            if (currentScreen != "results" || !grid.isAttachedToWindow) return@post
-            if (hadFocus && selectedPosition >= 0) { grid.setSelection(selectedPosition); grid.requestFocus() }
-            else if (!hadFocus && first in resultGroups.indices) grid.setSelectionFromTop(first, top - grid.paddingTop)
+        if (restoreFocus && selected != null) grid.post {
+            if (currentScreen != "results" || resultsGrid !== grid || !grid.isAttachedToWindow || !grid.hasFocus()) return@post
+            val position = searchSelectionToRestore(selected, resultGroups.map { it.first }, grid.isInTouchMode)
+            if (position != null) grid.setSelection(position)
         }
         resultsTitle?.text = "${resultGroups.size} 部 · $visibleCount 条结果"
         resultsHint?.apply {
