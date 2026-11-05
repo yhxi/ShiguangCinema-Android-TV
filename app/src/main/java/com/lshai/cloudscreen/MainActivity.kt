@@ -186,15 +186,13 @@ class MainActivity : Activity() {
     private var screenEpoch = 0
     private var searchOriginEpoch = 0
     private var searchResultsEpoch = -1
-    /** 结果页顶部「已搜索 x/y 个源…」那行文案，随每批结果刷新 */
-    private var searchProgressNote = ""
     /** 结果网格：分批合并时用它把选中项与焦点还回原处，避免每来一批就跳回顶部 */
     private var resultsGrid: GridView? = null
     /** 结果页顶部计数与进度行：原地刷新时只改文字，不重建页面 */
     private var resultsTitle: TextView? = null
-    private var resultsHint: TextView? = null
     /** 搜索页输入框的内容：整页重建（热门词回填等）时要把用户打的字带回去 */
     private var homeKeyword = ""
+    private var homeKeywordField: EditText? = null
     /** 搜索页热门榜单的就地填充容器（label → 视图），showHome 每次重建时清空重建 */
     private val hotChipRows = linkedMapOf<String, LinearLayout>()
     private val hotBoxes = linkedMapOf<String, LinearLayout>()
@@ -561,7 +559,6 @@ class MainActivity : Activity() {
                     searchToken++
                     searchConnections?.cancel()
                     searchInProgress = false
-                    searchProgressNote = ""
                     if (currentScreen == "results") showResults()
                 }
                 toast("已取消")
@@ -691,7 +688,6 @@ class MainActivity : Activity() {
         if (currentScreen != "results") {
             resultsGrid = null
             resultsTitle = null
-            resultsHint = null
         }
         if (lastRenderedScreen != null && lastRenderedScreen != currentScreen && !prefs.smoothUi) {
             // 用 withLayer() 让动画走硬件层，老盒子上比逐帧重绘稳
@@ -3813,14 +3809,6 @@ class MainActivity : Activity() {
         })
         bar.addView(button("重新搜索") { showHome() })
         col.addView(hScroll(bar))
-        // 这一行在搜索过程中一直存在，只改文字 —— 增减视图会让下面的网格整体位移
-        val hintView = hintText(
-            searchProgressNote.ifEmpty { "已先显示返回的结果，仍在并行搜索其他片源…" },
-        )
-        hintView.visibility = if (searchInProgress) View.VISIBLE else View.GONE
-        resultsHint = hintView
-        col.addView(hintView)
-
         if (sourceFilter.isNotEmpty()) {
             col.addView(hintText("当前只看：$sourceFilter（$(${resultGroups.size}) 部）"))
         }
@@ -3920,14 +3908,6 @@ class MainActivity : Activity() {
             if (position != null) grid.setSelection(position)
         }
         resultsTitle?.text = "${resultGroups.size} 部 · $visibleCount 条结果"
-        resultsHint?.apply {
-            if (searchInProgress) {
-                text = searchProgressNote.ifEmpty { "已先显示返回的结果，仍在并行搜索其他片源…" }
-                visibility = View.VISIBLE
-            } else {
-                visibility = View.GONE
-            }
-        }
         return true
     }
 
@@ -4218,7 +4198,8 @@ class MainActivity : Activity() {
         homeResultsList?.visibility = if (searching) View.GONE else View.VISIBLE
     }
 
-    private fun showHome() {
+    private fun showHome(clearKeyword: Boolean = true) {
+        if (clearKeyword) homeKeyword = ""
         currentScreen = "home"
         // 热门词回填、后台维护都会调 showHome() 整页重建，输入框是新建的。
         // 这里记住「重建前焦点是不是在输入框上」，重建后把文字和焦点一起还回去，
@@ -4230,9 +4211,10 @@ class MainActivity : Activity() {
         }
 
         col.addView(topBar())
-        // 把上次没搜完/刚搜过的词带回来。不能直接 setText：布局前控件宽度是 0，
+        // 同页筛选保留尚未提交的输入。不能直接 setText：布局前控件宽度是 0，
         // 会算出横向滚动偏移、把开头一两个字裁掉 —— field() 里已经处理了这个时序坑。
         val keywordField = field("输入影片名称…", homeKeyword)
+        homeKeywordField = keywordField
         keywordField.imeOptions = EditorInfo.IME_ACTION_SEARCH
         keywordField.addTextChangedListener(object : android.text.TextWatcher {
             override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
@@ -4275,7 +4257,7 @@ class MainActivity : Activity() {
                         .setMessage("确定清空这 ${history.size} 条记录？")
                         .setPositiveButton("清空") { _, _ ->
                             prefs.clearSearchHistory()
-                            showHome()
+                            showHome(clearKeyword = false)
                         }
                         .setNegativeButton("取消", null)
                         .show()
@@ -4374,7 +4356,7 @@ class MainActivity : Activity() {
                         .setTitle("只看某个采集站的结果")
                         .setItems(names.toTypedArray()) { _, which ->
                             sourceFilter = if (which == 0) "" else names[which]
-                            showHome()
+                            showHome(clearKeyword = false)
                         }
                         .show()
                 },
@@ -4385,7 +4367,7 @@ class MainActivity : Activity() {
             statusRow.addView(
                 button(if (onlyHealthySource) "已隐藏 ${badCount} 个坏源" else "只看可用源") {
                     onlyHealthySource = !onlyHealthySource
-                    showHome()
+                    showHome(clearKeyword = false)
                 },
                 LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.WRAP_CONTENT, dp(46),
@@ -4449,7 +4431,7 @@ class MainActivity : Activity() {
 
         setScreen(col)
         // 重建前焦点在输入框上就还给输入框（光标位置由 field() 回填文字时一并处理）
-        if (keepKeywordFocus || lastResults.isEmpty()) {
+        if (clearKeyword || keepKeywordFocus || lastResults.isEmpty()) {
             keywordField.requestFocus()
         } else {
             listView.requestFocus()
@@ -4482,11 +4464,16 @@ class MainActivity : Activity() {
         val requestConnections = SearchConnections().also { searchConnections = it }
         val token = ++searchToken
         lastSearchKeyword = kw
-        // 点热门词/推荐海报也是搜这个词，回搜索页时输入框显示它，而不是上一次手打的内容
-        homeKeyword = kw
+        // 搜索词只保存在最近搜索；提交和重新进入搜索页时输入框保持空白。
+        prefs.addSearchHistory(kw)
+        homeKeyword = ""
+        homeKeywordField?.takeIf { it.isAttachedToWindow }?.let { field ->
+            field.setText("")
+            (getSystemService(INPUT_METHOD_SERVICE) as? InputMethodManager)?.hideSoftInputFromWindow(field.windowToken, 0)
+        }
         homeSuppressSuggest = true
+        if (currentScreen == "home") refreshSearchBody()
         searchInProgress = true
-        searchProgressNote = ""
         sourceFilter = ""
         // 记下发起搜索时所在的界面世代：只有「还停在这个页面」或「本次搜索已经画出的结果页」
         // 才允许改界面，用户中途去了别处就不再回跳（哪怕后来又回到同一个页面）。
@@ -4500,7 +4487,6 @@ class MainActivity : Activity() {
                 prefs.addSearchHistory(kw)
                 lastResults = items
                 searchInProgress = false
-                toast("用刚才的结果（${items.size} 个）")
                 if (items.isEmpty() && childrenSearchOrigin != null) showChildrenEmpty(kw, "") else showResults()
                 return
             }
@@ -4519,15 +4505,13 @@ class MainActivity : Activity() {
                 lastRenderAt = now
                 lastResults = progress.items
                 searchInProgress = true
-                searchProgressNote = describeSearchProgress(progress)
                 // 已经在结果页上就只刷数据；还没进结果页（首批结果）才建整页
                 if (!updateResultsInPlace()) showResults(keepSelection = true)
                 // showResults 可能刚把页面从「首页」切成「结果页」，世代已经推进，这里跟上
                 searchResultsEpoch = screenEpoch
-                busyLabel?.text = searchProgressNote
             }
         }
-        runApiK("search", "正在搜索「$kw」（${sources.size} 个源）…", {
+        runApiK("search", null, {
             val first = directThenServerSearch(
                 kw, sources, requests = requestConnections, shouldContinue = { token == searchToken }, onPartial = onPartial,
             )
@@ -4547,7 +4531,6 @@ class MainActivity : Activity() {
         }, { result ->
             if (token != searchToken) return@runApiK
             searchInProgress = false
-            searchProgressNote = ""
             prefs.addSearchHistory(kw)
             if (shouldCacheSearchResult(result.items.size, result.failures)) {
                 searchCache[cacheKey] = System.currentTimeMillis() to result.items
@@ -4565,26 +4548,17 @@ class MainActivity : Activity() {
                 if (childrenSearchOrigin != null) showChildrenEmpty(kw, failedNote)
                 else {
                     toast("没有找到结果$failedNote，换个片名或别的源试试")
-                    showHome()
+                    showHome(clearKeyword = false)
                 }
             } else {
-                toast("找到 ${result.items.size} 个结果$failedNote")
                 // 已经停在结果页就原地收尾，不重建整页（会打断滚动与焦点）
                 if (!updateResultsInPlace()) showResults()
             }
         }, onError = {
             if (token != searchToken) return@runApiK
             searchInProgress = false
-            searchProgressNote = ""
             if (currentScreen == "results") showResults()
         })
-    }
-
-    /** 结果页顶部那行进度文案 */
-    private fun describeSearchProgress(p: SearchProgress): String = buildString {
-        append("已搜索 ${p.done}/${p.total} 个源")
-        if (p.retrying > 0) append("，正在补查 ${p.retrying} 个无结果源")
-        append(" · 已找到 ${p.items.size} 个结果，继续搜索…")
     }
 
     /**

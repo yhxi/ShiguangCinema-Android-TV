@@ -8,6 +8,12 @@
 
 构建：安装 JDK 25 与 Android SDK API 37.0，在项目根目录执行 `gradlew.bat :app:assembleDebug`。产物位于 `app/build/outputs/apk/debug/app-debug.apk`。
 
+## 1.2.7 变更
+
+- 搜索过程在后台进行，不再显示片源搜索进度和结果数量提示。
+- 进入搜索页或提交搜索后清空输入框，搜索词保留在最近搜索。
+- 版本号更新为 1.2.7（versionCode 56）。
+
 ## 1.2.6 变更
 
 - 修复手机搜索结果分批刷新时因网格位置恢复传入 -1 而闪退的问题。
