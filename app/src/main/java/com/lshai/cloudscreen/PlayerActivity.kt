@@ -89,6 +89,8 @@ class PlayerActivity : Activity() {
         const val EXTRA_SOURCE_URL = "source_url"
         const val EXTRA_SOURCE_NAME = "source_name"
         const val EXTRA_RETURN_TO_SOURCES = "return_to_sources"
+        const val EXTRA_RETURN_POSITION = "return_position"
+        const val EXTRA_CHILD_TIMER = "child_timer_minutes"
         const val CMD_TOGGLE = "toggle"
         const val CMD_STOP = "stop"
 
@@ -273,6 +275,7 @@ class PlayerActivity : Activity() {
     private var selectedQualityLabel: String? = null
 
     private val handler = Handler(Looper.getMainLooper())
+    private val childTimerCheck = Runnable { checkSleepTimer() }
 
     /** 网速采样：用累计字节/累计耗时做差分 */
     private val statsListener = PlaybackStatsListener(false, null)
@@ -381,6 +384,11 @@ class PlayerActivity : Activity() {
         hideSystemUi()
 
         prefs = Prefs(this)
+        val childMinutes = intent.getIntExtra(EXTRA_CHILD_TIMER, 0).coerceIn(0, 90)
+        if (childMinutes > 0) {
+            sleepUntil = SystemClock.uptimeMillis() + childMinutes * 60_000L
+            handler.postDelayed(childTimerCheck, childMinutes * 60_000L)
+        }
         // 告诉缓存层「有播放器活着」：此时清播放缓存会 release 分片缓存，播放器会崩
         PlaybackCache.playerOpened()
         if (BackgroundPlayback.detached) {
@@ -3698,6 +3706,8 @@ class PlayerActivity : Activity() {
         persistProgress()
         setResult(RESULT_OK, Intent().apply {
             putExtra(EXTRA_RETURN_TO_SOURCES, true)
+            putExtra(EXTRA_INDEX, currentIndex)
+            putExtra(EXTRA_RETURN_POSITION, player?.currentPosition ?: 0L)
             putExtra(EXTRA_SERIES_NAME, seriesTitle)
             putExtra(EXTRA_VOD_ID, vodId)
             putExtra(EXTRA_SOURCE_URL, sourceUrl)
@@ -3738,6 +3748,7 @@ class PlayerActivity : Activity() {
         hidePlaybackNotification()
         if (live === this) live = null
         handler.removeCallbacks(saveTick)
+        handler.removeCallbacks(childTimerCheck)
         handler.removeCallbacks(uiTick)
         handler.removeCallbacks(hideUi)
         handler.removeCallbacks(hideAfterBuffering)

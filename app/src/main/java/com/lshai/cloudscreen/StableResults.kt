@@ -12,3 +12,14 @@ internal fun searchSelectionToRestore(selected: String?, titles: List<String>, i
     if (inTouchMode || selected == null) return null
     return titles.indexOf(selected).takeIf { it >= 0 }
 }
+
+internal fun searchTitleRank(title: String, query: String): Int {
+    val target = normalizeSeries(title)
+    val keyword = normalizeSeries(query)
+    return when {
+        keyword.isEmpty() -> 2
+        target == keyword -> 0
+        target.contains(keyword) -> 1
+        else -> 2
+    }
+}

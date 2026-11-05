@@ -33,6 +33,9 @@ data class HistoryEntry(
 
 /** 本地配置：服务器、会话 Cookie、片源列表。全部存在应用私有 SharedPreferences。 */
 class Prefs(ctx: Context) {
+    var childrenTimerMinutes: Int
+        get() = sp.getInt("children_timer_minutes", 0)
+        set(value) { sp.edit().putInt("children_timer_minutes", value.coerceIn(0, 90)).apply() }
 
     var smoothUi: Boolean
         get() = sp.getBoolean("smooth_ui", false)

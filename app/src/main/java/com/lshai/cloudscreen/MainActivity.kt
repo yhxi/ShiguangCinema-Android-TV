@@ -171,6 +171,10 @@ class MainActivity : Activity() {
     /** 搜索结果短时缓存：key = 关键词 + 源集合，value = (写入时间, 结果) */
     private val searchCache = HashMap<String, Pair<Long, List<SearchItem>>>()
     private var lastSearchKeyword = ""
+    private var pendingSourceEpisode = -1
+    private var pendingSourcePosition = 0L
+    private var pendingSourceUrl = ""
+    private var pendingSourceTitle = ""
     private var searchInProgress = false
     /**
      * 本次搜索的编号。取消搜索、或又发起一次新搜索时自增，
@@ -3882,9 +3886,10 @@ class MainActivity : Activity() {
                 val bad = prefs.sourceTest(items.first().sourceUrl)?.first == false
                 (if (bad) 1 else 0) to (title to items)
             }
-            .sortedBy { it.first }
+            .sortedWith(compareBy({ searchTitleRank(it.second.first, lastSearchKeyword) }, { it.first }))
             .map { it.second }
         resultGroups = keepExistingResultOrder(resultGroups, previousOrder) { it.first }
+            .sortedBy { searchTitleRank(it.first, lastSearchKeyword) }
         return visible.size
     }
 
@@ -4547,8 +4552,14 @@ class MainActivity : Activity() {
             if (result.items.isEmpty()) {
                 if (childrenSearchOrigin != null) showChildrenEmpty(kw, failedNote)
                 else {
-                    toast("没有找到结果$failedNote，换个片名或别的源试试")
                     showHome(clearKeyword = false)
+                    val message = if (result.failures >= sources.size) "片源暂时无响应，请检查网络或片源。"
+                        else if (result.failures > 0) "暂未找到结果；部分片源无响应。"
+                        else "没有找到匹配的作品，可以换个片名再试。"
+                    AlertDialog.Builder(this).setTitle("搜索未找到结果").setMessage(message)
+                        .setPositiveButton("重试") { _, _ -> doSearch(kw) }
+                        .setNeutralButton("片源管理") { _, _ -> showSources() }
+                        .setNegativeButton("返回", null).show()
                 }
             } else {
                 // 已经停在结果页就原地收尾，不重建整页（会打断滚动与焦点）
@@ -4702,7 +4713,11 @@ class MainActivity : Activity() {
 
     /** 从播放器返回时展示这部视频的来源，并补查其他已启用片源。 */
     private fun showPlaybackSources(result: Intent) {
+        pendingSourceEpisode = result.getIntExtra(PlayerActivity.EXTRA_INDEX, -1)
+        pendingSourcePosition = result.getLongExtra(PlayerActivity.EXTRA_RETURN_POSITION, 0L)
+        pendingSourceUrl = result.getStringExtra(PlayerActivity.EXTRA_SOURCE_URL).orEmpty()
         val title = seriesNameOf(result.getStringExtra(PlayerActivity.EXTRA_SERIES_NAME).orEmpty())
+        pendingSourceTitle = title
         if (title.isEmpty()) { showRecommend(); return }
         val sourceUrl = result.getStringExtra(PlayerActivity.EXTRA_SOURCE_URL).orEmpty()
         val sourceName = result.getStringExtra(PlayerActivity.EXTRA_SOURCE_NAME).orEmpty()
@@ -4736,7 +4751,14 @@ class MainActivity : Activity() {
                     item.sourceUrl.substringAfter("://").substringBefore('/').ifEmpty { "未知来源" }
                 }
                 val isCurrent = item.sourceUrl == sourceUrl
-                val label = (if (isCurrent) "● 当前 · " else "") + name
+                val tested = prefs.sourceTest(item.sourceUrl)
+                val health = when {
+                    tested == null -> "未测速"
+                    tested.first -> "上次测速 ${tested.second} ms"
+                    else -> "上次测速失败"
+                }
+                val count = detailCache[item.vodId + "|" + item.sourceUrl]?.second?.episodes?.size
+                val label = (if (isCurrent) "● 当前 · " else "") + name + " · " + health + (count?.let { " · $it 集" } ?: "")
                 if (item.vodId.isNotEmpty()) {
                     rows.addView(button(label, primary = isCurrent) {
                         cancelJob("playbacksources")
@@ -4970,6 +4992,21 @@ class MainActivity : Activity() {
             )
         }
 
+        val transferIndex = pendingSourceEpisode
+        if (pendingSourceUrl.isNotEmpty() && pendingSourceUrl != item.sourceUrl && transferIndex >= 0 &&
+            normalizeSeries(pendingSourceTitle) == normalizeSeries(item.name)) {
+            pendingSourceEpisode = -1
+            pendingSourceUrl = ""
+            if (transferIndex < detail.episodes.size) {
+                AlertDialog.Builder(this).setTitle("继续观看第 ${transferIndex + 1} 集？")
+                    .setMessage("不同来源的集数和时长可能不一致，请确认对应集数。")
+                    .setPositiveButton("继续观看") { _, _ ->
+                        if (pendingSourcePosition > 5_000L) prefs.saveProgress(detail.episodes[transferIndex], pendingSourcePosition)
+                        startEpisode(transferIndex)
+                    }.setNegativeButton("手动选集", null).show()
+            } else toast("新来源集数不足，请手动选集")
+        }
+
         // 续播：全项目以前从来没读过 progressOf()，进详情页永远从第 1 集开始，
         // 1200 集的剧每次都要手动翻回去。这里一次性把「看过哪几集」算出来。
         val marked = prefs.resumeThresholdSeconds * 1000L
@@ -5118,6 +5155,9 @@ class MainActivity : Activity() {
             putExtra(PlayerActivity.EXTRA_VOD_ID, vodId)
             putExtra(PlayerActivity.EXTRA_SOURCE_URL, sourceUrl)
             putExtra(PlayerActivity.EXTRA_SOURCE_NAME, sourceName)
+            if (currentScreen == "children" || currentScreen == "children_more" || childrenSearchOrigin != null) {
+                putExtra(PlayerActivity.EXTRA_CHILD_TIMER, prefs.childrenTimerMinutes)
+            }
         }, REQ_PLAYER)
     }
 
@@ -6321,8 +6361,34 @@ class MainActivity : Activity() {
             setPadding(pagePad(40), dp(18), pagePad(40), dp(24))
         }
         col.addView(childrenHeader("儿童乐园") { showRecommend() })
-        val focusViews = mutableMapOf<String, View>()
+        col.addView(button("观看定时：${if (prefs.childrenTimerMinutes == 0) "关闭" else "${prefs.childrenTimerMinutes} 分钟"}") {
+            val values = listOf(0, 30, 60, 90)
+            AlertDialog.Builder(this).setTitle("儿童观看定时暂停")
+                .setSingleChoiceItems(arrayOf("关闭", "30 分钟", "60 分钟", "90 分钟"), values.indexOf(prefs.childrenTimerMinutes).coerceAtLeast(0)) { dialog, which ->
+                    prefs.childrenTimerMinutes = values[which]
+                    dialog.dismiss()
+                    showChildren()
+                }.setNegativeButton("取消", null).show()
+        })
         var firstCard: View? = null
+        val catalogTitles = ChildrenCatalog.preloadOrder().map(::normalizeSeries).toSet()
+        val recentChildren = prefs.history().filter { normalizeSeries(it.seriesTitle.ifEmpty { historyTitle(it) }) in catalogTitles }.take(3)
+        if (recentChildren.isNotEmpty()) {
+            col.addView(titleText("继续看", if (isTvDevice) 20f else 18f))
+            val recentRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            recentChildren.forEach { entry ->
+                val cardWidth = if (isTvDevice) dp(200) else dp(150)
+                val cardHeight = if (isTvDevice) dp(110) else dp(92)
+                val title = entry.seriesTitle.ifEmpty { historyTitle(entry) }
+                val card = childrenCard(cardWidth, cardHeight)
+                bindChildrenCard(card, title, cardWidth, cardHeight)
+                card.setOnClickListener { playFromHistory(entry) }
+                if (firstCard == null) firstCard = card
+                recentRow.addView(card, LinearLayout.LayoutParams(cardWidth, -2).apply { rightMargin = dp(8) })
+            }
+            col.addView(hScroll(recentRow))
+        }
+        val focusViews = mutableMapOf<String, View>()
         col.addView(hintText("按年龄推荐 · 点动画选择片源 · 年龄仅供参考").apply {
             setPadding(dp(6), dp(4), dp(6), dp(12))
         })
