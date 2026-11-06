@@ -21,11 +21,13 @@ internal fun childrenCoverCandidates(title: String, entries: List<Pair<String, S
 }
 
 
-/** Prefer sufficient resolution and a shape that needs less cropping. No text recognition. */
+/** Prefer sufficient resolution and a shape that needs less cropping. No text recognition.
+ *  清晰度权重 0.85：卡片本身是 CENTER_CROP，竖版海报裁切后观感没问题，
+ *  清晰度才是「看着糊」的主因；比例只作轻微惩罚。 */
 internal fun childrenCoverQuality(w: Int, h: Int, targetW: Int, targetH: Int): Double {
     if (w <= 0 || h <= 0 || targetW <= 0 || targetH <= 0) return 0.0
     val clarity = minOf(w.toDouble() / targetW, h.toDouble() / targetH, 1.0)
     val ratio = (w.toDouble() / h) / (targetW.toDouble() / targetH)
     val visible = minOf(ratio, 1.0 / ratio)
-    return clarity * .7 + visible * .3
+    return clarity * .85 + visible * .15
 }

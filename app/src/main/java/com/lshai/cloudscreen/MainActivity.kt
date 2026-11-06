@@ -6168,9 +6168,8 @@ class MainActivity : Activity() {
     private var childrenMoreTitle: String? = null
     private var childrenMoreFilter = 0
     private var childrenMoreFilterSection = -1
-    // 封面解析的并发上限。原值 3：几个分区 + 预取抢 3 个坑，冷启动一次页
-    // 要串行熬完几十次网络往返。6 = 低配盒子也能承受的海报下载并发。
-    private val childrenCoverSlots = kotlinx.coroutines.sync.Semaphore(6)
+    // 封面解析的并发上限。低配盒子也能承受的海报下载并发。
+    private val childrenCoverSlots = kotlinx.coroutines.sync.Semaphore(8)
     private val childrenCovers = mutableMapOf<String, String>()
     private val childrenCoverTried = mutableSetOf<String>()
     private val childrenCoverWaiting = mutableMapOf<String, MutableList<java.lang.ref.WeakReference<ImageView>>>()
@@ -6325,29 +6324,36 @@ class MainActivity : Activity() {
             try {
                 childrenCoverSlots.acquire()
                 val coverConnections = SearchConnections()
-                val deadline = android.os.SystemClock.elapsedRealtime() + 60_000L
-                val watchdog = scope.launch { delay(60_000); coverConnections.cancel() }
+                // 25 秒快速失败：一个片名 25 秒内找不到封面，再等 60 秒也大概率找不到，
+                // 只会占着并发坑拖累别的片名。失败后标 tried，下一轮轮换直接跳过。
+                val deadline = android.os.SystemClock.elapsedRealtime() + 25_000L
+                val watchdog = scope.launch { delay(26_000); coverConnections.cancel() }
                 try {
                         suspend fun tryCoverUrls(urls: List<String>, perImageBudget: Long = 15_000L): String {
-                            val candidates = urls.take(4)
+                            val candidates = urls.filter { it !in childrenBadCovers[title].orEmpty() }.take(4)
                             var best = ""
                             var bestScore = -1.0
-                            for (candidate in candidates) {
-                                if (candidate in childrenBadCovers[title].orEmpty()) continue
+                            var i = 0
+                            // 每轮并发「比稿」2 张、择优保留：既保留挑选余地避免选中低清图，
+                            // 又不用像串行那样一张张等（两张同时下，一轮顶两轮）
+                            while (i < candidates.size) {
                                 val remaining = (deadline - android.os.SystemClock.elapsedRealtime()).coerceAtLeast(0L)
                                 if (remaining == 0L) break
-                                val result = kotlinx.coroutines.withTimeoutOrNull(if (best.isEmpty()) minOf(remaining, perImageBudget) else minOf(remaining, 2500L)) { awaitChildrenImage(candidate, width, height) }
-                                if (result?.bitmap != null) {
-                                    val score = childrenCoverQuality(result.bitmap.width, result.bitmap.height, width, height)
-                                    if (score > bestScore) { best = candidate; bestScore = score }
-                                    // 0.95 → 0.85：原来几乎要把 4 张候选全部下载完打分才肯停，
-                                    // 一张清晰度足够的图就直接用，冷启动省掉 2-3 次串行下载
-                                    if (bestScore >= .85) break
-                                    continue
+                                val pair = candidates.subList(i, minOf(i + 2, candidates.size))
+                                val results = kotlinx.coroutines.withTimeoutOrNull(minOf(remaining, perImageBudget)) {
+                                    pair.map { candidate -> async { awaitChildrenImage(candidate, width, height) } }.awaitAll()
+                                } ?: List(pair.size) { null }
+                                for ((idx, result) in results.withIndex()) {
+                                    val candidate = pair[idx]
+                                    if (result?.bitmap != null) {
+                                        val score = childrenCoverQuality(result.bitmap.width, result.bitmap.height, width, height)
+                                        if (score > bestScore) { best = candidate; bestScore = score }
+                                    } else if (result != null && android.os.SystemClock.elapsedRealtime() < deadline) {
+                                        childrenBadCovers.getOrPut(title) { mutableSetOf() }.add(candidate)
+                                    }
                                 }
-                                if (result != null && android.os.SystemClock.elapsedRealtime() < deadline) {
-                                    childrenBadCovers.getOrPut(title) { mutableSetOf() }.add(candidate)
-                                }
+                                if (bestScore >= .82) break
+                                i += 2
                             }
                             return best
                         }
@@ -6442,7 +6448,9 @@ class MainActivity : Activity() {
         childrenPrefetchJob?.cancel()
         // Keep at most two speculative lookups in flight, reserving a slot for visible cards.
         childrenPrefetchJob = scope.launch {
-            // 每批 3 个并发预取：配合 6 个信号量槽，给可见卡片留足余量
+            // 先让可见卡片的解析占用并发坑，4 秒后再开始后台预热
+            delay(4_000)
+            // 每批 3 个并发预取：配合 8 个信号量槽，给可见卡片留足余量
             for (batch in (ChildrenCatalog.sections.indices.flatMap { childrenDailyPicks(it, if (isTvDevice) 3 else 2) } + ChildrenCatalog.preloadOrder()).distinct().chunked(3)) {
                 if (signature != childrenCoverSignature) break
                 batch.map { title -> async {
@@ -6602,29 +6610,12 @@ class MainActivity : Activity() {
                     ordered.filter { ChildrenArtworkIndex.urls(applicationContext, it).isNotEmpty() }.toSet()
                 }
                 val candidates = (preferred.filter { it in childrenCovers || it in listed } + ordered.filter { it in childrenCovers || it in listed } + ordered).distinct()
-                // 先把前排候选的封面解析一次性并发排队（信号量限流）：
-                // 解析流水线在后台同时跑，下面的逐卡等待等的是「已经在下载」的结果，
-                // 而不是每张卡串行地新发起一个最长 9 秒的等待
-                candidates.take(columns * 2).forEach { title ->
-                    if (childrenCovers[title] == null && title !in childrenCoverTried) {
-                        queueChildrenCover(title, width, height)
-                    }
-                }
-                for (title in candidates) {
-                    if (currentScreen != "children" || !row.isAttachedToWindow || row.childCount >= columns) break
-                    var cover = childrenCovers[title]
-                    if (cover == null) {
-                        val job = queueChildrenCover(title, width, height)
-                        if (job != null) kotlinx.coroutines.withTimeoutOrNull(9_000L) { job.join() }
-                        cover = childrenCovers[title]
-                    }
-                    if (cover == null) continue
-                    val result = awaitChildrenImage(cover, width, height)
-                    if (result?.bitmap == null) {
-                        if (result != null) invalidateChildrenCover(title, cover, childrenCoverSignature)
-                        continue
-                    }
-                    if (currentScreen != "children" || !row.isAttachedToWindow) break
+                // 立即出卡：候选顺序已把「有缓存封面 / 清单里有图」的排前面，
+                // 卡片先画出来（插画垫底 + 加载中角标），封面后台解析完自动换上
+                // （queueChildrenCover 的 waiting 机制会把成图灌回所有等它的 ImageView）。
+                // 不再像 v1.3.2 那样等封面解析成功才加卡 —— 冷启动会留下整行空白。
+                candidates.take(columns).forEach { title ->
+                    if (currentScreen != "children" || !row.isAttachedToWindow || row.childCount >= columns) return@forEach
                     val cardIndex = row.childCount
                     val card = childrenCard(width, height)
                     bindChildrenCard(card, title, width, height)
