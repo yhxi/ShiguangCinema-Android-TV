@@ -432,7 +432,7 @@ class MainActivity : Activity() {
             val locked = ChildrenQuota.remaining(this@MainActivity) <= 0L
             childrenQuotaTile?.let { tile ->
                 tile.alpha = if (locked) 0.4f else 1f
-                (tile.getChildAt(1) as? TextView)?.text = if (locked) "儿童·已用完" else "儿童"
+                (tile.getChildAt(1) as? TextView)?.text = "儿童"
                 tile.contentDescription = "儿童，${ChildrenQuota.label(this@MainActivity)}"
             }
             quotaLabelView?.text = "${ChildrenQuota.label(this@MainActivity)} · 家长设置 / 加时"
@@ -446,7 +446,7 @@ class MainActivity : Activity() {
         currentScreen = "children_locked"
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(pagePad(40), dp(24), pagePad(40), dp(24)) }
         col.addView(titleText("今天的儿童时间已用完", 24f))
-        col.addView(hintText("明天自动恢复每日额度，家长可以临时加时。"))
+        col.addView(hintText("明天恢复为 ${ChildrenQuota.dailyMinutes(this)} 分钟；家长临时加时只对今天有效。"))
         col.addView(button("家长设置 / 加时") { ChildrenQuota.parent(this) { if (ChildrenQuota.remaining(this) > 0) showChildren() else showChildrenLocked() } })
         col.addView(button("返回首页") { childrenSearchOrigin = null; showRecommend() })
         setScreen(col)
@@ -2497,7 +2497,7 @@ class MainActivity : Activity() {
             setPadding(0, dp(18), 0, 0)
         })
         col.addView(hintText("让观影体验保持顺手、稳定。"))
-        col.addView(button("儿童每日 ${ChildrenQuota.dailyMinutes(this)} 分钟 · 家长设置 / 加时") { ChildrenQuota.parent(this) { showSetupCompact() } })
+        col.addView(button("儿童每日固定 ${ChildrenQuota.dailyMinutes(this)} 分钟 · 设置 / 今天加时") { ChildrenQuota.parent(this) { showSetupCompact() } })
 
         val status = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -2906,6 +2906,7 @@ class MainActivity : Activity() {
             })
             col.addView(card, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(if (isTvDevice) 80 else 72)).apply { bottomMargin = dp(10) })
         }
+        col.addView(button("＋ 添加片源 / 导入", primary = true) { showAddSource() })
         category("点播源 ${vodSources.size} 个 · 管理", "已启用 $enabledVodCount 个 · 影视采集站", ::showVodSources)
         category("直播源 ${liveSources.size} 个 · 管理", "IPTV 频道 · 默认使用第一个直播源", ::showLive)
         col.addView(button("返回") { returnFromSources() })
@@ -2913,12 +2914,13 @@ class MainActivity : Activity() {
     }
 
     /** 点播源的详细列表与检测状态。 */
+    private val sourceChecked = HashSet<String>()
     private fun showVodSources() {
         currentScreen = "vodsources"
         val sources = prefs.sources()
         val enabledCount = sources.count { it.enabled }
         // 复选框多选：勾选后可批量启用/停用（直播源上线后沿用同一套交互）
-        val checked = HashSet<String>()
+        val checked = sourceChecked.apply { retainAll(sources.map { it.url }.toSet()) }
 
         val col = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -2966,10 +2968,29 @@ class MainActivity : Activity() {
                 .setNegativeButton("取消", null)
                 .show()
         })
-        col.addView(hScroll(bar))
+        if (!isTvDevice) {
+            val actions = (2 until bar.childCount).map { bar.getChildAt(it) as Button }
+            bar.removeAllViews()
+            val primaryActions = listOf(
+                button("返回") { showSources() },
+                button("添加片源", primary = true) { showAddSource() },
+                button("更多") {
+                    AlertDialog.Builder(this).setTitle("片源操作")
+                        .setItems(actions.map { it.text.toString() }.toTypedArray()) { _, index -> actions[index].performClick() }
+                        .setNegativeButton("取消", null).show()
+                },
+            )
+            primaryActions.forEach { action ->
+                action.minimumWidth = 0; action.minWidth = 0
+                action.setTextSize(14f)
+                action.setPadding(dp(6), dp(10), dp(6), dp(10))
+                bar.addView(action, LinearLayout.LayoutParams(0, -2, 1f).apply { rightMargin = dp(4) })
+            }
+            col.addView(bar, LinearLayout.LayoutParams(-1, -2))
+        } else col.addView(hScroll(bar))
 
         // 健康度看板：以前要一行行翻才能知道「到底还有几个源是活的」。
-        // 这里把最近一次检测的结果汇总成四个数字，点一下就跳到对应的操作。
+        // 统计限制为两行；操作集中在工具栏，避免窄屏文字把看板撑高。
         run {
             var ok = 0
             var bad = 0
@@ -2988,39 +3009,19 @@ class MainActivity : Activity() {
             val board = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
                 background = GradientDrawable().apply {
-                    setColor(0xFF141A26.toInt())
-                    cornerRadius = dp(10).toFloat()
+                    setColor(0xFFE5F3ED.toInt()); cornerRadius = dp(10).toFloat()
                 }
-                setPadding(dp(14), dp(10), dp(14), dp(10))
+                setPadding(dp(10), dp(8), dp(10), dp(8))
             }
-            val chips = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-            }
-            chips.addView(healthChip("可用 $ok", 0xFF4ADE80.toInt()))
-            chips.addView(
-                healthChip("上次失败 $bad", 0xFFF87171.toInt()) { if (bad > 0) disableFailedSources() },
-            )
-            chips.addView(healthChip("未测试 $unknown", 0xFF94A3B8.toInt()) { runAllSourceTests() })
-            chips.addView(healthChip("已停用 ${sources.size - enabledCount}", 0xFF64748B.toInt()))
-            val lastText = if (lastAt == 0L) {
-                "还没有测过：点「全部测试」探一遍"
-            } else {
-                "最近检测：" + java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.getDefault())
-                    .format(java.util.Date(lastAt))
-            }
-            chips.addView(
-                TextView(this).apply {
-                    text = "   $lastText"
-                    setTextColor(Color.parseColor("#64748b"))
-                    setTextSize(12f)
-                },
-                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f),
-            )
-            board.addView(chips)
-            col.addView(board, LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-            ).apply { topMargin = dp(4); bottomMargin = dp(6) })
+            board.addView(hintText("可用 $ok · 失败 $bad · 未测 $unknown · 停用 ${sources.size - enabledCount}").apply {
+                setTextColor(INK); setTextSize(13f); maxLines = 2
+                ellipsize = android.text.TextUtils.TruncateAt.END
+            }, LinearLayout.LayoutParams(-1, -2))
+            if (isTvDevice && lastAt > 0L) board.addView(hintText("最近检测：" +
+                java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.getDefault()).format(java.util.Date(lastAt))).apply {
+                maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END
+            }, LinearLayout.LayoutParams(-1, -2))
+            col.addView(board, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(4); bottomMargin = dp(6) })
         }
 
         val rows = sources
@@ -3093,8 +3094,18 @@ class MainActivity : Activity() {
                     setTextSize(13f)
                 }
                 row.addView(dot, LinearLayout.LayoutParams(dp(9), dp(9)).apply { rightMargin = dp(14) })
-                row.addView(name)
-                row.addView(domain)
+                if (isTvDevice) {
+                    row.addView(name)
+                    row.addView(domain)
+                } else {
+                    val info = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
+                    name.ellipsize = android.text.TextUtils.TruncateAt.END
+                    domain.setPadding(0, dp(3), dp(8), 0)
+                    info.addView(name, LinearLayout.LayoutParams(-1, -2))
+                    info.addView(domain, LinearLayout.LayoutParams(-1, -2))
+                    row.addView(info, LinearLayout.LayoutParams(0, -2, 1f))
+                    status.maxLines = 2
+                }
                 row.addView(status)
                 return row
             }
@@ -6081,7 +6092,7 @@ class MainActivity : Activity() {
         "show" -> homeTile("show", "综艺") { applyMediaType("show", "综艺") }
         "search" -> homeTile("search", "搜索") { showHome() }
         "live" -> homeTile("live", "直播") { liveChannels = emptyList(); showLive() }
-        "kids" -> homeTile("kids", if (ChildrenQuota.remaining(this) <= 0L) "儿童·已用完" else "儿童") { showChildren() }.apply {
+        "kids" -> homeTile("kids", "儿童") { showChildren() }.apply {
             alpha = if (ChildrenQuota.remaining(this@MainActivity) <= 0L) 0.4f else 1f
             childrenQuotaTile = this
         }
@@ -6133,6 +6144,20 @@ class MainActivity : Activity() {
     }
 
     // Resolve and preload all 100 titles with bounded concurrency; visible cards are queued first.
+    private fun childrenDailyPicks(section: Int, count: Int): List<String> {
+        val calendar = java.util.Calendar.getInstance()
+        val day = calendar.get(java.util.Calendar.YEAR).toLong() * 366 + calendar.get(java.util.Calendar.DAY_OF_YEAR)
+        val store = getSharedPreferences("children_daily_recommendations", MODE_PRIVATE)
+        val titles = ChildrenCatalog.sections[section].titles
+        val key = "section:$section"
+        val cached = store.getString(key, "").orEmpty().split("\n").filter { it in titles }
+        if (store.getLong("day", -1L) == day && cached.size >= count) return cached.take(count)
+        if (store.getLong("day", -1L) != day) store.edit().clear().putLong("day", day).apply()
+        val picks = dailyChildrenPicks(titles, day, prefs.history().map(::historyTitle).toSet(), 3)
+        store.edit().putString(key, picks.joinToString("\n")).apply()
+        return picks.take(count)
+    }
+
     private var childrenSectionIndex = -1
     private var childrenSearchOrigin: Int? = null
     private var selectedResultTitle: String? = null
@@ -6158,7 +6183,7 @@ class MainActivity : Activity() {
 
     private fun prepareChildrenCovers() {
         val sources = prefs.sources().filter { it.enabled && !it.isAdult }
-        val signature = stableDigest("cover-match-v2\n" + prefs.serverUrl + "\n" + sources.joinToString("\n") { it.url })
+        val signature = stableDigest("cover-match-v4\n" + prefs.serverUrl + "\n" + sources.joinToString("\n") { it.url })
         childrenSources = sources
         if (signature == childrenCoverSignature) {
             val pending = childrenCoverWaiting.keys.any { it.startsWith("$signature:") }
@@ -6215,14 +6240,45 @@ class MainActivity : Activity() {
 
     private fun updateChildrenCoverStatus(image: ImageView, text: String?) {
         val badge = (image.parent as? FrameLayout)?.getChildAt(2) as? TextView ?: return
-        badge.text = text.orEmpty()
-        badge.visibility = if (text == null) View.GONE else View.VISIBLE
+        val visibleText = text?.takeUnless { it == "暂无封面" || it == "可重试" }
+        badge.text = visibleText.orEmpty()
+        badge.visibility = if (visibleText == null) View.GONE else View.VISIBLE
+    }
+
+    private fun showChildrenCoverActions(title: String, image: ImageView, width: Int, height: Int) {
+        AlertDialog.Builder(this).setTitle("《$title》封面")
+            .setItems(arrayOf("换一张封面", "重试封面加载")) { _, which ->
+                if (which == 1) { retryChildrenCover(title, image, width, height); return@setItems }
+                val signature = childrenCoverSignature
+                val key = "$signature:$title"
+                if (childrenCoverWaiting.containsKey(key)) { toast("封面加载中，请稍后再换"); return@setItems }
+                val old = childrenCovers[title]
+                if (old != null) childrenBadCovers.getOrPut(title) { mutableSetOf() }.add(old)
+                childrenCovers.remove(title)
+                childrenCoverTried.remove(title)
+                scope.launch {
+                    try { queueChildrenCover(title, width, height, image)?.join() }
+                    finally {
+                        if (signature == childrenCoverSignature && childrenCovers[title] == null && old != null) {
+                            childrenCovers[title] = old
+                            if (image.tag == title && image.isAttachedToWindow) bindChildrenCover(image, title, width, height)
+                            toast("暂无其他可用封面，已保留原封面")
+                        }
+                        if (signature == childrenCoverSignature) persistChildrenCovers(signature)
+                    }
+                }
+            }.setNegativeButton("取消", null).show()
+    }
+
+    private fun setChildrenBitmap(image: ImageView, bitmap: android.graphics.Bitmap) {
+        image.setBackgroundColor(0xFFD9F1E7.toInt())
+        image.scaleType = if (bitmap.width.toFloat() / bitmap.height < .85f) ImageView.ScaleType.FIT_CENTER else ImageView.ScaleType.CENTER_CROP
+        image.setImageBitmap(bitmap)
     }
 
     private fun retryChildrenCover(title: String, image: ImageView, width: Int, height: Int) {
         val key = "$childrenCoverSignature:$title"
         if (childrenCoverWaiting.containsKey(key)) { toast("正在获取封面，请稍候"); return }
-        if (childrenSources.isEmpty()) { toast("请先启用片源，再重试封面"); return }
         childrenCoverTried.remove(title)
         childrenBadCovers.remove(title)
         childrenCovers.remove(title)
@@ -6239,7 +6295,7 @@ class MainActivity : Activity() {
                 if (image.tag == title) updateChildrenCoverStatus(image, "可重试")
             }) { bmp ->
                 if (image.tag != title || signature != childrenCoverSignature) return@load
-                if (bmp != null) { image.setImageBitmap(bmp); updateChildrenCoverStatus(image, null) }
+                if (bmp != null) { setChildrenBitmap(image, bmp); updateChildrenCoverStatus(image, null) }
                 else {
                     invalidateChildrenCover(title, cached, signature)
                     queueChildrenCover(title, width, height, image)
@@ -6247,7 +6303,7 @@ class MainActivity : Activity() {
             }
             return null
         }
-        if (title in childrenCoverTried || childrenSources.isEmpty()) {
+        if (title in childrenCoverTried) {
             image?.let { updateChildrenCoverStatus(it, "暂无封面") }
             return null
         }
@@ -6270,35 +6326,43 @@ class MainActivity : Activity() {
                 val deadline = android.os.SystemClock.elapsedRealtime() + 60_000L
                 val watchdog = scope.launch { delay(60_000); coverConnections.cancel() }
                 try {
-                    var chosen = ""
-                    for (source in sources) {
-                        if (coverConnections.isCancelled() || android.os.SystemClock.elapsedRealtime() >= deadline) break
-                        suspend fun tryCandidates(items: List<SearchItem>): String {
-                            val candidates = childrenCoverCandidates(title, items.map { it.name to it.pic }).take(4)
+                        suspend fun tryCoverUrls(urls: List<String>, perImageBudget: Long = 35_000L): String {
+                            val candidates = urls.take(4)
+                            var best = ""
+                            var bestScore = -1.0
                             for (candidate in candidates) {
                                 if (candidate in childrenBadCovers[title].orEmpty()) continue
                                 val remaining = (deadline - android.os.SystemClock.elapsedRealtime()).coerceAtLeast(0L)
                                 if (remaining == 0L) break
-                                val result = kotlinx.coroutines.withTimeoutOrNull(remaining) { awaitChildrenImage(candidate, width, height) }
-                                if (result?.bitmap != null) return candidate
+                                val result = kotlinx.coroutines.withTimeoutOrNull(if (best.isEmpty()) minOf(remaining, perImageBudget) else minOf(remaining, 2500L)) { awaitChildrenImage(candidate, width, height) }
+                                if (result?.bitmap != null) {
+                                    val score = childrenCoverQuality(result.bitmap.width, result.bitmap.height, width, height)
+                                    if (score > bestScore) { best = candidate; bestScore = score }
+                                    if (bestScore >= .95) break
+                                    continue
+                                }
                                 if (result != null && android.os.SystemClock.elapsedRealtime() < deadline) {
                                     childrenBadCovers.getOrPut(title) { mutableSetOf() }.add(candidate)
                                 }
                             }
-                            return ""
+                            return best
                         }
+                    val independent = withContext(Dispatchers.IO) { ChildrenArtworkIndex.urls(applicationContext, title) }
+                    var chosen = tryCoverUrls(independent, perImageBudget = 6_000L)
+                    for (source in sources) {
+                        if (chosen.isNotEmpty() || coverConnections.isCancelled() || android.os.SystemClock.elapsedRealtime() >= deadline) break
                         if (DirectCms.shouldTryDirect(source)) {
                             val items = withContext(Dispatchers.IO) {
                                 runCatching { coverConnections.run { DirectCms.search(source, title) } }.getOrDefault(emptyList())
                             }
-                            chosen = tryCandidates(items)
+                            chosen = tryCoverUrls(childrenCoverCandidates(title, items.map { it.name to it.pic }))
                         }
                         if (chosen.isEmpty()) {
                             val items = withContext(Dispatchers.IO) {
                                 runCatching { coverConnections.run { requestApi.search(title, listOf(source), readTimeoutMs = 6_000).items } }
                                     .getOrDefault(emptyList())
                             }
-                            chosen = tryCandidates(items)
+                            chosen = tryCoverUrls(childrenCoverCandidates(title, items.map { it.name to it.pic }))
                         }
                         if (chosen.isNotEmpty() || signature != childrenCoverSignature || requestApi !== api) break
                     }
@@ -6313,7 +6377,7 @@ class MainActivity : Activity() {
                                 if (target.tag == title) updateChildrenCoverStatus(target, "可重试")
                             }) { bmp ->
                                 if (target.tag == title && bmp != null) {
-                                    target.setImageBitmap(bmp)
+                                    setChildrenBitmap(target, bmp)
                                     updateChildrenCoverStatus(target, null)
                                 }
                             }
@@ -6345,6 +6409,7 @@ class MainActivity : Activity() {
     }
 
     private fun bindChildrenCover(image: ImageView, title: String, width: Int, height: Int) {
+        image.setBackgroundColor(Color.TRANSPARENT)
         image.tag = title
         image.setImageDrawable(null)
         updateChildrenCoverStatus(image, "加载中")
@@ -6352,14 +6417,14 @@ class MainActivity : Activity() {
     }
 
     private fun prefetchChildrenCovers(width: Int, height: Int) {
-        if (childrenSources.isEmpty() || childrenPreloadedSignature == childrenCoverSignature) return
+        if (childrenPreloadedSignature == childrenCoverSignature) return
         childrenPreloadedSignature = childrenCoverSignature
         childrenLastPreloadAt = android.os.SystemClock.elapsedRealtime()
         val signature = childrenCoverSignature
         childrenPrefetchJob?.cancel()
         // Keep at most two speculative lookups in flight, reserving a slot for visible cards.
         childrenPrefetchJob = scope.launch {
-            for (batch in ChildrenCatalog.preloadOrder().chunked(2)) {
+            for (batch in (ChildrenCatalog.sections.indices.flatMap { childrenDailyPicks(it, if (isTvDevice) 3 else 2) } + ChildrenCatalog.preloadOrder()).distinct().chunked(2)) {
                 if (signature != childrenCoverSignature) break
                 batch.map { title -> async {
                     val cover = childrenCovers[title]
@@ -6379,7 +6444,7 @@ class MainActivity : Activity() {
 
     private fun childrenCard(width: Int, height: Int): LinearLayout = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL
-        setPadding(dp(6), dp(6), dp(6), dp(6))
+        setPadding(dp(4), dp(4), dp(4), dp(4))
         isFocusable = true
         isClickable = true
         clipChildren = false
@@ -6399,9 +6464,9 @@ class MainActivity : Activity() {
         addView(TextView(this@MainActivity).apply {
             gravity = Gravity.CENTER
             setTextColor(INK); setTextSize(if (isTvDevice) 16f else 14f)
-            setTypeface(null, Typeface.BOLD); maxLines = 2; minLines = 2
+            setTypeface(null, Typeface.BOLD); maxLines = 2; minLines = if (isTvDevice) 2 else 1
             ellipsize = android.text.TextUtils.TruncateAt.END
-            setPadding(dp(2), dp(7), dp(2), dp(3))
+            setPadding(dp(2), dp(if (isTvDevice) 7 else 4), dp(2), dp(2))
         }, LinearLayout.LayoutParams(-1, -2))
         applyFocusStyle(this, PANEL, focusScale = 1.02f)
     }
@@ -6409,6 +6474,7 @@ class MainActivity : Activity() {
     private fun bindChildrenCard(card: LinearLayout, title: String, width: Int, height: Int) {
         val frame = card.getChildAt(0) as FrameLayout
         val image = frame.getChildAt(1) as ImageView
+        (frame.getChildAt(0) as ChildrenArtworkView).title = title
         (card.getChildAt(1) as TextView).text = title
         bindChildrenCover(image, title, width, height)
         card.setOnClickListener {
@@ -6418,7 +6484,7 @@ class MainActivity : Activity() {
             }
             doSearch(title)
         }
-        card.setOnLongClickListener { retryChildrenCover(title, image, width, height); true }
+        card.setOnLongClickListener { showChildrenCoverActions(title, image, width, height); true }
         card.contentDescription = title
     }
 
@@ -6473,8 +6539,9 @@ class MainActivity : Activity() {
         col.addView(hintText("按年龄推荐 · 点动画选择片源 · 年龄仅供参考").apply {
             setPadding(dp(6), dp(4), dp(6), dp(12))
         })
-        val width = if (isTvDevice) ((resources.displayMetrics.widthPixels - dp(220)) / 3).coerceAtLeast(dp(120)) else dp(150)
-        val height = if (isTvDevice) dp(110) else dp(92)
+        val columns = if (isTvDevice) 3 else 2
+        val width = ((resources.displayMetrics.widthPixels - pagePad(40) * 2 - dp(20) - dp(8) * (columns - 1)) / columns).coerceAtLeast(dp(72))
+        val height = if (isTvDevice) dp(110) else (width * .62f).toInt()
         ChildrenCatalog.sections.forEachIndexed { index, section ->
             val panel = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
@@ -6488,10 +6555,18 @@ class MainActivity : Activity() {
             head.addView(titleText("${section.age}  ${section.title}", if (isTvDevice) 20f else 18f).apply {
                 setTypeface(null, Typeface.BOLD); setTextColor(ACCENT)
             }, LinearLayout.LayoutParams(0, -2, 1f))
-            val more = button("更多 ›") {
+            val more = button("全部 ›") {
                 childrenOverviewFocus = "more:$index"
                 childrenOverviewScrollY = childrenOverviewScroll?.scrollY ?: 0
                 showChildrenMore(index)
+            }
+            more.apply {
+                elevation = 0f; stateListAnimator = null
+                minimumWidth = dp(64); minWidth = dp(64)
+                minimumHeight = dp(48); minHeight = dp(48)
+                setPadding(dp(10), dp(6), dp(10), dp(6))
+                setTextSize(if (isTvDevice) 16f else 14f)
+                contentDescription = "查看${section.age}全部动画"
             }
             focusViews["more:$index"] = more
             head.addView(more)
@@ -6499,15 +6574,15 @@ class MainActivity : Activity() {
             val row = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL; clipChildren = false; clipToPadding = false
             }
-            section.titles.take(3).forEach { title ->
+            childrenDailyPicks(index, columns).forEachIndexed { cardIndex, title ->
                 val card = childrenCard(width, height)
                 bindChildrenCard(card, title, width, height)
                 focusViews[title] = card
                 if (firstCard == null) firstCard = card
-                row.addView(card, LinearLayout.LayoutParams(width, -2).apply { rightMargin = dp(8) })
+                row.addView(card, LinearLayout.LayoutParams(0, -2, 1f).apply { rightMargin = if (cardIndex < columns - 1) dp(8) else 0 })
             }
-            panel.addView(hScroll(row))
-            col.addView(panel, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) })
+            panel.addView(row)
+            col.addView(panel, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(if (isTvDevice) 12 else 8) })
         }
         val scroll = ScrollView(this).apply {
             isFillViewport = false; clipChildren = false; clipToPadding = false
@@ -6624,7 +6699,7 @@ class MainActivity : Activity() {
                 val card = view as? LinearLayout ?: return@setOnItemLongClickListener false
                 val title = items.getOrNull(position) ?: return@setOnItemLongClickListener false
                 val image = (card.getChildAt(0) as FrameLayout).getChildAt(1) as ImageView
-                retryChildrenCover(title, image, width, height)
+                showChildrenCoverActions(title, image, width, height)
                 true
             }
         }

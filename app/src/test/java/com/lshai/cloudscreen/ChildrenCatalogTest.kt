@@ -53,4 +53,18 @@ class ChildrenCatalogTest {
             migrateHomeOrder(listOf("tv", "live", "search", "setup")))
         assertEquals(listOf("kids", "tv"), migrateHomeOrder(listOf("kids", "live", "tv")))
     }
+
+    @Test fun dailyPicksRotateAndPreferUnwatchedWithoutDuplicates() {
+        val titles = listOf("甲", "乙", "丙", "丁")
+        assertEquals(listOf("乙", "丙"), dailyChildrenPicks(titles, 1, emptySet(), 2))
+        assertEquals(listOf("丙", "丁"), dailyChildrenPicks(titles, 2, emptySet(), 2))
+        assertEquals(listOf("丙", "丁", "甲"), dailyChildrenPicks(titles, 1, setOf("乙"), 3))
+        assertEquals(4, dailyChildrenPicks(titles, 1, titles.toSet(), 9).distinct().size)
+        assertTrue(dailyChildrenPicks(emptyList(), 1, emptySet(), 3).isEmpty())
+    }
+    @Test fun coverQualityPrefersResolutionAndLessCropping() {
+        assertTrue(childrenCoverQuality(400, 250, 400, 250) > childrenCoverQuality(80, 50, 400, 250))
+        assertTrue(childrenCoverQuality(400, 250, 400, 250) > childrenCoverQuality(400, 800, 400, 250))
+        assertEquals(0.0, childrenCoverQuality(0, 100, 400, 250), .001)
+    }
 }

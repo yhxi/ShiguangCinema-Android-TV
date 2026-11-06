@@ -19,3 +19,13 @@ internal fun childrenCoverCandidates(title: String, entries: List<Pair<String, S
         rank to url
     }.sortedBy { it.first }.map { it.second }.distinct()
 }
+
+
+/** Prefer sufficient resolution and a shape that needs less cropping. No text recognition. */
+internal fun childrenCoverQuality(w: Int, h: Int, targetW: Int, targetH: Int): Double {
+    if (w <= 0 || h <= 0 || targetW <= 0 || targetH <= 0) return 0.0
+    val clarity = minOf(w.toDouble() / targetW, h.toDouble() / targetH, 1.0)
+    val ratio = (w.toDouble() / h) / (targetW.toDouble() / targetH)
+    val visible = minOf(ratio, 1.0 / ratio)
+    return clarity * .7 + visible * .3
+}

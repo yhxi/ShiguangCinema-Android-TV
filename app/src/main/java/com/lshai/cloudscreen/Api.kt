@@ -319,6 +319,8 @@ class Api(baseUrl: String) {
         // 豆瓣图床的防盗链只认 Referer 网域
         val referer = when {
             host.contains("doubanio.com") || host.contains("douban.com") -> "https://movie.douban.com/"
+            host == "lain.bgm.tv" -> "https://bgm.tv/"
+            host.endsWith(".iqiyipic.com") -> "https://www.iqiyi.com/"
             else -> null
         }
         val conn = runCatching { URL(url).openConnection() as HttpURLConnection }.getOrNull()

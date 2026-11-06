@@ -6,8 +6,6 @@ import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
-import android.text.InputType
-import android.widget.EditText
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import java.text.SimpleDateFormat
@@ -115,44 +113,194 @@ internal object ChildrenQuota {
         val titles = store.getStringSet("titles", emptySet()).orEmpty().toMutableSet()
         if (titles.add(key)) store.edit().putStringSet("titles", titles).apply()
     }
+    private fun panelTitle(activity: Activity, title: String): android.view.View {
+        fun dp(n: Int) = (n * activity.resources.displayMetrics.density).toInt()
+        return android.widget.LinearLayout(activity).apply {
+            gravity = android.view.Gravity.CENTER_VERTICAL
+            setPadding(dp(18), dp(16), dp(18), dp(10))
+            addView(ChildrenArtworkView(activity).apply {
+                background = android.graphics.drawable.GradientDrawable().apply {
+                    setColor(0xFFD9F1E7.toInt()); cornerRadius = dp(12).toFloat()
+                }
+                clipToOutline = true
+                importantForAccessibility = android.view.View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            }, android.widget.LinearLayout.LayoutParams(dp(72), dp(58)))
+            addView(android.widget.TextView(activity).apply {
+                text = title; textSize = 20f; setTextColor(0xFF173B35.toInt())
+                setTypeface(null, android.graphics.Typeface.BOLD)
+                setPadding(dp(12), 0, 0, 0)
+            }, android.widget.LinearLayout.LayoutParams(0, -2, 1f))
+        }
+    }
+    private fun stylePanel(activity: Activity, dialog: AlertDialog) {
+        val density = activity.resources.displayMetrics.density
+        dialog.window?.setBackgroundDrawable(android.graphics.drawable.GradientDrawable().apply {
+            setColor(0xFFFFFDF6.toInt()); cornerRadius = 22 * density
+            setStroke((density * 1).toInt().coerceAtLeast(1), 0xFFDFE8E2.toInt())
+        })
+        val available = activity.resources.displayMetrics.widthPixels
+        dialog.window?.setLayout(minOf((480 * density).toInt(), (available * .94f).toInt()), -2)
+        listOf(AlertDialog.BUTTON_POSITIVE, AlertDialog.BUTTON_NEGATIVE).forEach { which ->
+            dialog.getButton(which)?.setTextColor(0xFF0F766E.toInt())
+        }
+    }
+
+    private fun numberPanel(
+        activity: Activity, title: String, explanation: String, maxDigits: Int,
+        preview: (String) -> String = { "" },
+        validate: (Int?) -> String?, accepted: (Int) -> Unit,
+    ) {
+        fun dp(value: Int) = (value * activity.resources.displayMetrics.density).toInt()
+        val content = android.widget.LinearLayout(activity).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            setPadding(dp(16), dp(6), dp(16), dp(8))
+        }
+        content.addView(android.widget.TextView(activity).apply { text = explanation; textSize = 15f; setTextColor(0xFF40645A.toInt()) })
+        val display = android.widget.TextView(activity).apply {
+            textSize = 28f; gravity = android.view.Gravity.CENTER
+            setTextColor(0xFF173B35.toInt())
+            background = android.graphics.drawable.GradientDrawable().apply {
+                setColor(0xFFE5F3ED.toInt()); cornerRadius = dp(14).toFloat()
+                setStroke(dp(1), 0xFFBDDCCD.toInt())
+            }
+            setPadding(0, dp(8), 0, dp(8)); contentDescription = "尚未输入数字"
+        }
+        content.addView(display)
+        val detail = android.widget.TextView(activity).apply { textSize = 14f; minLines = 2; setTextColor(0xFF40645A.toInt()); setPadding(0, dp(6), 0, 0) }
+        content.addView(detail)
+        val error = android.widget.TextView(activity).apply { setTextColor(0xFFAE3B32.toInt()); minLines = 1 }
+        content.addView(error)
+        val dialog = AlertDialog.Builder(android.view.ContextThemeWrapper(activity, android.R.style.Theme_Material_Light_Dialog_Alert)).setCustomTitle(panelTitle(activity, title))
+            .setView(android.widget.ScrollView(activity).apply { addView(content) })
+            .setNegativeButton("取消", null).create()
+        var input = ""
+        fun refresh() {
+            display.text = input.ifEmpty { "—" }
+            display.contentDescription = "已输入：${input.ifEmpty { "空" }}"
+            detail.text = preview(input)
+            error.text = ""
+        }
+        fun append(digit: String) {
+            if (input.length >= maxDigits) return
+            input = if (input == "0") digit else input + digit
+            refresh()
+        }
+        fun submit() {
+            val number = input.toIntOrNull()
+            val message = validate(number)
+            if (message != null) { error.text = message; return }
+            dialog.dismiss()
+            accepted(number!!)
+        }
+        val labels = listOf("1", "2", "3", "4", "5", "6", "7", "8", "9", "删除", "0", "确认")
+        val buttons = mutableListOf<android.widget.Button>()
+        labels.chunked(3).forEach { keys ->
+            val row = android.widget.LinearLayout(activity)
+            keys.forEach { key ->
+                val button = android.widget.Button(activity).apply {
+                    text = key; textSize = 18f
+                    isAllCaps = false
+                    background = android.graphics.drawable.StateListDrawable().apply {
+                        fun shape(color: Int, focused: Boolean = false) = android.graphics.drawable.GradientDrawable().apply {
+                            setColor(color); cornerRadius = dp(12).toFloat()
+                            setStroke(dp(if (focused) 3 else 1), if (focused) 0xFF0F766E.toInt() else 0xFFDFE8E2.toInt())
+                        }
+                        addState(intArrayOf(android.R.attr.state_focused), shape(if (key == "确认") 0xFF155C53.toInt() else 0xFFC5E9D7.toInt(), true))
+                        addState(intArrayOf(android.R.attr.state_pressed), shape(if (key == "确认") 0xFF155C53.toInt() else 0xFFC5E9D7.toInt(), true))
+                        addState(intArrayOf(), shape(when (key) { "确认" -> 0xFF0F766E.toInt(); "删除" -> 0xFFFFE8CE.toInt(); else -> 0xFFFFFFFF.toInt() }))
+                    }
+                    setTextColor(if (key == "确认") android.graphics.Color.WHITE else 0xFF173B35.toInt())
+                    stateListAnimator = null
+                    backgroundTintList = null
+                    setOnClickListener {
+                        when (key) {
+                            "删除" -> { input = input.dropLast(1); refresh() }
+                            "确认" -> submit()
+                            else -> append(key)
+                        }
+                    }
+                }
+                buttons.add(button)
+                row.addView(button, android.widget.LinearLayout.LayoutParams(0, dp(48), 1f).apply {
+                    setMargins(dp(3), dp(3), dp(3), dp(3))
+                })
+            }
+            content.addView(row)
+        }
+        // Explicit neighbours keep D-pad movement inside the number pad predictable.
+        buttons.forEach { button ->
+            button.id = android.view.View.generateViewId()
+        }
+        buttons.forEachIndexed { index, button ->
+            if (index % 3 > 0) button.nextFocusLeftId = buttons[index - 1].id
+            if (index % 3 < 2) button.nextFocusRightId = buttons[index + 1].id
+            if (index >= 3) button.nextFocusUpId = buttons[index - 3].id
+            if (index + 3 < buttons.size) button.nextFocusDownId = buttons[index + 3].id
+        }
+        dialog.setOnKeyListener { _, code, event ->
+            val digit = when (code) {
+                in android.view.KeyEvent.KEYCODE_0..android.view.KeyEvent.KEYCODE_9 -> code - android.view.KeyEvent.KEYCODE_0
+                in android.view.KeyEvent.KEYCODE_NUMPAD_0..android.view.KeyEvent.KEYCODE_NUMPAD_9 -> code - android.view.KeyEvent.KEYCODE_NUMPAD_0
+                else -> -1
+            }
+            if (digit >= 0 || code == android.view.KeyEvent.KEYCODE_DEL) {
+                if (event.action == android.view.KeyEvent.ACTION_DOWN) {
+                    if (digit >= 0) append(digit.toString()) else { input = input.dropLast(1); refresh() }
+                }
+                true
+            } else false
+        }
+        refresh()
+        dialog.setOnShowListener {
+            stylePanel(activity, dialog)
+            dialog.window?.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN)
+            buttons.first().requestFocus()
+        }
+        dialog.show()
+    }
+
     fun parent(activity: Activity, after: () -> Unit) {
         init(activity)
         val random = java.util.Random()
         val a = random.nextInt(8) + 2; val b = random.nextInt(8) + 2
         val digits = arrayOf("零", "壹", "贰", "叁", "肆", "伍", "陆", "柒", "捌", "玖")
-        val answer = EditText(activity).apply { inputType = InputType.TYPE_CLASS_NUMBER; hint = "输入计算结果" }
-        val verify = AlertDialog.Builder(activity).setTitle("家长验证：${digits[a]} × ${digits[b]} = ？")
-            .setView(answer).setPositiveButton("验证", null).setNegativeButton("取消", null).create()
-        verify.setOnShowListener {
-            verify.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
-                if (answer.text.toString().toIntOrNull() != a * b) { answer.error = "答案不正确，请重试"; return@setOnClickListener }
-                verify.dismiss()
-                AlertDialog.Builder(activity).setTitle("儿童每日时长")
-                    .setItems(arrayOf("设置每日额度（当前 ${dailyMinutes(activity)} 分钟）", "今天临时增加时间")) { _, which ->
-                        val field = EditText(activity).apply {
-                            inputType = InputType.TYPE_CLASS_NUMBER
-                            hint = if (which == 0) "每日分钟数（1—240）" else "今天增加分钟数（1—240）"
-                        }
-                        val edit = AlertDialog.Builder(activity).setTitle(if (which == 0) "每日额度" else "今天临时加时")
-                            .setView(field).setMessage("每日额度次日恢复；临时加时仅当天有效。")
-                            .setPositiveButton("保存", null).setNegativeButton("取消", null).create()
-                        edit.setOnShowListener { edit.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
-                            val minutes = field.text.toString().toIntOrNull()
-                            if (minutes == null || minutes !in 1..240) { field.error = "请输入 1—240 的分钟数"; return@setOnClickListener }
-                            settle()
-                            store.edit().putInt(if (which == 0) "limit" else "bonus", if (which == 0) minutes else store.getInt("bonus", 0) + minutes).apply()
-                            edit.dismiss(); after()
-                        } }
-                        edit.show()
-                    }.setNegativeButton("关闭", null).show()
-            }
-        }
-        verify.show()
+        numberPanel(activity, "家长验证：${digits[a]} × ${digits[b]} = ？", "点击数字输入答案，输入 10 请依次按 1、0。", 2,
+            validate = { if (it == a * b) null else "答案不正确，请删除后重新输入" }, accepted = {
+                val daily = dailyMinutes(activity)
+                AlertDialog.Builder(android.view.ContextThemeWrapper(activity, android.R.style.Theme_Material_Light_Dialog_Alert))
+                    .setCustomTitle(panelTitle(activity, "每日固定 $daily 分钟"))
+                    .setItems(arrayOf("修改每日固定额度（以后每天生效）", "仅今天加时（明天仍为 $daily 分钟）")) { _, which ->
+                        val fixed = which == 0
+                        numberPanel(activity, if (fixed) "修改每日固定额度" else "仅今天加时",
+                            if (fixed) "当前每天 $daily 分钟。修改后今天立即生效，以后每天沿用新额度；已用时间不清零。"
+                            else "每日固定 $daily 分钟。这里只增加今天的时间，不改变每日固定额度。", 3,
+                            preview = { input ->
+                                val minutes = input.toIntOrNull()
+                                if (minutes == null || minutes !in 1..240) "请输入 1—240 分钟"
+                                else if (fixed) "确认后：每天 $minutes 分钟，明天也是 $minutes 分钟。"
+                                else "今天额外增加 $minutes 分钟；明天恢复为 $daily 分钟。"
+                            },
+                            validate = { if (it != null && it in 1..240) null else "请输入 1—240 的分钟数" },
+                            accepted = { minutes ->
+                                settle()
+                                store.edit().putInt(if (fixed) "limit" else "bonus",
+                                    if (fixed) minutes else store.getInt("bonus", 0) + minutes).apply()
+                                android.widget.Toast.makeText(activity,
+                                    if (fixed) "每日固定额度已改为 $minutes 分钟，明天同样生效"
+                                    else "今天已加 $minutes 分钟，明天仍为 $daily 分钟",
+                                    android.widget.Toast.LENGTH_LONG).show()
+                                after()
+                            })
+                    }.setNegativeButton("关闭", null).create().also { menu -> menu.setOnShowListener { stylePanel(activity, menu) }; menu.show() }
+            })
     }
     fun locked(activity: Activity, onClose: (() -> Unit)? = null, after: () -> Unit) {
-        AlertDialog.Builder(activity).setTitle("今天的儿童时间已用完")
-            .setMessage("每日额度 ${dailyMinutes(activity)} 分钟，明天自动恢复。家长可通过计算题临时加时。")
+        AlertDialog.Builder(android.view.ContextThemeWrapper(activity, android.R.style.Theme_Material_Light_Dialog_Alert))
+            .setCustomTitle(panelTitle(activity, "今天的儿童时间已用完"))
+            .setMessage("每日固定 ${dailyMinutes(activity)} 分钟，明天恢复为 ${dailyMinutes(activity)} 分钟。家长可通过计算题仅给今天加时。")
             .setPositiveButton("家长加时") { _, _ -> parent(activity, after) }
-            .setNegativeButton(if (onClose == null) "关闭" else "返回", { _, _ -> onClose?.invoke() }).show()
+            .setNegativeButton(if (onClose == null) "关闭" else "返回", { _, _ -> onClose?.invoke() }).create().also { dialog ->
+                dialog.setOnShowListener { stylePanel(activity, dialog) }; dialog.show()
+            }
     }
 }

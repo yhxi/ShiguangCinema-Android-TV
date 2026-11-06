@@ -52,3 +52,13 @@ internal fun filterChildrenTitles(titles: List<String>, filter: Int, covered: Se
         }
         else -> titles
     }
+
+
+/** Rotate by local day, retaining one deterministic order for the entire day. */
+internal fun dailyChildrenPicks(titles: List<String>, day: Long, watched: Set<String>, count: Int): List<String> {
+    if (titles.isEmpty() || count <= 0) return emptyList()
+    val start = (((day % titles.size) + titles.size) % titles.size).toInt()
+    val rotated = titles.drop(start) + titles.take(start)
+    val normalized = watched.map(::normalizeSeries).toSet()
+    return (rotated.filter { normalizeSeries(it) !in normalized } + rotated.filter { normalizeSeries(it) in normalized }).take(count)
+}
