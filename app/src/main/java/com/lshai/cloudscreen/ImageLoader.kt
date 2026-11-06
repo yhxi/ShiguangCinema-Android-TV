@@ -55,14 +55,20 @@ class ImageLoader(private val context: Context, api: Api) {
     }
     // 3 个线程时，24 张海报要分 8 批发；每张即使只要 0.5 秒也要 4 秒才铺满。
     // 提到 6 个：弱网下再多会互相抢带宽，反而让单张更慢。
-    private val pool = Executors.newFixedThreadPool(6)
+    private val requestOrder = AtomicLong(0)
+    private class ImageTask(val priority: Int, val order: Long, val work: () -> Unit) : Runnable, Comparable<ImageTask> {
+        override fun compareTo(other: ImageTask): Int = compareValuesBy(this, other, { it.priority }, { it.order })
+        override fun run() = work()
+    }
+    private val pool = java.util.concurrent.ThreadPoolExecutor(6, 6, 0L, java.util.concurrent.TimeUnit.MILLISECONDS,
+        java.util.concurrent.PriorityBlockingQueue<Runnable>())
     // 磁盘压缩单独排队，不占用下载线程；首屏后续海报无需等前一张落盘。
     private val diskPool = Executors.newSingleThreadExecutor()
     private val main = Handler(Looper.getMainLooper())
     @Volatile private var closed = false
 
     /** 正在下载的图：同一个 key 的后续请求排队等结果，不再各自发起下载 */
-    private data class ImageCallback(val ready: (Bitmap?) -> Unit, val cancelled: (() -> Unit)?)
+    private data class ImageCallback(val ready: (Bitmap?) -> Unit, val cancelled: (() -> Unit)?, val needed: () -> Boolean)
     private val inFlight = ConcurrentHashMap<String, MutableList<ImageCallback>>()
 
     private val diskDir = File(context.cacheDir, "poster_cache")
@@ -74,13 +80,13 @@ class ImageLoader(private val context: Context, api: Api) {
 
     fun load(
         url: String, reqWidth: Int, reqHeight: Int,
-        onCancelled: (() -> Unit)? = null, onReady: (Bitmap?) -> Unit,
+        onCancelled: (() -> Unit)? = null, background: Boolean = false, needed: () -> Boolean = { true }, onReady: (Bitmap?) -> Unit,
     ) {
         if (closed) { onCancelled?.invoke(); return }
         if (url.isEmpty()) { onReady(null); return }
         val key = "$url@${reqWidth}x$reqHeight"
         cache.get(key)?.let { onReady(it); return }
-        val callback = ImageCallback(onReady, onCancelled)
+        val callback = ImageCallback(onReady, onCancelled, needed)
         val requestGeneration: Long
         synchronized(inFlight) {
             if (closed) { onCancelled?.invoke(); return }
@@ -90,7 +96,12 @@ class ImageLoader(private val context: Context, api: Api) {
             inFlight[key] = mutableListOf(callback)
         }
         try {
-            pool.execute {
+            pool.execute(ImageTask(if (background) 1 else 0, requestOrder.incrementAndGet()) {
+                val useful = synchronized(inFlight) { inFlight[key]?.any { it.needed() } == true }
+                if (!useful) {
+                    main.post { deliver(key, requestGeneration, null) }
+                    return@ImageTask
+                }
                 val cached = runCatching { readFromDisk(url, reqWidth, reqHeight) }.getOrNull()
                 val bmp = cached ?: runCatching { download(url, reqWidth, reqHeight) }.getOrNull()
                 main.post { deliver(key, requestGeneration, bmp) }
@@ -99,7 +110,7 @@ class ImageLoader(private val context: Context, api: Api) {
                         if (generation.get() == requestGeneration) writeToDisk(url, bmp, reqWidth)
                     } } }
                 }
-            }
+            })
         } catch (_: java.util.concurrent.RejectedExecutionException) {
             val callbacks = synchronized(inFlight) {
                 if (generation.get() == requestGeneration) inFlight.remove(key) else null
@@ -130,7 +141,7 @@ class ImageLoader(private val context: Context, api: Api) {
             if (bmp != null) cache.put(key, bmp)
             inFlight.remove(key)
         }
-        waiting?.forEach { it.ready(bmp) }
+        waiting?.forEach { if (it.needed()) it.ready(bmp) else it.cancelled?.invoke() }
     }
 
     private fun download(url: String, reqWidth: Int, reqHeight: Int): Bitmap? {

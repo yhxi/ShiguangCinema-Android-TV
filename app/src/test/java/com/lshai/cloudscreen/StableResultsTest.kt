@@ -29,4 +29,14 @@ class StableResultsTest {
         assertNull(searchSelectionToRestore("B", listOf("A", "C"), inTouchMode = false))
         assertNull(searchSelectionToRestore(null, listOf("A"), inTouchMode = false))
     }
+
+    @Test fun resumesLastVisitEvenWhenHigherEpisodeWasWatched() {
+        assertEquals(1, resumeEpisodeIndex(1, booleanArrayOf(false, true, false, true)))
+        assertEquals(3, resumeEpisodeIndex(99, booleanArrayOf(false, true, false, true)))
+        assertEquals(-1, resumeEpisodeIndex(null, booleanArrayOf()))
+    }
+    @Test fun lateExactMatchDoesNotDisplaceExistingResult() {
+        val sorted = listOf("动画", "动画第二季").sortedBy { searchTitleRank(it, "动画") }
+        assertEquals(listOf("动画第二季", "动画"), keepExistingResultOrder(sorted, listOf("动画第二季")) { it })
+    }
 }

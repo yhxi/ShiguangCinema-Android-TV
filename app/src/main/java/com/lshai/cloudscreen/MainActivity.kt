@@ -3889,7 +3889,6 @@ class MainActivity : Activity() {
             .sortedWith(compareBy({ searchTitleRank(it.second.first, lastSearchKeyword) }, { it.first }))
             .map { it.second }
         resultGroups = keepExistingResultOrder(resultGroups, previousOrder) { it.first }
-            .sortedBy { searchTitleRank(it.first, lastSearchKeyword) }
         return visible.size
     }
 
@@ -3993,10 +3992,10 @@ class MainActivity : Activity() {
                 if (bad) 0xFFFCA5A5.toInt() else 0xFF64748B.toInt(),
             )
 
+            if (poster.tag != first.pic) poster.setImageBitmap(null)
             poster.tag = first.pic
-            poster.setImageBitmap(null)
             // 按 ImageView 的实际尺寸取图：以前要 120x170 却只显示 86x120，白解了 2 倍像素
-            imageLoader.load(first.pic, dp(86), dp(120)) { bmp ->
+            imageLoader.load(first.pic, dp(86), dp(120), needed = posterSubscription(poster)::get) { bmp ->
                 if (poster.tag == first.pic) poster.setImageBitmap(bmp)
             }
             cell.setOnClickListener { openDetail(first) }
@@ -4736,6 +4735,9 @@ class MainActivity : Activity() {
         val initial = (listOfNotNull(current) + known).filter { it.sourceUrl.isNotEmpty() }
             .distinctBy { it.sourceUrl }
 
+        var sourceRows: LinearLayout? = null
+        var sourceStatus: TextView? = null
+        var sourceScroll: ScrollView? = null
         fun render(items: List<SearchItem>, status: String) {
             if (currentScreen != "playbacksources") return
             val col = LinearLayout(this).apply {
@@ -4744,8 +4746,13 @@ class MainActivity : Activity() {
             }
             col.addView(topBar())
             col.addView(titleText("《$title》 · 选择播放源", 21f))
-            col.addView(hintText(status).apply { setPadding(0, dp(8), 0, dp(12)) })
-            val rows = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+            val statusView = hintText(status).apply { setPadding(0, dp(8), 0, dp(12)) }
+            val oldFocus = currentFocus?.tag as? String
+            val oldScroll = sourceScroll?.scrollY ?: 0
+            val rows = sourceRows ?: LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+            val oldButtons = (0 until rows.childCount).mapNotNull { rows.getChildAt(it) as? Button }.associateBy { it.tag as? String }
+            rows.removeAllViews()
+            col.addView(statusView)
             items.forEach { item ->
                 val name = item.sourceName.ifEmpty {
                     item.sourceUrl.substringAfter("://").substringBefore('/').ifEmpty { "未知来源" }
@@ -4760,10 +4767,11 @@ class MainActivity : Activity() {
                 val count = detailCache[item.vodId + "|" + item.sourceUrl]?.second?.episodes?.size
                 val label = (if (isCurrent) "● 当前 · " else "") + name + " · " + health + (count?.let { " · $it 集" } ?: "")
                 if (item.vodId.isNotEmpty()) {
-                    rows.addView(button(label, primary = isCurrent) {
-                        cancelJob("playbacksources")
-                        openDetail(item)
-                    }.apply {
+                    val sourceButton = oldButtons[item.sourceUrl] ?: button(label, primary = isCurrent) { }
+                    sourceButton.text = label
+                    sourceButton.tag = item.sourceUrl
+                    sourceButton.setOnClickListener { cancelJob("playbacksources"); openDetail(item) }
+                    rows.addView(sourceButton.apply {
                         layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(52))
                     })
                 } else {
@@ -4771,7 +4779,19 @@ class MainActivity : Activity() {
                 }
             }
             if (items.isEmpty()) rows.addView(hintText("暂无可选择的来源，请稍后重试。"))
-            col.addView(ScrollView(this).apply { addView(rows) }, LinearLayout.LayoutParams(
+            if (sourceRows != null) {
+                sourceStatus?.text = status
+                sourceScroll?.post {
+                    sourceScroll?.scrollTo(0, oldScroll)
+                    if (isTvDevice && oldFocus != null) (0 until rows.childCount).map { rows.getChildAt(it) }.firstOrNull { it.tag == oldFocus }?.requestFocus()
+                }
+                return
+            }
+            sourceRows = rows
+            sourceStatus = statusView
+            val scroller = ScrollView(this).apply { addView(rows) }
+            sourceScroll = scroller
+            col.addView(scroller, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f,
             ))
             setScreen(col)
@@ -4938,8 +4958,8 @@ class MainActivity : Activity() {
             0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         col.addView(header)
         if (compact) {
-            if (detail.info.actor.isNotEmpty()) addPreview("主演：${detail.info.actor}", "主演", 2, extraInfo)
-            if (detail.info.desc.isNotEmpty()) addPreview(stripHtml(detail.info.desc), "简介", 3, extraInfo)
+            if (detail.info.actor.isNotEmpty()) addPreview("主演：${detail.info.actor}", "主演", 1, extraInfo)
+            if (detail.info.desc.isNotEmpty()) addPreview(stripHtml(detail.info.desc), "简介", 1, extraInfo)
         }
 
         val coverUrl = detail.info.cover.ifEmpty { item.pic }
@@ -4968,7 +4988,7 @@ class MainActivity : Activity() {
                 }.setNegativeButton("取消", null).show()
         })
         col.addView(sourceHeader)
-        if (alternatives.size > 1) {
+        if (alternatives.size > 1 && !compact) {
             val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
             row.addView(hintText("来源（${alternatives.size}）："), LinearLayout.LayoutParams(dp(96), dp(44)))
             alternatives.forEach { alt ->
@@ -5013,7 +5033,9 @@ class MainActivity : Activity() {
         // 两份记录都看：按地址的 + 按「剧名+集号」的（换源之后地址变了，后者才认得出来）
         val progressKey = detail.info.title.ifEmpty { item.name }
         val watched = prefs.watchedEpisodes(progressKey, detail.episodes, marked)
-        val lastIdx = if (prefs.resumeEnabled) watched.indexOfLast { it } else -1
+        val recent = prefs.history().firstOrNull { normalizeSeries(it.seriesTitle.ifEmpty { historyTitle(it) }) == normalizeSeries(progressKey) }
+        val recentIndex = recent?.let { entry -> detail.episodes.indexOf(entry.playUrl).takeIf { it >= 0 } ?: entry.episodeIndex }
+        val lastIdx = if (prefs.resumeEnabled) resumeEpisodeIndex(recentIndex, watched) else -1
         if (lastIdx >= 0) {
             col.addView(
                 button("▶ 继续看第 ${lastIdx + 1} 集", primary = true) { startEpisode(lastIdx) },
@@ -5024,7 +5046,7 @@ class MainActivity : Activity() {
         // 看剧最容易问的两件事：我上次看到哪了、这部还剩多少
         val watchedCount = watched.count { it }
         if (watchedCount > 0) {
-            col.addView(hintText("已看 $watchedCount / ${detail.episodes.size} 集"))
+            col.addView(hintText("看过 $watchedCount / ${detail.episodes.size} 集"))
         }
 
         // 追剧：只记「加入时这部剧共几集」，之后集数变多就说明更新了（纯本地比对）
@@ -5048,7 +5070,7 @@ class MainActivity : Activity() {
                     )
                     toast("已加入追剧，有新集会提示")
                 }
-                showDetail(item, detail)
+                (findButtonByText(col, "✓ 已追剧") ?: findButtonByText(col, "＋ 加入追剧"))?.let { (it as Button).text = if (prefs.isFavorite(progressKey)) "✓ 已追剧" else "＋ 加入追剧" }
             },
             LinearLayout.LayoutParams(dp(200), ViewGroup.LayoutParams.WRAP_CONTENT)
                 .apply { bottomMargin = dp(8) },
@@ -5073,7 +5095,7 @@ class MainActivity : Activity() {
                 // CMS 的集数标题常常带一段哈希（第1集$4ad62e），这里只保留序号
                 tv.text = when {
                     position == lastIdx -> "第 ${position + 1} 集 ▶"
-                    watched[position] -> "第 ${position + 1} 集 ✓"
+                    watched[position] -> "第 ${position + 1} 集 · 看过"
                     else -> "第 ${position + 1} 集"
                 }
                 tv.setTextColor(
@@ -5090,7 +5112,12 @@ class MainActivity : Activity() {
         col.addView(epGrid, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
 
-        setScreen(col)
+        val detailsRoot = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        col.removeView(epGrid)
+        val headerScroll = ScrollView(this).apply { addView(col) }
+        detailsRoot.addView(headerScroll, LinearLayout.LayoutParams(-1, 0, 1f))
+        detailsRoot.addView(epGrid, LinearLayout.LayoutParams(-1, 0, 1f))
+        setScreen(detailsRoot)
         // 直接定位到上次看到的那一集附近，不用手动滑到第 800 格
         if (lastIdx > 0) {
             val target = (lastIdx - (if (compact) 3 else 8)).coerceAtLeast(0)
@@ -5398,8 +5425,8 @@ class MainActivity : Activity() {
                     (info.getChildAt(0) as TextView).text = h.title
                     (info.getChildAt(1) as TextView).text =
                         formatTime(h.positionMs) + " / " + formatTime(h.durationMs)
+                    if (poster.tag != h.cover) poster.setImageBitmap(null)
                     poster.tag = h.cover
-                    poster.setImageBitmap(null)
                     imageLoader.load(h.cover, dp(120), dp(170)) { bmp ->
                         if (poster.tag == h.cover) poster.setImageBitmap(bmp)
                     }
@@ -5523,8 +5550,8 @@ class MainActivity : Activity() {
                     )
                     (info.getChildAt(2) as TextView).text =
                         f.sourceName.ifEmpty { "未知来源" } + " · " + relativeTime(f.checkedAt)
+                    if (poster.tag != f.cover) poster.setImageBitmap(null)
                     poster.tag = f.cover
-                    poster.setImageBitmap(null)
                     imageLoader.load(f.cover, dp(120), dp(170)) { bmp ->
                         if (poster.tag == f.cover) poster.setImageBitmap(bmp)
                     }
@@ -6118,7 +6145,7 @@ class MainActivity : Activity() {
     private suspend fun awaitChildrenImage(url: String, width: Int, height: Int): ChildrenImageResult? =
         kotlinx.coroutines.withTimeoutOrNull(35_000) {
             kotlinx.coroutines.suspendCancellableCoroutine { continuation ->
-                imageLoader.load(url, width, height, onCancelled = {
+                imageLoader.load(url, width, height, background = true, needed = { continuation.isActive }, onCancelled = {
                     continuation.cancel(kotlinx.coroutines.CancellationException("图片缓存已清理"))
                 }) { bitmap ->
                     if (continuation.isActive) continuation.resumeWith(Result.success(ChildrenImageResult(bitmap)))
@@ -6371,6 +6398,7 @@ class MainActivity : Activity() {
                 }.setNegativeButton("取消", null).show()
         })
         var firstCard: View? = null
+        val focusViews = mutableMapOf<String, View>()
         val catalogTitles = ChildrenCatalog.preloadOrder().map(::normalizeSeries).toSet()
         val recentChildren = prefs.history().filter { normalizeSeries(it.seriesTitle.ifEmpty { historyTitle(it) }) in catalogTitles }.take(3)
         if (recentChildren.isNotEmpty()) {
@@ -6382,13 +6410,18 @@ class MainActivity : Activity() {
                 val title = entry.seriesTitle.ifEmpty { historyTitle(entry) }
                 val card = childrenCard(cardWidth, cardHeight)
                 bindChildrenCard(card, title, cardWidth, cardHeight)
-                card.setOnClickListener { playFromHistory(entry) }
+                (card.getChildAt(1) as TextView).text = "$title · 第 ${entry.episodeIndex.coerceAtLeast(0) + 1} 集\n${entry.positionMs / 60_000}:${(entry.positionMs / 1000 % 60).toString().padStart(2, '0')}"
+                focusViews["recent:$title"] = card
+                card.setOnClickListener {
+                    childrenOverviewFocus = "recent:$title"
+                    childrenOverviewScrollY = childrenOverviewScroll?.scrollY ?: 0
+                    playFromHistory(entry)
+                }
                 if (firstCard == null) firstCard = card
                 recentRow.addView(card, LinearLayout.LayoutParams(cardWidth, -2).apply { rightMargin = dp(8) })
             }
             col.addView(hScroll(recentRow))
         }
-        val focusViews = mutableMapOf<String, View>()
         col.addView(hintText("按年龄推荐 · 点动画选择片源 · 年龄仅供参考").apply {
             setPadding(dp(6), dp(4), dp(6), dp(12))
         })
@@ -6462,6 +6495,7 @@ class MainActivity : Activity() {
         val columns = if (isTvDevice) 4 else 2
         val width = ((resources.displayMetrics.widthPixels - pagePad(40) * 2 - dp(12) * (columns - 1)) / columns).coerceAtLeast(dp(110))
         val height = if (isTvDevice) dp(130) else dp(105)
+        val filterPositions = mutableMapOf<Int, Pair<Int, Int>>()
         var items: List<String> = section.titles
         lateinit var grid: GridView
         val actions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
@@ -6469,7 +6503,7 @@ class MainActivity : Activity() {
         fun updateFilter() {
             val watched = if (childrenMoreFilter == 2) prefs.history().map(::historyTitle).toSet() else emptySet()
             items = filterChildrenTitles(section.titles, childrenMoreFilter, childrenCovers.keys, watched)
-            filter.text = when (childrenMoreFilter) { 1 -> "筛选：已有封面"; 2 -> "筛选：最近看过"; else -> "筛选：全部" }
+            filter.text = when (childrenMoreFilter) { 1 -> "筛选：已收录封面地址"; 2 -> "筛选：最近看过"; else -> "筛选：全部" }
             hint.text = "${items.size} / ${section.titles.size} 部 · 年龄仅供参考" +
                 if (items.isEmpty()) " · 当前没有符合条件的作品" else ""
             (grid.adapter as? BaseAdapter)?.notifyDataSetChanged()
@@ -6482,7 +6516,17 @@ class MainActivity : Activity() {
                 }
             }
         }
-        filter.setOnClickListener { childrenMoreFilter = (childrenMoreFilter + 1) % 3; updateFilter() }
+        filter.setOnClickListener {
+            AlertDialog.Builder(this).setTitle("筛选作品")
+                .setSingleChoiceItems(arrayOf("全部", "已收录封面地址", "最近看过"), childrenMoreFilter) { dialog, which ->
+                    filterPositions[childrenMoreFilter] = grid.firstVisiblePosition to (grid.getChildAt(0)?.top ?: 0)
+                    childrenMoreFilter = which; childrenMoreTitle = null; updateFilter()
+                    filterPositions[which]?.let { saved -> grid.post {
+                        if (saved.first in items.indices) grid.smoothScrollToPositionFromTop(saved.first, saved.second, 1)
+                    } }
+                    dialog.dismiss()
+                }.setNegativeButton("取消", null).show()
+        }
         actions.addView(filter)
         actions.addView(button("重试当前封面") {
             val position = grid.selectedItemPosition
@@ -6706,6 +6750,7 @@ class MainActivity : Activity() {
             }
         }
 
+        recommendRetry?.let { retry -> col.addView(button("推荐加载失败 · 点击重试") { retry() }) }
         showRecommendFeed(col)
     }
 
@@ -6756,7 +6801,7 @@ class MainActivity : Activity() {
                 }
                 val last = lm.findLastVisibleItemPosition()
                 if (feed.itemCount - last <= 6 &&
-                    !isLoadingMore && !noMoreRecommend && recommendItems.isNotEmpty()
+                    !isLoadingMore && recommendRetry == null && !noMoreRecommend && recommendItems.isNotEmpty()
                 ) {
                     loadRecommend(true)
                 }
@@ -6883,8 +6928,10 @@ class MainActivity : Activity() {
         })
     }
 
+    private var recommendRetry: (() -> Unit)? = null
     private fun loadRecommend(more: Boolean = false) {
         if (more && (isLoadingMore || noMoreRecommend)) return
+        recommendRetry = null
         isLoadingMore = true
         val page = if (more) recommendPage + 1 else 0
         // 记下发起时的分类：切换分类的请求在另一个槽位，可能先回来了。
@@ -6898,8 +6945,7 @@ class MainActivity : Activity() {
             val specs = if (tag.isEmpty()) listOf("最新" to 8, "热门" to 8) else listOf(tag to 16)
             specs.map { (t, n) ->
                 async(Dispatchers.IO) {
-                    runCatching { api.douban(loadingType, t, page * n, n) }
-                        .getOrDefault(emptyList())
+                    api.douban(loadingType, t, page * n, n)
                 }
             }.awaitAll().flatten().distinctBy { it.title.trim() }
         }, { items ->
@@ -6941,6 +6987,12 @@ class MainActivity : Activity() {
                     }
                     showRecommend()
                 }
+            }
+        }, quiet = true, onError = {
+            isLoadingMore = false
+            if (currentScreen == "recommend" && loadingType == mediaType) {
+                recommendRetry = { loadRecommend(more) }
+                showRecommend()
             }
         })
     }
@@ -6991,6 +7043,14 @@ class MainActivity : Activity() {
     }
 
     /** 把一个单元格填上第 position 条推荐（图片按 URL 校验，快速滚动不会串图） */
+    private val posterSubscriptions = java.util.WeakHashMap<ImageView, java.util.concurrent.atomic.AtomicBoolean>()
+    private fun posterSubscription(image: ImageView): java.util.concurrent.atomic.AtomicBoolean {
+        posterSubscriptions.remove(image)?.set(false)
+        val active = java.util.concurrent.atomic.AtomicBoolean(true)
+        posterSubscriptions[image] = active
+        return active
+    }
+
     private fun bindRecommendCell(cell: LinearLayout, position: Int) {
         val item = recommendItems.getOrNull(position) ?: return
         val metrics = recommendCellMetrics()
@@ -7004,7 +7064,7 @@ class MainActivity : Activity() {
         val previousCover = img.tag as? String
         img.tag = item.cover
         if (previousCover != item.cover) img.setImageDrawable(null)
-        imageLoader.load(item.cover, posterWidth, posterHeight) { bmp ->
+        imageLoader.load(item.cover, posterWidth, posterHeight, needed = posterSubscription(img)::get) { bmp ->
             if (img.tag == item.cover) img.setImageBitmap(bmp)
         }
         cell.setOnClickListener { doSearch(item.title) }
@@ -7071,6 +7131,14 @@ class MainActivity : Activity() {
                 }
                 Holder(cell)
             }
+
+        override fun onViewRecycled(holder: Holder) {
+            if (holder.itemViewType == TYPE_CELL) {
+                val image = (holder.itemView as? LinearLayout)?.getChildAt(0) as? ImageView
+                if (image != null) posterSubscriptions.remove(image)?.set(false)
+            }
+            super.onViewRecycled(holder)
+        }
 
         override fun onBindViewHolder(holder: Holder, position: Int) {
             if (position == 0) return

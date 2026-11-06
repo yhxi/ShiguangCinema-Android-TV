@@ -31,10 +31,29 @@ internal object BackgroundPlayback {
     var sourceName = ""
     var cover = ""
     var running = false
+    private val timerHandler = Handler(Looper.getMainLooper())
+    var timerPlayer: ExoPlayer? = null
+    private val timer = object : Runnable {
+        override fun run() {
+            if (sleepUntil <= 0L) return
+            val left = sleepUntil - android.os.SystemClock.elapsedRealtime()
+            if (left > 0L) { timerHandler.postDelayed(this, left); return }
+            sleepUntil = 0L
+            (timerPlayer ?: player)?.pause()
+        }
+    }
+    var sleepUntil = 0L
+        set(value) {
+            field = value
+            timerHandler.removeCallbacks(timer)
+            if (value > 0L) timerHandler.postDelayed(timer, (value - android.os.SystemClock.elapsedRealtime()).coerceAtLeast(0L))
+        }
 
     fun releaseDetached() {
         if (!detached) return
+        sleepUntil = 0L
         player?.release()
+        timerPlayer = null
         player = null
         detached = false
         PlaybackCache.playerClosed()

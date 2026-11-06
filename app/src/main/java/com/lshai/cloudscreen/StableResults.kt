@@ -23,3 +23,7 @@ internal fun searchTitleRank(title: String, query: String): Int {
         else -> 2
     }
 }
+
+/** Prefer the last actual visit over the highest episode ever visited. */
+internal fun resumeEpisodeIndex(recentIndex: Int?, watched: BooleanArray): Int =
+    recentIndex?.takeIf { it in watched.indices } ?: watched.indexOfLast { it }

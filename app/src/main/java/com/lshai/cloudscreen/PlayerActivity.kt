@@ -265,7 +265,9 @@ class PlayerActivity : Activity() {
     /** 上次把进度写进 SharedPreferences 的时间：每 5 秒重写整份历史 JSON 太浪费 */
     private var lastPersistAt = 0L
     /** 睡眠定时：到点的 uptimeMillis，0 = 没设 */
-    private var sleepUntil = 0L
+    private var sleepUntil: Long
+        get() = BackgroundPlayback.sleepUntil
+        set(value) { BackgroundPlayback.sleepUntil = value }
     /** 另一种语义：不按时间，播完当前这一集就停（不想让自动连播往下跑） */
     private var stopAtEpisodeEnd = false
     /** 方向锁：竖屏片源会自动转竖屏，但侧躺看的时候不希望它跟着转 */
@@ -384,11 +386,6 @@ class PlayerActivity : Activity() {
         hideSystemUi()
 
         prefs = Prefs(this)
-        val childMinutes = intent.getIntExtra(EXTRA_CHILD_TIMER, 0).coerceIn(0, 90)
-        if (childMinutes > 0) {
-            sleepUntil = SystemClock.uptimeMillis() + childMinutes * 60_000L
-            handler.postDelayed(childTimerCheck, childMinutes * 60_000L)
-        }
         // 告诉缓存层「有播放器活着」：此时清播放缓存会 release 分片缓存，播放器会崩
         PlaybackCache.playerOpened()
         if (BackgroundPlayback.detached) {
@@ -401,6 +398,11 @@ class PlayerActivity : Activity() {
                 BackgroundPlayback.releaseDetached()
                 stopService(Intent(this, PlaybackService::class.java))
             }
+        }
+        val childMinutes = intent.getIntExtra(EXTRA_CHILD_TIMER, 0).coerceIn(0, 90)
+        if (childMinutes > 0 && sleepUntil == 0L) {
+            sleepUntil = SystemClock.elapsedRealtime() + childMinutes * 60_000L
+            handler.postDelayed(childTimerCheck, childMinutes * 60_000L)
         }
         urls = intent.getStringArrayListExtra(EXTRA_URLS)?.toList().orEmpty()
         if (adoptedPlayer != null) urls = BackgroundPlayback.urls
@@ -1092,6 +1094,7 @@ class PlayerActivity : Activity() {
                 }
             }
 
+        BackgroundPlayback.timerPlayer = player
         if (prefs.backgroundPlay) startBackgroundService()
 
         updateSpeedAction()
@@ -1845,7 +1848,7 @@ class PlayerActivity : Activity() {
     private fun sleepLabel(): String {
         if (stopAtEpisodeEnd) return "定时关闭：播完本集就停"
         if (sleepUntil <= 0L) return "定时关闭"
-        val left = (sleepUntil - SystemClock.uptimeMillis()).coerceAtLeast(0L)
+        val left = (sleepUntil - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
         val minutes = (left + 59_999L) / 60_000L
         return "定时关闭：还剩 $minutes 分钟"
     }
@@ -1865,9 +1868,9 @@ class PlayerActivity : Activity() {
                 stopAtEpisodeEnd = false
                 when (which) {
                     1 -> stopAtEpisodeEnd = true
-                    2 -> sleepUntil = SystemClock.uptimeMillis() + 30 * 60_000L
-                    3 -> sleepUntil = SystemClock.uptimeMillis() + 60 * 60_000L
-                    4 -> sleepUntil = SystemClock.uptimeMillis() + 90 * 60_000L
+                    2 -> sleepUntil = SystemClock.elapsedRealtime() + 30 * 60_000L
+                    3 -> sleepUntil = SystemClock.elapsedRealtime() + 60 * 60_000L
+                    4 -> sleepUntil = SystemClock.elapsedRealtime() + 90 * 60_000L
                 }
                 val msg = when {
                     stopAtEpisodeEnd -> "本集播完就暂停，不会自动连播"
@@ -1884,7 +1887,7 @@ class PlayerActivity : Activity() {
     /** 到点就暂停，并把控制条亮出来（屏幕暗着的时候得让用户知道为什么停了） */
     private fun checkSleepTimer() {
         if (sleepUntil <= 0L) return
-        if (SystemClock.uptimeMillis() < sleepUntil) return
+        if (SystemClock.elapsedRealtime() < sleepUntil) return
         sleepUntil = 0L
         player?.pause()
         toast("定时关闭时间到，已暂停播放")
@@ -3773,9 +3776,11 @@ class PlayerActivity : Activity() {
             BackgroundPlayback.detached = true
         } else {
             if (BackgroundPlayback.player === p) {
+                BackgroundPlayback.sleepUntil = 0L
                 BackgroundPlayback.player = null
                 stopService(Intent(this, PlaybackService::class.java))
             }
+            if (BackgroundPlayback.timerPlayer === p) { BackgroundPlayback.sleepUntil = 0L; BackgroundPlayback.timerPlayer = null }
             p?.release()
             PlaybackCache.playerClosed()
         }
