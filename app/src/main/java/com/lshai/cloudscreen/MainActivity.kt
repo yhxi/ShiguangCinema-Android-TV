@@ -6168,7 +6168,9 @@ class MainActivity : Activity() {
     private var childrenMoreTitle: String? = null
     private var childrenMoreFilter = 0
     private var childrenMoreFilterSection = -1
-    private val childrenCoverSlots = kotlinx.coroutines.sync.Semaphore(3)
+    // 封面解析的并发上限。原值 3：几个分区 + 预取抢 3 个坑，冷启动一次页
+    // 要串行熬完几十次网络往返。6 = 低配盒子也能承受的海报下载并发。
+    private val childrenCoverSlots = kotlinx.coroutines.sync.Semaphore(6)
     private val childrenCovers = mutableMapOf<String, String>()
     private val childrenCoverTried = mutableSetOf<String>()
     private val childrenCoverWaiting = mutableMapOf<String, MutableList<java.lang.ref.WeakReference<ImageView>>>()
@@ -6326,7 +6328,7 @@ class MainActivity : Activity() {
                 val deadline = android.os.SystemClock.elapsedRealtime() + 60_000L
                 val watchdog = scope.launch { delay(60_000); coverConnections.cancel() }
                 try {
-                        suspend fun tryCoverUrls(urls: List<String>, perImageBudget: Long = 35_000L): String {
+                        suspend fun tryCoverUrls(urls: List<String>, perImageBudget: Long = 15_000L): String {
                             val candidates = urls.take(4)
                             var best = ""
                             var bestScore = -1.0
@@ -6338,7 +6340,9 @@ class MainActivity : Activity() {
                                 if (result?.bitmap != null) {
                                     val score = childrenCoverQuality(result.bitmap.width, result.bitmap.height, width, height)
                                     if (score > bestScore) { best = candidate; bestScore = score }
-                                    if (bestScore >= .95) break
+                                    // 0.95 → 0.85：原来几乎要把 4 张候选全部下载完打分才肯停，
+                                    // 一张清晰度足够的图就直接用，冷启动省掉 2-3 次串行下载
+                                    if (bestScore >= .85) break
                                     continue
                                 }
                                 if (result != null && android.os.SystemClock.elapsedRealtime() < deadline) {
@@ -6349,21 +6353,35 @@ class MainActivity : Activity() {
                         }
                     val independent = withContext(Dispatchers.IO) { ChildrenArtworkIndex.urls(applicationContext, title) }
                     var chosen = tryCoverUrls(independent, perImageBudget = 6_000L)
-                    for (source in sources) {
-                        if (chosen.isNotEmpty() || coverConnections.isCancelled() || android.os.SystemClock.elapsedRealtime() >= deadline) break
-                        if (DirectCms.shouldTryDirect(source)) {
+                    // 直连源全部并发查：原来逐源串行，一个慢源卡几秒就把后面全部拖住。
+                    // 一次发齐、一次收齐，再统一挑候选图。
+                    if (chosen.isEmpty()) {
+                        val directSources = sources.filter { DirectCms.shouldTryDirect(it) }
+                        if (directSources.isNotEmpty()) {
                             val items = withContext(Dispatchers.IO) {
-                                runCatching { coverConnections.run { DirectCms.search(source, title) } }.getOrDefault(emptyList())
-                            }
+                                directSources.map { src ->
+                                    async {
+                                        runCatching { coverConnections.run { DirectCms.search(src, title) } }
+                                            .getOrDefault(emptyList())
+                                    }
+                                }.awaitAll()
+                            }.flatten()
                             chosen = tryCoverUrls(childrenCoverCandidates(title, items.map { it.name to it.pic }))
                         }
-                        if (chosen.isEmpty()) {
-                            val items = withContext(Dispatchers.IO) {
-                                runCatching { coverConnections.run { requestApi.search(title, listOf(source), readTimeoutMs = 6_000).items } }
-                                    .getOrDefault(emptyList())
-                            }
-                            chosen = tryCoverUrls(childrenCoverCandidates(title, items.map { it.name to it.pic }))
-                        }
+                    }
+                    // 服务端每批 4 个源并发：保持「先到先用」的行为，批内的源不再互相等待
+                    for (batch in sources.chunked(4)) {
+                        if (chosen.isNotEmpty() || coverConnections.isCancelled() ||
+                            android.os.SystemClock.elapsedRealtime() >= deadline) break
+                        val items = withContext(Dispatchers.IO) {
+                            batch.map { src ->
+                                async {
+                                    runCatching { coverConnections.run { requestApi.search(title, listOf(src), readTimeoutMs = 6_000).items } }
+                                        .getOrDefault(emptyList())
+                                }
+                            }.awaitAll()
+                        }.flatten()
+                        chosen = tryCoverUrls(childrenCoverCandidates(title, items.map { it.name to it.pic }))
                         if (chosen.isNotEmpty() || signature != childrenCoverSignature || requestApi !== api) break
                     }
                     if (requestApi !== api || signature != childrenCoverSignature) return@launch
@@ -6424,7 +6442,8 @@ class MainActivity : Activity() {
         childrenPrefetchJob?.cancel()
         // Keep at most two speculative lookups in flight, reserving a slot for visible cards.
         childrenPrefetchJob = scope.launch {
-            for (batch in (ChildrenCatalog.sections.indices.flatMap { childrenDailyPicks(it, if (isTvDevice) 3 else 2) } + ChildrenCatalog.preloadOrder()).distinct().chunked(2)) {
+            // 每批 3 个并发预取：配合 6 个信号量槽，给可见卡片留足余量
+            for (batch in (ChildrenCatalog.sections.indices.flatMap { childrenDailyPicks(it, if (isTvDevice) 3 else 2) } + ChildrenCatalog.preloadOrder()).distinct().chunked(3)) {
                 if (signature != childrenCoverSignature) break
                 batch.map { title -> async {
                     val cover = childrenCovers[title]
@@ -6583,6 +6602,14 @@ class MainActivity : Activity() {
                     ordered.filter { ChildrenArtworkIndex.urls(applicationContext, it).isNotEmpty() }.toSet()
                 }
                 val candidates = (preferred.filter { it in childrenCovers || it in listed } + ordered.filter { it in childrenCovers || it in listed } + ordered).distinct()
+                // 先把前排候选的封面解析一次性并发排队（信号量限流）：
+                // 解析流水线在后台同时跑，下面的逐卡等待等的是「已经在下载」的结果，
+                // 而不是每张卡串行地新发起一个最长 9 秒的等待
+                candidates.take(columns * 2).forEach { title ->
+                    if (childrenCovers[title] == null && title !in childrenCoverTried) {
+                        queueChildrenCover(title, width, height)
+                    }
+                }
                 for (title in candidates) {
                     if (currentScreen != "children" || !row.isAttachedToWindow || row.childCount >= columns) break
                     var cover = childrenCovers[title]
