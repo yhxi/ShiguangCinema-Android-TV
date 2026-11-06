@@ -52,6 +52,7 @@ internal object BackgroundPlayback {
     fun releaseDetached() {
         if (!detached) return
         sleepUntil = 0L
+        ChildrenQuota.detach(player)
         player?.release()
         timerPlayer = null
         player = null

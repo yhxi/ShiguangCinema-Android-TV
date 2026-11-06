@@ -419,7 +419,43 @@ class MainActivity : Activity() {
         super.onDestroy()
     }
 
+    private val quotaHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var quotaVisible = false
+    private var childrenQuotaTile: LinearLayout? = null
+    private var quotaLabelView: Button? = null
+    private val quotaTick = object : Runnable {
+        override fun run() {
+            if (!quotaVisible) return
+            val childScreen = currentScreen == "children" || currentScreen == "children_more" ||
+                (childrenSearchOrigin != null && currentScreen in listOf("results", "detail", "playbacksources"))
+            ChildrenQuota.browse(childScreen)
+            val locked = ChildrenQuota.remaining(this@MainActivity) <= 0L
+            childrenQuotaTile?.let { tile ->
+                tile.alpha = if (locked) 0.4f else 1f
+                (tile.getChildAt(1) as? TextView)?.text = if (locked) "儿童·已用完" else "儿童"
+                tile.contentDescription = "儿童，${ChildrenQuota.label(this@MainActivity)}"
+            }
+            quotaLabelView?.text = "${ChildrenQuota.label(this@MainActivity)} · 家长设置 / 加时"
+            if (childScreen && locked) showChildrenLocked()
+            else if (currentScreen == "children_locked" && !locked) showChildren()
+            quotaHandler.postDelayed(this, 1000)
+        }
+    }
+    private fun showChildrenLocked() {
+        ChildrenQuota.browse(false)
+        currentScreen = "children_locked"
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(pagePad(40), dp(24), pagePad(40), dp(24)) }
+        col.addView(titleText("今天的儿童时间已用完", 24f))
+        col.addView(hintText("明天自动恢复每日额度，家长可以临时加时。"))
+        col.addView(button("家长设置 / 加时") { ChildrenQuota.parent(this) { if (ChildrenQuota.remaining(this) > 0) showChildren() else showChildrenLocked() } })
+        col.addView(button("返回首页") { childrenSearchOrigin = null; showRecommend() })
+        setScreen(col)
+    }
+
     override fun onPause() {
+        ChildrenQuota.browse(false)
+        quotaVisible = false
+        quotaHandler.removeCallbacks(quotaTick)
         uiMonitor?.stop()
         homeMaintenanceJob?.cancel()
         favoriteCheckJob?.cancel()
@@ -434,6 +470,10 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        ChildrenQuota.init(this)
+        quotaVisible = true
+        quotaHandler.removeCallbacks(quotaTick)
+        quotaHandler.post(quotaTick)
         if (BuildConfig.TEST_BUILD && prefs.uiStatsEnabled) startUiMonitor()
         hideSystemUi()
         if (currentScreen == "children" || currentScreen == "children_more") {
@@ -671,6 +711,8 @@ class MainActivity : Activity() {
     private var lastRenderedScreen: String? = null
 
     private fun setScreen(view: View, focusFirst: Boolean = true) {
+        ChildrenQuota.browse(quotaVisible && (currentScreen == "children" || currentScreen == "children_more" ||
+            (childrenSearchOrigin != null && currentScreen in listOf("results", "detail", "playbacksources"))))
         if (currentScreen != "recommend") {
             homeMaintenanceJob?.cancel()
             homeHistoryCoverViews.clear()
@@ -2455,6 +2497,7 @@ class MainActivity : Activity() {
             setPadding(0, dp(18), 0, 0)
         })
         col.addView(hintText("让观影体验保持顺手、稳定。"))
+        col.addView(button("儿童每日 ${ChildrenQuota.dailyMinutes(this)} 分钟 · 家长设置 / 加时") { ChildrenQuota.parent(this) { showSetupCompact() } })
 
         val status = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -5171,10 +5214,16 @@ class MainActivity : Activity() {
         sourceName: String = "",
     ) {
         if (urls.isEmpty()) return
+        val child = currentScreen == "children" || currentScreen == "children_more" || childrenSearchOrigin != null || ChildrenQuota.isChild(this, seriesName.ifEmpty { title })
+        if (child) {
+            ChildrenQuota.mark(this, seriesName.ifEmpty { title })
+            if (ChildrenQuota.remaining(this) <= 0L) { ChildrenQuota.locked(this) { playFromList(urls, index, title, cover, seriesName, vodId, sourceUrl, sourceName) }; return }
+        }
         refreshHomeAfterPlayback = true
         startActivityForResult(Intent(this, PlayerActivity::class.java).apply {
             putStringArrayListExtra(PlayerActivity.EXTRA_URLS, ArrayList(urls))
             putExtra(PlayerActivity.EXTRA_INDEX, index.coerceIn(0, urls.size - 1))
+            putExtra("children_daily_content", child)
             putExtra(PlayerActivity.EXTRA_TITLE, title)
             putExtra(PlayerActivity.EXTRA_COVER, cover)
             // 选集回查用：只有这几项齐了，播放器才能从 1 集恢复成整季
@@ -6032,7 +6081,10 @@ class MainActivity : Activity() {
         "show" -> homeTile("show", "综艺") { applyMediaType("show", "综艺") }
         "search" -> homeTile("search", "搜索") { showHome() }
         "live" -> homeTile("live", "直播") { liveChannels = emptyList(); showLive() }
-        "kids" -> homeTile("kids", "儿童") { showChildren() }
+        "kids" -> homeTile("kids", if (ChildrenQuota.remaining(this) <= 0L) "儿童·已用完" else "儿童") { showChildren() }.apply {
+            alpha = if (ChildrenQuota.remaining(this@MainActivity) <= 0L) 0.4f else 1f
+            childrenQuotaTile = this
+        }
         "history" -> homeTile("history", "继续") { showHistoryCards() }
         "fav" -> {
             // 有更新时在标签上带一句，用户不用进页面才知道有新集
@@ -6381,6 +6433,8 @@ class MainActivity : Activity() {
     }
 
     private fun showChildren() {
+        if (ChildrenQuota.remaining(this) <= 0L) { showChildrenLocked(); return }
+        ChildrenQuota.browse(quotaVisible)
         currentScreen = "children"
         prepareChildrenCovers()
         val col = LinearLayout(this).apply {
@@ -6388,15 +6442,9 @@ class MainActivity : Activity() {
             setPadding(pagePad(40), dp(18), pagePad(40), dp(24))
         }
         col.addView(childrenHeader("儿童乐园") { showRecommend() })
-        col.addView(button("观看定时：${if (prefs.childrenTimerMinutes == 0) "关闭" else "${prefs.childrenTimerMinutes} 分钟"}") {
-            val values = listOf(0, 30, 60, 90)
-            AlertDialog.Builder(this).setTitle("儿童观看定时暂停")
-                .setSingleChoiceItems(arrayOf("关闭", "30 分钟", "60 分钟", "90 分钟"), values.indexOf(prefs.childrenTimerMinutes).coerceAtLeast(0)) { dialog, which ->
-                    prefs.childrenTimerMinutes = values[which]
-                    dialog.dismiss()
-                    showChildren()
-                }.setNegativeButton("取消", null).show()
-        })
+        col.addView(button("${ChildrenQuota.label(this)} · 家长设置 / 加时") {
+            ChildrenQuota.parent(this) { showChildren() }
+        }.also { quotaLabelView = it })
         var firstCard: View? = null
         val focusViews = mutableMapOf<String, View>()
         val catalogTitles = ChildrenCatalog.preloadOrder().map(::normalizeSeries).toSet()
@@ -6476,6 +6524,7 @@ class MainActivity : Activity() {
     }
 
     private fun showChildrenMore(index: Int) {
+        if (ChildrenQuota.remaining(this) <= 0L) { showChildrenLocked(); return }
         val section = ChildrenCatalog.sections.getOrNull(index) ?: return
         prepareChildrenCovers()
         if (childrenMoreFilterSection != index) {

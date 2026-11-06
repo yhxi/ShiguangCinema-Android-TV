@@ -1094,6 +1094,7 @@ class PlayerActivity : Activity() {
                 }
             }
 
+        player?.let { ChildrenQuota.attach(this, it, intent.getBooleanExtra("children_daily_content", false) || ChildrenQuota.isChild(this, seriesName.ifEmpty { singleLabel })) }
         BackgroundPlayback.timerPlayer = player
         if (prefs.backgroundPlay) startBackgroundService()
 
@@ -3720,7 +3721,22 @@ class PlayerActivity : Activity() {
         finish()
     }
 
+    private var quotaDialogShown = false
+    private val quotaWatch = object : Runnable {
+        override fun run() {
+            val child = intent.getBooleanExtra("children_daily_content", false) || ChildrenQuota.isChild(this@PlayerActivity, seriesName.ifEmpty { singleLabel })
+            if (child && ChildrenQuota.remaining(this@PlayerActivity) <= 0L && !quotaDialogShown) {
+                quotaDialogShown = true
+                persistProgress()
+                ChildrenQuota.locked(this@PlayerActivity, onClose = { finish() }) { quotaDialogShown = false; if (ChildrenQuota.remaining(this@PlayerActivity) > 0) player?.play() }
+            }
+            if (!child || ChildrenQuota.remaining(this@PlayerActivity) > 0L) quotaDialogShown = false
+            handler.postDelayed(this, 1000)
+        }
+    }
     override fun onStart() {
+        handler.removeCallbacks(quotaWatch)
+        handler.post(quotaWatch)
         super.onStart()
         live = this
         hidePlaybackNotification()
@@ -3729,6 +3745,7 @@ class PlayerActivity : Activity() {
 
     override fun onStop() {
         super.onStop()
+        handler.removeCallbacks(quotaWatch)
         handler.removeCallbacks(nextTick)
         hideNextHint()
         persistProgress()
@@ -3781,6 +3798,7 @@ class PlayerActivity : Activity() {
                 stopService(Intent(this, PlaybackService::class.java))
             }
             if (BackgroundPlayback.timerPlayer === p) { BackgroundPlayback.sleepUntil = 0L; BackgroundPlayback.timerPlayer = null }
+            ChildrenQuota.detach(p)
             p?.release()
             PlaybackCache.playerClosed()
         }
