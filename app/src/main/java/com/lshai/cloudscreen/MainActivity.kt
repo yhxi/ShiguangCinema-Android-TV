@@ -6272,7 +6272,7 @@ class MainActivity : Activity() {
 
     private fun setChildrenBitmap(image: ImageView, bitmap: android.graphics.Bitmap) {
         image.setBackgroundColor(0xFFD9F1E7.toInt())
-        image.scaleType = if (bitmap.width.toFloat() / bitmap.height < .85f) ImageView.ScaleType.FIT_CENTER else ImageView.ScaleType.CENTER_CROP
+        image.scaleType = ImageView.ScaleType.CENTER_CROP
         image.setImageBitmap(bitmap)
     }
 
@@ -6574,12 +6574,42 @@ class MainActivity : Activity() {
             val row = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL; clipChildren = false; clipToPadding = false
             }
-            childrenDailyPicks(index, columns).forEachIndexed { cardIndex, title ->
-                val card = childrenCard(width, height)
-                bindChildrenCard(card, title, width, height)
-                focusViews[title] = card
-                if (firstCard == null) firstCard = card
-                row.addView(card, LinearLayout.LayoutParams(0, -2, 1f).apply { rightMargin = if (cardIndex < columns - 1) dp(8) else 0 })
+            val preferred = childrenDailyPicks(index, 3)
+            val calendar = java.util.Calendar.getInstance()
+            val day = calendar.get(java.util.Calendar.YEAR).toLong() * 366 + calendar.get(java.util.Calendar.DAY_OF_YEAR)
+            val ordered = dailyChildrenPicks(section.titles, day, prefs.history().map(::historyTitle).toSet(), section.titles.size)
+            scope.launch {
+                val listed = withContext(Dispatchers.IO) {
+                    ordered.filter { ChildrenArtworkIndex.urls(applicationContext, it).isNotEmpty() }.toSet()
+                }
+                val candidates = (preferred.filter { it in childrenCovers || it in listed } + ordered.filter { it in childrenCovers || it in listed } + ordered).distinct()
+                for (title in candidates) {
+                    if (currentScreen != "children" || !row.isAttachedToWindow || row.childCount >= columns) break
+                    var cover = childrenCovers[title]
+                    if (cover == null) {
+                        val job = queueChildrenCover(title, width, height)
+                        if (job != null) kotlinx.coroutines.withTimeoutOrNull(9_000L) { job.join() }
+                        cover = childrenCovers[title]
+                    }
+                    if (cover == null) continue
+                    val result = awaitChildrenImage(cover, width, height)
+                    if (result?.bitmap == null) {
+                        if (result != null) invalidateChildrenCover(title, cover, childrenCoverSignature)
+                        continue
+                    }
+                    if (currentScreen != "children" || !row.isAttachedToWindow) break
+                    val cardIndex = row.childCount
+                    val card = childrenCard(width, height)
+                    bindChildrenCard(card, title, width, height)
+                    focusViews[title] = card
+                    row.addView(card, LinearLayout.LayoutParams(width, -2).apply {
+                        rightMargin = if (cardIndex < columns - 1) dp(8) else 0
+                    })
+                    if (firstCard == null) {
+                        firstCard = card
+                        if (isTvDevice && currentFocus == null) card.requestFocus()
+                    }
+                }
             }
             panel.addView(row)
             col.addView(panel, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(if (isTvDevice) 12 else 8) })
