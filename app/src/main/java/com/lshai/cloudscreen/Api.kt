@@ -108,6 +108,35 @@ class Api(baseUrl: String) {
     fun currentCookie(): String? = cookie
 
     /**
+     * 手动封面的全屋同步（可选能力，LibreTV 原生协议没有这两个接口）。
+     * 服务端实现约定：
+     *   GET  /api/custom-covers → {"covers": {"片名": "https://.../poster.jpg", ...}}
+     *   POST /api/custom-covers body {"covers": {...}} → 2xx 即视为成功
+     * 服务端没实现时请求会 404/失败，客户端静默降级为仅本机保存。
+     */
+    fun customCovers(): Map<String, String>? = runCatching {
+        val o = JSONObject(readBody(open("/api/custom-covers", readTimeoutMs = 8_000)))
+        val covers = o.optJSONObject("covers") ?: return null
+        val out = linkedMapOf<String, String>()
+        covers.keys().forEach { t ->
+            val u = covers.optString(t).trim()
+            if (t.isNotBlank() && u.startsWith("http")) out[t] = u
+        }
+        out
+    }.getOrNull()
+
+    fun saveCustomCovers(covers: Map<String, String>): Boolean = runCatching {
+        val conn = open("/api/custom-covers", readTimeoutMs = 8_000).apply {
+            requestMethod = "POST"
+            doOutput = true
+            setRequestProperty("Content-Type", "application/json")
+        }
+        val payload = JSONObject().put("covers", JSONObject(covers)).toString()
+        conn.outputStream.use { it.write(payload.toByteArray()) }
+        conn.responseCode in 200..299
+    }.getOrDefault(false)
+
+    /**
      * 打开连接。超时可按接口单独放宽：
      * /api/search 要串行打十几个采集站，20 秒是常态、30 秒以上也见过，
      * 之前统一 20 秒导致「搜到了但结果被腰斩」；/api/detail 同理。

@@ -6177,6 +6177,9 @@ class MainActivity : Activity() {
     private val childrenBadCovers = mutableMapOf<String, MutableSet<String>>()
     private var childrenPrefetchJob: Job? = null
     private var childrenCoverSignature = ""
+    /** 手动指定的封面（片名 → URL）：优先级高于自动解析，永远不会被覆盖 */
+    private var childrenPinnedCovers: Map<String, String> = emptyMap()
+    private var childrenPinSyncAt = 0L
     private var childrenSources: List<SourceConfig> = emptyList()
     private var childrenCacheWriteJob: Job? = null
     private var childrenPreloadedSignature = ""
@@ -6186,6 +6189,7 @@ class MainActivity : Activity() {
         val sources = prefs.sources().filter { it.enabled && !it.isAdult }
         val signature = stableDigest("cover-match-v4\n" + prefs.serverUrl + "\n" + sources.joinToString("\n") { it.url })
         childrenSources = sources
+        childrenPinnedCovers = prefs.pinnedChildrenCovers()
         if (signature == childrenCoverSignature) {
             val pending = childrenCoverWaiting.keys.any { it.startsWith("$signature:") }
             if (!pending && android.os.SystemClock.elapsedRealtime() - childrenLastPreloadAt >= 60_000L) {
@@ -6248,8 +6252,9 @@ class MainActivity : Activity() {
 
     private fun showChildrenCoverActions(title: String, image: ImageView, width: Int, height: Int) {
         AlertDialog.Builder(this).setTitle("《$title》封面")
-            .setItems(arrayOf("换一张封面", "重试封面加载")) { _, which ->
-                if (which == 1) { retryChildrenCover(title, image, width, height); return@setItems }
+            .setItems(arrayOf("从搜索结果选封面", "换一张封面", "重试封面加载")) { _, which ->
+                if (which == 0) { showChildrenCoverPicker(title, image, width, height); return@setItems }
+                if (which == 2) { retryChildrenCover(title, image, width, height); return@setItems }
                 val signature = childrenCoverSignature
                 val key = "$signature:$title"
                 if (childrenCoverWaiting.containsKey(key)) { toast("封面加载中，请稍后再换"); return@setItems }
@@ -6271,6 +6276,158 @@ class MainActivity : Activity() {
             }.setNegativeButton("取消", null).show()
     }
 
+    /**
+     * 从各片源的搜索结果里手动挑一张封面（长按卡片 → 从搜索结果选封面）。
+     * 与自动解析不同：这里把每个结果的海报连同片名一起列出来，由用户肉眼判断，
+     * 所以不按片名严格过滤（像《小羊肖恩》这种自动匹配不到的，人工一眼就能认出来）。
+     */
+    private fun showChildrenCoverPicker(title: String, image: ImageView, width: Int, height: Int) {
+        val frame = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        frame.setPadding(dp(16), dp(12), dp(16), dp(12))
+        val status = hintText("正在从启用的片源搜索《$title》…").apply { setPadding(0, 0, 0, dp(6)) }
+        frame.addView(status)
+        val grid = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        frame.addView(
+            ScrollView(this).apply { isVerticalScrollBarEnabled = false; addView(grid) },
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(380)),
+        )
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("为《$title》选封面")
+            .setView(frame)
+            .setNegativeButton("关闭", null)
+            .show()
+
+        val cellW = dp(104)
+        val cellH = dp(140)
+        val collected = linkedMapOf<String, String>()  // url → 展示片名
+        fun addCandidate(name: String, rawPic: String) {
+            val url = rawPic.trim().let { if (it.startsWith("//")) "https:$it" else it }
+            if (!url.startsWith("http")) return
+            collected.putIfAbsent(url, name.ifBlank { title })
+        }
+        fun flushGrid() {
+            if (!dialog.isShowing) return
+            grid.removeAllViews()
+            var row: LinearLayout? = null
+            collected.entries.forEachIndexed { idx, (url, name) ->
+                if (idx % 3 == 0) {
+                    row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                    grid.addView(row, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
+                }
+                val cell = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    gravity = Gravity.CENTER_HORIZONTAL
+                    isFocusable = true
+                    isFocusableInTouchMode = true
+                    setPadding(dp(4), dp(4), dp(4), dp(4))
+                    setOnClickListener {
+                        dialog.dismiss()
+                        applyPinnedChildrenCover(title, url, image, width, height)
+                    }
+                }
+                cell.addView(
+                    ImageView(this).apply {
+                        scaleType = ImageView.ScaleType.CENTER_CROP
+                        setBackgroundColor(0xFFE8EEEA.toInt())
+                        imageLoader.load(url, cellW, cellH) { bmp -> if (bmp != null) setImageBitmap(bmp) }
+                    },
+                    LinearLayout.LayoutParams(cellW, cellH),
+                )
+                cell.addView(
+                    TextView(this).apply {
+                        text = name
+                        setTextSize(10f)
+                        setTextColor(BRIGHTER_TEXT)
+                        maxLines = 1
+                        ellipsize = android.text.TextUtils.TruncateAt.END
+                        setPadding(0, dp(3), 0, 0)
+                    },
+                    LinearLayout.LayoutParams(cellW, -2),
+                )
+                row?.addView(cell, LinearLayout.LayoutParams(-2, -2).apply {
+                    if (idx % 3 < 2) rightMargin = dp(8)
+                })
+            }
+            status.text = if (collected.isEmpty()) {
+                "没有找到候选海报，可以稍后重试"
+            } else {
+                "共 ${collected.size} 张候选 · 点一张设为《$title》的封面"
+            }
+        }
+
+        scope.launch {
+            val sources = childrenSources.ifEmpty { prefs.sources().filter { it.enabled && !it.isAdult } }
+            ChildrenArtworkIndex.urls(applicationContext, title).forEach { addCandidate(title, it) }
+            val coverConnections = SearchConnections()
+            val deadline = android.os.SystemClock.elapsedRealtime() + 20_000L
+            val watchdog = scope.launch { delay(21_000); coverConnections.cancel() }
+            try {
+                val directSources = sources.filter { DirectCms.shouldTryDirect(it) }
+                if (directSources.isNotEmpty()) {
+                    val items = withContext(Dispatchers.IO) {
+                        directSources.map { src ->
+                            async { runCatching { coverConnections.run { DirectCms.search(src, title) } }.getOrDefault(emptyList()) }
+                        }.awaitAll()
+                    }.flatten()
+                    items.forEach { addCandidate(it.name, it.pic) }
+                    flushGrid()
+                }
+                for (batch in sources.chunked(4)) {
+                    if (collected.size >= 30 || coverConnections.isCancelled() ||
+                        android.os.SystemClock.elapsedRealtime() >= deadline || !dialog.isShowing) break
+                    val items = withContext(Dispatchers.IO) {
+                        batch.map { src ->
+                            async {
+                                runCatching { coverConnections.run { api.search(title, listOf(src), readTimeoutMs = 6_000).items } }
+                                    .getOrDefault(emptyList())
+                            }
+                        }.awaitAll()
+                    }.flatten()
+                    items.forEach { addCandidate(it.name, it.pic) }
+                    flushGrid()
+                }
+            } finally {
+                watchdog.cancel()
+                coverConnections.cancel()
+            }
+            flushGrid()
+        }
+    }
+
+    /** 应用手动选定的封面：本机立即生效并持久化，随后尽力推送服务端做全屋同步。 */
+    private fun applyPinnedChildrenCover(title: String, url: String, image: ImageView, width: Int, height: Int) {
+        prefs.setPinnedChildrenCovers(prefs.pinnedChildrenCovers().toMutableMap().apply { put(title, url) })
+        childrenPinnedCovers = prefs.pinnedChildrenCovers()
+        childrenCovers[title] = url
+        childrenCoverTried.add(title)
+        persistChildrenCovers(childrenCoverSignature)
+        bindChildrenCover(image, title, width, height)
+        val snapshot = prefs.pinnedChildrenCovers()
+        scope.launch {
+            val ok = withContext(Dispatchers.IO) { api.saveCustomCovers(snapshot) }
+            toast(if (ok) "封面已同步到服务器，全家设备可见" else "封面已保存在本机（服务端暂不支持同步）")
+        }
+    }
+
+    /** 拉取服务端的手动封面并合并（远端优先，家里别的设备设置的会覆盖进来）。不支持时静默跳过。 */
+    private fun syncChildrenPinnedCovers() {
+        if (android.os.SystemClock.elapsedRealtime() - childrenPinSyncAt < 300_000L) return
+        childrenPinSyncAt = android.os.SystemClock.elapsedRealtime()
+        scope.launch {
+            val remote = withContext(Dispatchers.IO) { runCatching { api.customCovers() }.getOrNull() } ?: return@launch
+            val local = prefs.pinnedChildrenCovers()
+            val merged = local + remote
+            if (merged == local) return@launch
+            prefs.setPinnedChildrenCovers(merged)
+            childrenPinnedCovers = merged
+            merged.forEach { (t, u) -> if (childrenCovers[t] == null) childrenCovers[t] = u }
+            persistChildrenCovers(childrenCoverSignature)
+            toast("已同步 ${merged.size - local.size} 条手动封面")
+            // 正停在儿童板块的话重建一次，让新封面立刻可见（焦点与滚动位置会自动恢复）
+            if (currentScreen == "children") showChildren()
+        }
+    }
+
     private fun setChildrenBitmap(image: ImageView, bitmap: android.graphics.Bitmap) {
         image.setBackgroundColor(0xFFD9F1E7.toInt())
         image.scaleType = ImageView.ScaleType.CENTER_CROP
@@ -6290,14 +6447,19 @@ class MainActivity : Activity() {
 
     private fun queueChildrenCover(title: String, width: Int, height: Int, image: ImageView? = null): Job? {
         val signature = childrenCoverSignature
-        val cached = childrenCovers[title]
+        val pinned = childrenPinnedCovers[title]
+        val cached = childrenCovers[title] ?: pinned
         if (cached != null) {
             if (image != null) imageLoader.load(cached, width, height, onCancelled = {
                 if (image.tag == title) updateChildrenCoverStatus(image, "可重试")
             }) { bmp ->
                 if (image.tag != title || signature != childrenCoverSignature) return@load
                 if (bmp != null) { setChildrenBitmap(image, bmp); updateChildrenCoverStatus(image, null) }
-                else {
+                else if (pinned != null && cached == pinned) {
+                    // 手动指定的封面失效：不自动换源重试（绝不能覆盖用户的选择），
+                    // 留「可重试」角标，长按卡片可以重新挑一张
+                    updateChildrenCoverStatus(image, "可重试")
+                } else {
                     invalidateChildrenCover(title, cached, signature)
                     queueChildrenCover(title, width, height, image)
                 }
@@ -6530,6 +6692,8 @@ class MainActivity : Activity() {
         ChildrenQuota.browse(quotaVisible)
         currentScreen = "children"
         prepareChildrenCovers()
+        // 尽力拉取家里其他设备手动指定的封面（服务端不支持时静默跳过）
+        syncChildrenPinnedCovers()
         val col = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(pagePad(40), dp(18), pagePad(40), dp(24))
@@ -6650,6 +6814,7 @@ class MainActivity : Activity() {
         if (ChildrenQuota.remaining(this) <= 0L) { showChildrenLocked(); return }
         val section = ChildrenCatalog.sections.getOrNull(index) ?: return
         prepareChildrenCovers()
+        syncChildrenPinnedCovers()
         if (childrenMoreFilterSection != index) {
             childrenMoreFilterSection = index
             childrenMoreFilter = 0

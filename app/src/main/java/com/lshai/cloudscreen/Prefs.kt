@@ -767,6 +767,31 @@ class Prefs(ctx: Context) {
         sp.edit().putString("children_cover_cache", raw).apply()
     }
 
+    /**
+     * 手动指定的封面（片名 → 图片 URL，通常从搜索结果里挑）。
+     * 与源签名无关、跨签名保留；自动解析永远不能覆盖它。
+     * 服务端若支持 /api/custom-covers，则全屋设备共享这份映射。
+     */
+    fun pinnedChildrenCovers(): Map<String, String> {
+        val raw = sp.getString("children_pinned_covers", "").orEmpty()
+        if (raw.isEmpty()) return emptyMap()
+        return try {
+            val o = JSONObject(raw)
+            val result = mutableMapOf<String, String>()
+            o.keys().forEach { t ->
+                val u = o.optString(t).trim()
+                if (t.isNotBlank() && u.startsWith("http")) result[t] = u
+            }
+            result
+        } catch (_: Exception) { emptyMap() }
+    }
+
+    fun setPinnedChildrenCovers(map: Map<String, String>) {
+        val items = JSONObject()
+        map.forEach { (t, u) -> if (t.isNotBlank() && u.startsWith("http")) items.put(t, u) }
+        sp.edit().putString("children_pinned_covers", items.toString()).apply()
+    }
+
     /** 首页右上角更新提示开关（关闭后只在设置页页脚显示红点） */
     var updateBannerEnabled: Boolean
         get() = sp.getBoolean("update_banner", true)
