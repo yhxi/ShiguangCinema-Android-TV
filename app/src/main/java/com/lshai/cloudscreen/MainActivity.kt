@@ -5012,7 +5012,7 @@ class MainActivity : Activity() {
             0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         col.addView(header)
         val quotaTitle = detail.info.title.ifEmpty { item.name }
-        col.addView(button(if (ChildrenQuota.isChild(this, quotaTitle)) "儿童计时 · 家长设置" else "加入儿童计时") {
+        col.addView(button(if (ChildrenQuota.isChild(this, quotaTitle)) "儿童计时管理" else "加入儿童计时") {
             if (ChildrenQuota.isChild(this, quotaTitle)) ChildrenQuota.parent(this) {} else addToChildrenQuota(quotaTitle)
         })
         if (compact) {
@@ -5723,7 +5723,7 @@ class MainActivity : Activity() {
         val title = h.seriesTitle.ifEmpty { seriesNameOf(h.title) }
         val tracked = ChildrenQuota.isChild(this, title)
         AlertDialog.Builder(this).setTitle(title)
-            .setItems(arrayOf(if (tracked) "儿童计时设置" else "加入儿童计时", "查看详情", "删除观看记录")) { _, which ->
+            .setItems(arrayOf(if (tracked) "儿童计时管理" else "加入儿童计时", "查看详情", "删除观看记录")) { _, which ->
                 when (which) {
                     1 -> {
                         childrenSearchOrigin = null
