@@ -5474,6 +5474,13 @@ class MainActivity : Activity() {
         setScreen(col)
         col.post { col.findFocus() ?: col.requestFocus() }
     }
+    /** Percentage is for this episode; unknown duration keeps the elapsed-time fallback. */
+    private fun historyProgressLabel(h: HistoryEntry): String {
+        if (h.durationMs <= 0L) return "已看 ${formatTime(h.positionMs.coerceAtLeast(0L))}"
+        val percent = ((h.positionMs.toDouble() / h.durationMs).coerceIn(0.0, 1.0) * 100).toInt()
+        return "已看 $percent%"
+    }
+
     private fun formatTime(ms: Long): String {
         val total = ms / 1000
         return "%d:%02d".format(total / 60, total % 60)
@@ -5870,8 +5877,7 @@ class MainActivity : Activity() {
             }, LinearLayout.LayoutParams(-1, -2))
             detail.addView(TextView(this).apply {
                 val number = Regex("第\\s*(\\d+)").find(h.title)?.groupValues?.getOrNull(1)
-                text = (if (number != null) "第 ${number} 集" else "已观看") +
-                    if (h.positionMs > 0) " · ${formatTime(h.positionMs)}" else ""
+                text = listOfNotNull(number?.let { "第 $it 集" }, historyProgressLabel(h)).joinToString(" · ")
                 setTextColor(BRIGHTER_TEXT)
                 setTextSize(if (isTvDevice) 13f else 11f)
                 maxLines = 1
@@ -5938,7 +5944,7 @@ class MainActivity : Activity() {
             title.setLines(2)
             title.ellipsize = android.text.TextUtils.TruncateAt.END
             val episode = Regex("第\\s*(\\d+)").find(h.title)?.groupValues?.getOrNull(1)
-            metadata.text = (if (episode != null) "第 $episode 集 · " else "已观看 · ") + formatTime(h.positionMs)
+            metadata.text = listOfNotNull(episode?.let { "第 $it 集" }, historyProgressLabel(h)).joinToString(" · ")
             homeHistoryCoverViews[h.playUrl] = Triple(poster, metrics[0], metrics[1])
             if (h.cover.isNotBlank()) updateHomeHistoryCover(h.playUrl, h.cover)
             val progress = android.widget.ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
