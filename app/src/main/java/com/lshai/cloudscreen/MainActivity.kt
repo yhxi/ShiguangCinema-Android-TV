@@ -1681,6 +1681,11 @@ class MainActivity : Activity() {
         if (requestCode == REQ_PLAYER) {
             if (resultCode == RESULT_OK && data?.getBooleanExtra(PlayerActivity.EXTRA_RETURN_TO_SOURCES, false) == true) {
                 showPlaybackSources(data)
+            } else {
+                childrenSearchOrigin = null
+                cancelJob("playbacksources")
+                refreshHomeAfterPlayback = false
+                showRecommend()
             }
             return
         }
@@ -5831,6 +5836,10 @@ class MainActivity : Activity() {
         }, LinearLayout.LayoutParams(0, -2, 1f))
         head.addView(button("全部记录") { showHistoryCards() })
         col.addView(head)
+        if (!isTvDevice) {
+            addMobileRecentPosters(col, recent)
+            return
+        }
         val row = LinearLayout(this).apply {
             orientation = if (isTvDevice) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL
             clipChildren = false
@@ -5951,6 +5960,45 @@ class MainActivity : Activity() {
             if (homeHistoryFirst == null) homeHistoryFirst = card
         }
         col.addView(row, LinearLayout.LayoutParams(-1, if (isTvDevice) height else -2))
+    }
+
+    /** Phone history follows the same poster grid as the recommendations below. */
+    private fun addMobileRecentPosters(col: LinearLayout, recent: List<HistoryEntry>) {
+        val metrics = recommendCellMetrics()
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        recent.forEachIndexed { index, h ->
+            val card = recommendCellView()
+            val poster = card.getChildAt(0) as ImageView
+            val title = card.getChildAt(1) as TextView
+            val metadata = card.getChildAt(2) as TextView
+            title.text = historyTitle(h)
+            title.setLines(2)
+            title.ellipsize = android.text.TextUtils.TruncateAt.END
+            val episode = Regex("第\\s*(\\d+)").find(h.title)?.groupValues?.getOrNull(1)
+            metadata.text = (if (episode != null) "第 $episode 集 · " else "已观看 · ") + formatTime(h.positionMs)
+            homeHistoryCoverViews[h.playUrl] = Triple(poster, metrics[0], metrics[1])
+            if (h.cover.isNotBlank()) updateHomeHistoryCover(h.playUrl, h.cover)
+            val progress = android.widget.ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+                max = 1000
+                progress = if (h.durationMs > 0) ((h.positionMs.toDouble() / h.durationMs).coerceIn(0.0, 1.0) * 1000).toInt() else 0
+                progressTintList = android.content.res.ColorStateList.valueOf(ACCENT)
+                progressBackgroundTintList = android.content.res.ColorStateList.valueOf(0xFFDDE7E2.toInt())
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            }
+            card.addView(progress, LinearLayout.LayoutParams(-1, dp(3)).apply { topMargin = dp(7) })
+            card.isClickable = true
+            card.isFocusable = true
+            card.contentDescription = "${historyTitle(h)}，${metadata.text}，点击继续播放，长按管理"
+            card.setOnClickListener { playFromHistory(h) }
+            card.setOnLongClickListener { confirmRemoveHistory(h); true }
+            row.addView(card, LinearLayout.LayoutParams(0, -2, 1f).apply {
+                if (index > 0) leftMargin = dp(12)
+            })
+            if (homeHistoryFirst == null) homeHistoryFirst = card
+        }
+        // Keep a single record the same width as a recommendation poster.
+        if (recent.size == 1) row.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f).apply { leftMargin = dp(12) })
+        col.addView(row, LinearLayout.LayoutParams(-1, -2))
     }
 
     private fun addContinueWatching(col: LinearLayout) {

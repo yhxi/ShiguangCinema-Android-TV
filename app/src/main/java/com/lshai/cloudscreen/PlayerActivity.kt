@@ -151,7 +151,6 @@ class PlayerActivity : Activity() {
     private lateinit var speedActionBtn: TextView
     /** 手机底部一级菜单里的倍速按钮（和遥控器操作栏那个共用一份标签） */
     private var speedBarBtn: TextView? = null
-    private var qualityBarBtn: TextView? = null
     private var introBarBtn: TextView? = null
     private var outroBarBtn: TextView? = null
     /** 暂停时浮在画面正中的播放按钮：点中间暂停之后，继续播就在原地 */
@@ -771,16 +770,7 @@ class PlayerActivity : Activity() {
             speedBarBtn = actionButton(speedButtonLabel()) { showSpeedMenu() }
             addTouchAction(speedBarBtn!!)
             addTouchAction(actionButton("选集") { showEpisodePicker() })
-            qualityBarBtn = actionButton("自动") { showQualityMenu() }.apply {
-                setTextSize(12f)
-                setPadding(dp(2), dp(3), dp(2), dp(3))
-                maxLines = 1
-                gravity = Gravity.CENTER
-                contentDescription = "选择清晰度"
-            }
-            touchBar.addView(qualityBarBtn!!, LinearLayout.LayoutParams(dp(78), dp(43)).apply {
-                rightMargin = dp(2)
-            })
+            addTouchAction(actionButton("换源") { backToSources() })
             addTouchAction(fullscreenButton())
             addTouchAction(actionButton("更多") { showMoreMenu() })
             updateSkipButtons()
@@ -810,7 +800,8 @@ class PlayerActivity : Activity() {
         actionBar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         // 选集放在第一位：按下键 → 焦点就落在这里，两下就能跳到任意一集
         actionBar.addView(actionButton("选集") { showEpisodePicker() })
-        actionBar.addView(actionButton("清晰度") { showQualityMenu() })
+        actionBar.addView(actionButton("换源") { backToSources() })
+        actionBar.addView(actionButton("更多") { showMoreMenu() })
         actionBar.addView(actionButton("跳过") { showSkipMarks() })
         actionBar.addView(actionButton("上集") {
             if (player?.hasPreviousMediaItem() == true) {
@@ -848,11 +839,7 @@ class PlayerActivity : Activity() {
         actionBar.addView(fullscreenButton())
         actionBar.addView(actionButton("锁屏") { lockScreen() })
         actionBar.addView(actionButton("音轨/字幕") { showTrackMenu() })
-        // 开启后台播放后，返回键只是退到后台；要真正停下来用这个
-        actionBar.addView(actionButton("退出") {
-            persistProgress()
-            finish()
-        })
+        actionBar.addView(actionButton("退出") { exitToHome() })
 
         actionScroll = HorizontalScrollView(this).apply {
             isFocusable = false
@@ -958,8 +945,7 @@ class PlayerActivity : Activity() {
                         currentIndex = exo.currentMediaItemIndex
                         currentVideoWidth = 0
                         currentVideoHeight = 0
-                        updateQualityButton()
-                        hasError = false
+                                        hasError = false
                         // 换集之后重新给这一集一次「原地重试」的机会
                         autoRetried = false
                         baseText = labelFor(currentIndex)
@@ -1056,9 +1042,9 @@ class PlayerActivity : Activity() {
                             return
                         }
                         val msg = if (decodeFail) {
-                            "解码失败：这个片源可能是 H.265 / 不支持的编码 · 按返回键换源"
+                            "解码失败：这个片源可能是 H.265 / 不支持的编码 · 点击底部换源"
                         } else {
-                            "播放失败：${error.errorCodeName} · 按返回键换源"
+                            "播放失败：${error.errorCodeName} · 点击底部换源"
                         }
                         hasError = true
                         baseText = msg
@@ -1075,12 +1061,10 @@ class PlayerActivity : Activity() {
                         currentVideoWidth = videoSize.width
                         currentVideoHeight = videoSize.height
                         applyOrientationForVideo(videoSize.width, videoSize.height)
-                        updateQualityButton()
-                    }
+                                    }
 
                     override fun onTracksChanged(tracks: Tracks) {
-                        updateQualityButton()
-                    }
+                                    }
                 }).also { activityPlayerListener = it })
 
                 if (adoptedPlayer == null) {
@@ -1511,20 +1495,15 @@ class PlayerActivity : Activity() {
             timeText.text = "--:--"
         }
         updatePlayPauseIcon()
-        updateQualityButton()
     }
 
     /** 显示当前实际画质；只有片源提供的轨道才会出现在选择菜单。 */
-    private fun updateQualityButton() {
-        val button = qualityBarBtn ?: return
+    private fun currentQualityLabel(): String {
         val format = selectedVideoFormat()
         val width = currentVideoWidth.takeIf { it > 0 } ?: format?.width ?: -1
         val height = currentVideoHeight.takeIf { it > 0 } ?: format?.height ?: -1
-        val actual = if (width > 0 && height > 0) qualityLabel(width, height) else "清晰度未知"
-        val firstLine = if (selectedQualityLabel == null) "自动·${if (actual == "清晰度未知") "未知" else actual}"
-            else if (actual == "清晰度未知") selectedQualityLabel!! else actual
-        if (button.text.toString() != firstLine) button.text = firstLine
-        button.contentDescription = "已选${selectedQualityLabel ?: "自动"}，当前$actual，点击选择清晰度"
+        val actual = if (width > 0 && height > 0) qualityLabel(width, height) else "未知"
+        return if (selectedQualityLabel == null) "自动 · $actual" else if (actual == "未知") selectedQualityLabel!! else actual
     }
 
     /** 当前实际输出尺寸优先匹配到已选视频轨道。 */
@@ -1598,8 +1577,7 @@ class PlayerActivity : Activity() {
                 }
                 p.trackSelectionParameters = parameters.build()
                 dialog.dismiss()
-                updateQualityButton()
-                showProgress()
+                        showProgress()
             }
             .setNegativeButton("关闭", null)
             .show()
@@ -1798,15 +1776,13 @@ class PlayerActivity : Activity() {
             if (orientationLocked) "方向：已锁定（点击解锁）" else "方向：自动旋转（点击锁定）",
             "画中画（缩成小窗继续播）",
             subtitleLabel(),
+            "清晰度：${currentQualityLabel()}",
         )
         android.app.AlertDialog.Builder(this)
             .setTitle("更多操作")
             .setItems(items) { _, which ->
                 when (which) {
-                    0 -> {
-                        persistProgress()
-                        finish()
-                    }
+                    0 -> exitToHome()
                     1 -> {
                         player?.let {
                             it.seekTo(currentIndex, it.currentPosition)
@@ -1838,6 +1814,7 @@ class PlayerActivity : Activity() {
                     10 -> toggleOrientationLock()
                     11 -> enterPip()
                     12 -> showSubtitleMenu()
+                    13 -> showQualityMenu()
                 }
             }
             .setNegativeButton("关闭", null)
@@ -3697,16 +3674,24 @@ class PlayerActivity : Activity() {
             if (isTvDevice) unlockScreen() else lockHint()
             return
         }
-        backToSources()
+        exitToHome()
+    }
+
+    private fun exitToHome() {
+        if (isFinishing || isDestroyed) return
+        player?.pause()
+        persistProgress()
+        setResult(RESULT_CANCELED)
+        finish()
     }
 
     /**
      * 带着「回到来源选择」的结果关掉播放页。
-     * 用户按返回、以及某个源连续失败两次，走的都是这里 —— 后者把「按返回键换源」
-     * 从一句提示变成自动动作，用户不用自己再按一次。
+     * 只有显式换源或片源恢复流程才使用这里；普通返回直接回首页。
      */
     private fun backToSources() {
         if (isFinishing || isDestroyed) return
+        player?.pause()
         persistProgress()
         setResult(RESULT_OK, Intent().apply {
             putExtra(EXTRA_RETURN_TO_SOURCES, true)
