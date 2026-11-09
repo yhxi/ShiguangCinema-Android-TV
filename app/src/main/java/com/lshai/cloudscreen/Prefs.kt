@@ -341,6 +341,10 @@ class Prefs(ctx: Context) {
                 dropped = true
                 continue
             }
+            if (kept.size >= 20) {
+                dropped = true
+                continue
+            }
             kept.add(e)
         }
         if (dropped) writeHistory(kept)
@@ -401,7 +405,7 @@ class Prefs(ctx: Context) {
      * 「最近观看」会变成同一部剧的好几张卡（海贼王 1134 / 1133 / 1132 并排）。
      * 现在同一部剧只保留最近播放的那一集 —— 「最近观看」的语义本来就是「接着看」。
      * 想回看更早的集，从详情页的选集面板进。
-     * 最近观看排最前，最多 40 条。
+     * 最近观看排最前，最多 20 条。
      */
     fun upsertHistory(entry: HistoryEntry) = synchronized(playbackLock) {
         val all = history()
@@ -428,13 +432,13 @@ class Prefs(ctx: Context) {
             it.playUrl == merged.playUrl || (key.isNotEmpty() && seriesKeyOf(it) == key)
         }.toMutableList()
         list.add(0, merged)
-        while (list.size > 40) list.removeAt(list.size - 1)
+        while (list.size > 20) list.removeAt(list.size - 1)
         writeHistory(list)
     }
 
     private fun writeHistory(list: List<HistoryEntry>) {
         val arr = JSONArray()
-        list.forEach { e ->
+        list.take(20).forEach { e ->
             arr.put(historyJson(e))
         }
         sp.edit().putString("history", arr.toString()).apply()
@@ -887,7 +891,7 @@ class Prefs(ctx: Context) {
         if (idx < 0) return@synchronized
         list[idx] = list[idx].copy(cover = cover)
         val arr = JSONArray()
-        list.forEach { e ->
+        list.take(20).forEach { e ->
             arr.put(historyJson(e))
         }
         sp.edit().putString("history", arr.toString()).apply()

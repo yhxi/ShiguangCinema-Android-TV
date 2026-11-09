@@ -5371,18 +5371,7 @@ class MainActivity : Activity() {
             setPadding(pagePad(48), dp(24), pagePad(48), dp(20))
         }
         col.addView(topBar())
-        col.addView(titleText("继续观看  ·  ${items.size} 条", 20f))
-
-        val bar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        bar.addView(button("返回") { showRecommend() })
-        bar.addView(
-            button("清空历史") {
-                prefs.clearHistory()
-                toast("已清空观看历史")
-                showHistory()
-            },
-        )
-        col.addView(hScroll(bar))
+        col.addView(titleText("全部记录", 20f))
 
         if (items.isEmpty()) {
             col.addView(hintText("还没有观看记录。播过的片子会出现在这里，方便接着看。"))
@@ -5434,13 +5423,7 @@ class MainActivity : Activity() {
             setPadding(pagePad(40), dp(20), pagePad(40), dp(16))
         }
         col.addView(topBar())
-        val bar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        bar.addView(titleText("继续观看 · ${items2.size} 条", 18f))
-        bar.addView(button("返回推荐") { showRecommend() })
-        if (items2.isNotEmpty()) {
-            bar.addView(button("清空历史") { prefs.clearHistory(); toast("已清空"); showHistoryCards() })
-        }
-        col.addView(hScroll(bar))
+        col.addView(titleText("全部记录", 18f))
 
         if (items2.isEmpty()) {
             col.addView(hintText("还没有观看记录。播过的片子会出现在这里，方便接着看。"))
@@ -5493,6 +5476,14 @@ class MainActivity : Activity() {
                         if (poster.tag == h.cover) poster.setImageBitmap(bmp)
                     }
                     cell.setOnClickListener { playFromHistory(h) }
+                    // The cell consumes touch events, so GridView's item long-click
+                    // listener alone does not receive a long press on this row.
+                    cell.setOnLongClickListener { confirmRemoveHistory(h); true }
+                    cell.setOnKeyListener { _, code, event ->
+                        if (code == KeyEvent.KEYCODE_MENU && event.action == KeyEvent.ACTION_DOWN) {
+                            confirmRemoveHistory(h); true
+                        } else false
+                    }
                     return cell
                 }
             }
@@ -5502,6 +5493,12 @@ class MainActivity : Activity() {
             grid.setOnItemLongClickListener { _, _, pos, _ ->
                 confirmRemoveHistory(items2[pos])
                 true
+            }
+            grid.setOnKeyListener { _, code, event ->
+                if (code == KeyEvent.KEYCODE_MENU && event.action == KeyEvent.ACTION_DOWN) {
+                    items2.getOrNull(grid.selectedItemPosition)?.let { confirmRemoveHistory(it) }
+                    true
+                } else false
             }
             col.addView(grid, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
