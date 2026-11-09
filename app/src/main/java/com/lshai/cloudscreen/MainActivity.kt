@@ -5836,8 +5836,9 @@ class MainActivity : Activity() {
             clipChildren = false
             clipToPadding = false
         }
-        val height = dp(if (isTvDevice) 140 else (112 * resources.configuration.fontScale.coerceIn(1f, 1.5f)).toInt())
-        val coverWidth = dp(if (isTvDevice) 78 else 52)
+        val height = dp(if (isTvDevice) 144 else (126 * resources.configuration.fontScale.coerceIn(1f, 1.5f)).toInt())
+        val coverWidth = dp(if (isTvDevice) 72 else 48)
+        val coverHeight = coverWidth * 3 / 2
         recent.forEachIndexed { index, h ->
             val card = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
@@ -5851,8 +5852,16 @@ class MainActivity : Activity() {
                         confirmRemoveHistory(h); true
                     } else false
                 }
-                setPadding(dp(4), dp(4), dp(4), dp(4))
-                applyFocusStyle(this, PANEL, focusScale = 1f)
+                setPadding(dp(4), dp(8), dp(4), dp(8))
+                // Borderless at rest; a soft highlight keeps TV focus visible.
+                background = android.graphics.drawable.StateListDrawable().apply {
+                    fun surface(color: Int) = GradientDrawable().apply {
+                        setColor(color); cornerRadius = dp(12).toFloat()
+                    }
+                    addState(intArrayOf(android.R.attr.state_pressed), surface(0xFFD5E7DF.toInt()))
+                    addState(intArrayOf(android.R.attr.state_focused), surface(0xFFE2EDE5.toInt()))
+                    addState(intArrayOf(), surface(Color.TRANSPARENT))
+                }
             }
             val poster = FrameLayout(this).apply {
                 background = GradientDrawable().apply {
@@ -5869,25 +5878,26 @@ class MainActivity : Activity() {
             }, FrameLayout.LayoutParams(-1, -1))
             val image = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
             poster.addView(image, FrameLayout.LayoutParams(-1, -1))
-            homeHistoryCoverViews[h.playUrl] = Triple(image, coverWidth, height)
+            homeHistoryCoverViews[h.playUrl] = Triple(image, coverWidth, coverHeight)
             if (h.cover.isNotBlank()) updateHomeHistoryCover(h.playUrl, h.cover)
-            card.addView(poster, LinearLayout.LayoutParams(coverWidth, -1))
+            card.addView(poster, LinearLayout.LayoutParams(coverWidth, coverHeight).apply { gravity = Gravity.CENTER_VERTICAL })
             val detail = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
-                gravity = Gravity.CENTER_VERTICAL
-                setPadding(dp(if (isTvDevice) 12 else 7), dp(4), dp(3), dp(4))
+                gravity = Gravity.TOP
+                setPadding(dp(if (isTvDevice) 12 else 9), dp(2), dp(3), dp(2))
             }
             detail.addView(TextView(this).apply {
                 text = historyTitle(h)
                 setTextColor(INK)
-                setTextSize(if (isTvDevice) 18f else 14f)
+                setTextSize(if (isTvDevice) 17f else 13f)
                 setTypeface(null, Typeface.BOLD)
-                maxLines = 2
+                setLines(2)
+                includeFontPadding = false
                 ellipsize = android.text.TextUtils.TruncateAt.END
-            })
+            }, LinearLayout.LayoutParams(-1, 0, 1f))
             detail.addView(TextView(this).apply {
                 val number = Regex("第\\s*(\\d+)").find(h.title)?.groupValues?.getOrNull(1)
-                text = (if (number != null) "第 ${number} 集" else "继续播放") +
+                text = (if (number != null) "第 ${number} 集" else "已观看") +
                     if (h.positionMs > 0) " · ${formatTime(h.positionMs)}" else ""
                 setTextColor(BRIGHTER_TEXT)
                 setTextSize(if (isTvDevice) 13f else 11f)
@@ -5905,16 +5915,16 @@ class MainActivity : Activity() {
             track.post { track.getChildAt(0).layoutParams = FrameLayout.LayoutParams((track.width * fraction).toInt(), dp(4)) }
             detail.addView(track, LinearLayout.LayoutParams(-1, dp(4)))
             detail.addView(TextView(this).apply {
-                text = "▶ 继续播放"
+                text = "继续播放  ›"
                 setTextColor(ACCENT)
-                setTextSize(if (isTvDevice) 14f else 11f)
+                setTextSize(if (isTvDevice) 13f else 11f)
                 setTypeface(null, Typeface.BOLD)
                 maxLines = 1
                 setPadding(0, dp(7), 0, 0)
             })
             card.addView(detail, LinearLayout.LayoutParams(0, -1, 1f))
             row.addView(card, LinearLayout.LayoutParams(0, height, 1f).apply {
-                if (index > 0) leftMargin = dp(if (isTvDevice) 10 else 6)
+                if (index > 0) leftMargin = dp(if (isTvDevice) 20 else 12)
             })
             if (homeHistoryFirst == null) homeHistoryFirst = card
         }
@@ -6073,16 +6083,15 @@ class MainActivity : Activity() {
             setOnClickListener { onClick() }
             // 图标自绘（HomeIconView）：用字体里的 ▷ ⌕ ⚙ 这些符号，各家字体大小粗细不一，
             // 真机上「搜索」「设置」会明显比别人小一圈，看着像没渲染出来
-            val selected = kind == "tv"
             val iconSize = dp(if (isTvDevice) 34 else 25)
             val icon = HomeIconView(this@MainActivity, kind).apply {
-                tintColor = if (selected) Color.WHITE else INK
+                tintColor = INK
             }
             addView(icon, LinearLayout.LayoutParams(iconSize, iconSize))
             val caption = TextView(this@MainActivity).apply {
                 text = label
                 gravity = Gravity.CENTER
-                setTextColor(if (selected) Color.WHITE else INK)
+                setTextColor(INK)
                 setTextSize(if (isTvDevice) 17f else 12f)
                 includeFontPadding = false
                 isSingleLine = true
@@ -6090,10 +6099,10 @@ class MainActivity : Activity() {
                 setPadding(0, dp(4), 0, 0)
             }
             addView(caption, LinearLayout.LayoutParams(-1, -2))
-            applyFocusStyle(this, if (selected) ACCENT else PANEL,
+            applyFocusStyle(this, PANEL,
                 onFocusChanged = { focused ->
-                    icon.tintColor = if (focused || selected) Color.WHITE else INK
-                    caption.setTextColor(if (focused || selected) Color.WHITE else INK)
+                    icon.tintColor = if (focused) Color.WHITE else INK
+                    caption.setTextColor(if (focused) Color.WHITE else INK)
                     if (focused) background = GradientDrawable().apply {
                         setColor(ACCENT)
                         cornerRadius = dp(14).toFloat()
