@@ -5832,12 +5832,12 @@ class MainActivity : Activity() {
         head.addView(button("全部记录") { showHistoryCards() })
         col.addView(head)
         val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
+            orientation = if (isTvDevice) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL
             clipChildren = false
             clipToPadding = false
         }
-        val height = dp(if (isTvDevice) 144 else (126 * resources.configuration.fontScale.coerceIn(1f, 1.5f)).toInt())
-        val coverWidth = dp(if (isTvDevice) 72 else 48)
+        val height = dp((144 * resources.configuration.fontScale.coerceIn(1f, 1.5f)).toInt())
+        val coverWidth = dp(if (isTvDevice) 80 else 50)
         val coverHeight = coverWidth * 3 / 2
         recent.forEachIndexed { index, h ->
             val card = LinearLayout(this).apply {
@@ -5852,14 +5852,15 @@ class MainActivity : Activity() {
                         confirmRemoveHistory(h); true
                     } else false
                 }
-                setPadding(dp(4), dp(8), dp(4), dp(8))
+                setPadding(dp(if (isTvDevice) 10 else 4), dp(8), dp(if (isTvDevice) 10 else 4), dp(8))
                 // Borderless at rest; a soft highlight keeps TV focus visible.
                 background = android.graphics.drawable.StateListDrawable().apply {
-                    fun surface(color: Int) = GradientDrawable().apply {
+                    fun surface(color: Int, focus: Boolean = false) = GradientDrawable().apply {
                         setColor(color); cornerRadius = dp(12).toFloat()
+                        if (focus && isTvDevice) setStroke(dp(2), ACCENT)
                     }
                     addState(intArrayOf(android.R.attr.state_pressed), surface(0xFFD5E7DF.toInt()))
-                    addState(intArrayOf(android.R.attr.state_focused), surface(0xFFE2EDE5.toInt()))
+                    addState(intArrayOf(android.R.attr.state_focused), surface(0xFFE2EDE5.toInt(), true))
                     addState(intArrayOf(), surface(Color.TRANSPARENT))
                 }
             }
@@ -5883,18 +5884,18 @@ class MainActivity : Activity() {
             card.addView(poster, LinearLayout.LayoutParams(coverWidth, coverHeight).apply { gravity = Gravity.CENTER_VERTICAL })
             val detail = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
-                gravity = Gravity.TOP
-                setPadding(dp(if (isTvDevice) 12 else 9), dp(2), dp(3), dp(2))
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(12), dp(2), dp(3), dp(2))
             }
             detail.addView(TextView(this).apply {
                 text = historyTitle(h)
                 setTextColor(INK)
-                setTextSize(if (isTvDevice) 17f else 13f)
+                setTextSize(if (isTvDevice) 18f else 15f)
                 setTypeface(null, Typeface.BOLD)
-                setLines(2)
+                if (isTvDevice) setLines(2) else maxLines = 2
                 includeFontPadding = false
                 ellipsize = android.text.TextUtils.TruncateAt.END
-            }, LinearLayout.LayoutParams(-1, 0, 1f))
+            }, LinearLayout.LayoutParams(-1, -2))
             detail.addView(TextView(this).apply {
                 val number = Regex("第\\s*(\\d+)").find(h.title)?.groupValues?.getOrNull(1)
                 text = (if (number != null) "第 ${number} 集" else "已观看") +
@@ -5914,21 +5915,42 @@ class MainActivity : Activity() {
             }, FrameLayout.LayoutParams(0, dp(4)))
             track.post { track.getChildAt(0).layoutParams = FrameLayout.LayoutParams((track.width * fraction).toInt(), dp(4)) }
             detail.addView(track, LinearLayout.LayoutParams(-1, dp(4)))
-            detail.addView(TextView(this).apply {
+            if (isTvDevice) detail.addView(TextView(this).apply {
                 text = "继续播放  ›"
                 setTextColor(ACCENT)
-                setTextSize(if (isTvDevice) 13f else 11f)
+                setTextSize(if (isTvDevice) 14f else 11f)
                 setTypeface(null, Typeface.BOLD)
                 maxLines = 1
                 setPadding(0, dp(7), 0, 0)
             })
-            card.addView(detail, LinearLayout.LayoutParams(0, -1, 1f))
-            row.addView(card, LinearLayout.LayoutParams(0, height, 1f).apply {
-                if (index > 0) leftMargin = dp(if (isTvDevice) 20 else 12)
+            card.addView(detail, LinearLayout.LayoutParams(0, -2, 1f))
+            card.contentDescription = "${historyTitle(h)}，继续播放，长按管理"
+            if (!isTvDevice) {
+                card.addView(TextView(this).apply {
+                    text = "▶"
+                    gravity = Gravity.CENTER
+                    setTextSize(17f)
+                    setTextColor(ACCENT)
+                    includeFontPadding = false
+                    background = GradientDrawable().apply {
+                        shape = GradientDrawable.OVAL
+                        setColor(0xFFE0ECE4.toInt())
+                    }
+                    importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+                }, LinearLayout.LayoutParams(dp(40), dp(40)).apply {
+                    leftMargin = dp(16)
+                    rightMargin = dp(4)
+                    gravity = Gravity.CENTER_VERTICAL
+                })
+            }
+            row.addView(card, if (isTvDevice) LinearLayout.LayoutParams(0, height, 1f).apply {
+                if (index > 0) leftMargin = dp(12)
+            } else LinearLayout.LayoutParams(-1, -2).apply {
+                if (index > 0) topMargin = dp(6)
             })
             if (homeHistoryFirst == null) homeHistoryFirst = card
         }
-        col.addView(row, LinearLayout.LayoutParams(-1, height))
+        col.addView(row, LinearLayout.LayoutParams(-1, if (isTvDevice) height else -2))
     }
 
     private fun addContinueWatching(col: LinearLayout) {
