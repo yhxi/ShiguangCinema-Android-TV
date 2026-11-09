@@ -5011,6 +5011,10 @@ class MainActivity : Activity() {
         header.addView(info, LinearLayout.LayoutParams(
             0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         col.addView(header)
+        val quotaTitle = detail.info.title.ifEmpty { item.name }
+        col.addView(button(if (ChildrenQuota.isChild(this, quotaTitle)) "儿童计时 · 家长设置" else "加入儿童计时") {
+            if (ChildrenQuota.isChild(this, quotaTitle)) ChildrenQuota.parent(this) {} else addToChildrenQuota(quotaTitle)
+        })
         if (compact) {
             if (detail.info.actor.isNotEmpty()) addPreview("主演：${detail.info.actor}", "主演", 1, extraInfo)
             if (detail.info.desc.isNotEmpty()) addPreview(stripHtml(detail.info.desc), "简介", 1, extraInfo)
@@ -5242,7 +5246,7 @@ class MainActivity : Activity() {
             putExtra(PlayerActivity.EXTRA_VOD_ID, vodId)
             putExtra(PlayerActivity.EXTRA_SOURCE_URL, sourceUrl)
             putExtra(PlayerActivity.EXTRA_SOURCE_NAME, sourceName)
-            if (currentScreen == "children" || currentScreen == "children_more" || childrenSearchOrigin != null) {
+            if (child) {
                 putExtra(PlayerActivity.EXTRA_CHILD_TIMER, prefs.childrenTimerMinutes)
             }
         }, REQ_PLAYER)
@@ -5383,7 +5387,7 @@ class MainActivity : Activity() {
         if (items.isEmpty()) {
             col.addView(hintText("还没有观看记录。播过的片子会出现在这里，方便接着看。"))
         } else {
-            col.addView(hintText("选中即从上次位置继续播放；长按（或按菜单键）可删除单条。"))
+            col.addView(hintText("选中即从上次位置继续播放 · 长按可查看详情、加入儿童计时或删除。"))
             val listView = newList()
             bindList(listView,
                 items.map { "${it.title}    ${formatTime(it.positionMs)} / ${formatTime(it.durationMs)}" },
@@ -5393,9 +5397,7 @@ class MainActivity : Activity() {
                 },
             )
             listView.setOnItemLongClickListener { _, _, pos, _ ->
-                prefs.removeHistory(items[pos].playUrl)
-                toast("已删除该条")
-                showHistory()
+                confirmRemoveHistory(items[pos])
                 true
             }
             col.addView(listView, LinearLayout.LayoutParams(
@@ -5443,7 +5445,7 @@ class MainActivity : Activity() {
         if (items2.isEmpty()) {
             col.addView(hintText("还没有观看记录。播过的片子会出现在这里，方便接着看。"))
         } else {
-            col.addView(hintText("选中即从上次位置继续播放"))
+            col.addView(hintText("选中即从上次位置继续播放 · 长按可查看详情、加入儿童计时或删除"))
             val grid = newGrid().apply {
                 numColumns = if (compact) 1 else 3
                 horizontalSpacing = dp(12)
@@ -5495,12 +5497,10 @@ class MainActivity : Activity() {
                 }
             }
             grid.setOnItemClickListener { _, _, pos, _ ->
-                items2.getOrNull(pos)?.let { play(it.playUrl, it.title) }
+                items2.getOrNull(pos)?.let { playFromHistory(it) }
             }
             grid.setOnItemLongClickListener { _, _, pos, _ ->
-                prefs.removeHistory(items2[pos].playUrl)
-                toast("已删除该条")
-                showHistoryCards()
+                confirmRemoveHistory(items2[pos])
                 true
             }
             col.addView(grid, LinearLayout.LayoutParams(
@@ -5720,6 +5720,30 @@ class MainActivity : Activity() {
 
     /** 删一条观看记录（只删记录，不动收藏/片源） */
     private fun confirmRemoveHistory(h: HistoryEntry) {
+        val title = h.seriesTitle.ifEmpty { seriesNameOf(h.title) }
+        val tracked = ChildrenQuota.isChild(this, title)
+        AlertDialog.Builder(this).setTitle(title)
+            .setItems(arrayOf(if (tracked) "儿童计时设置" else "加入儿童计时", "查看详情", "删除观看记录")) { _, which ->
+                when (which) {
+                    1 -> {
+                        childrenSearchOrigin = null
+                        if (h.vodId.isBlank() || h.sourceUrl.isBlank()) doSearch(title)
+                        else openDetail(SearchItem(h.sourceName, h.vodId, title, h.cover, "", "", "", h.sourceUrl))
+                    }
+                    0 -> if (tracked) ChildrenQuota.parent(this) {} else addToChildrenQuota(title)
+                    2 -> removeHistoryDialog(h)
+                }
+            }.show()
+    }
+
+    private fun addToChildrenQuota(title: String) {
+        AlertDialog.Builder(this).setTitle("加入儿童计时")
+            .setMessage("《$title》以后从历史记录、搜索等入口播放，都会计入当天儿童总时长，并受每日上限限制。设置保存在本机。")
+            .setPositiveButton("加入") { _, _ -> ChildrenQuota.mark(this, title); toast("已加入儿童计时") }
+            .setNegativeButton("取消", null).show()
+    }
+
+    private fun removeHistoryDialog(h: HistoryEntry) {
         AlertDialog.Builder(this)
             .setTitle("删除这条观看记录？")
             .setMessage(historyTitle(h) + "  ·  " + h.title.substringAfter(" · ", ""))

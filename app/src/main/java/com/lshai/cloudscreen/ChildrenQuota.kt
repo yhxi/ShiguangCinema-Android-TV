@@ -103,12 +103,12 @@ internal object ChildrenQuota {
     }
     fun isChild(context: Context, title: String): Boolean {
         init(context)
-        val key = normalizeSeries(title.substringBefore(" · 第"))
-        return key.isNotEmpty() && (key in catalogKeys || key in store.getStringSet("titles", emptySet()).orEmpty())
+        val key = childQuotaKey(title)
+        return key.isNotEmpty() && matchesChildQuotaTitle(title, catalogKeys + store.getStringSet("titles", emptySet()).orEmpty())
     }
     fun mark(context: Context, title: String) {
         init(context)
-        val key = normalizeSeries(title.substringBefore(" · 第"))
+        val key = childQuotaKey(title)
         if (key.isEmpty()) return
         val titles = store.getStringSet("titles", emptySet()).orEmpty().toMutableSet()
         if (titles.add(key)) store.edit().putStringSet("titles", titles).apply()

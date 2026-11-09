@@ -36,8 +36,8 @@ android {
         // 23 = Android 6.0：Media3 的下限之上，老盒子都能装
         minSdk = 23
         targetSdk = 37
-        versionCode = 65
-        versionName = "1.3.6"
+        versionCode = 66
+        versionName = "1.3.7"
     }
 
     signingConfigs {
