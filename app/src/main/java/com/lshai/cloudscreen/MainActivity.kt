@@ -1470,7 +1470,7 @@ class MainActivity : Activity() {
     }
 
     /**
-     * 内置默认片源：直接用 [BuiltInSources] 里固化的探活结果（2026-10-23 实测）。
+     * 内置默认片源：直接用 [BuiltInSources] 里固化的清单（2026-11-09 补充至 20 个）。
      * 不再去拉 qist 的 TVBox 配置 —— 那样慢，还会带入一堆没验证过的死源。
      */
     private fun loadBuiltInDefaultSources(): List<SourceConfig> = BuiltInSources.ALL
@@ -2504,43 +2504,6 @@ class MainActivity : Activity() {
         col.addView(hintText("让观影体验保持顺手、稳定。"))
         col.addView(button("儿童每日固定 ${ChildrenQuota.dailyMinutes(this)} 分钟 · 设置 / 今天加时") { ChildrenQuota.parent(this) { showSetupCompact() } })
 
-        val status = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(17), dp(20), dp(17))
-            background = GradientDrawable(
-                GradientDrawable.Orientation.TL_BR,
-                intArrayOf(0xFF0F766E.toInt(), 0xFF174E48.toInt()),
-            ).apply { cornerRadius = dp(20).toFloat() }
-            isFocusable = true
-            isClickable = true
-            setOnClickListener { showServerSettings() }
-        }
-        status.addView(TextView(this).apply {
-            text = "●  服务端已连接"
-            setTextColor(0xFFD7FFF0.toInt())
-            setTextSize(13f)
-            setTypeface(null, Typeface.BOLD)
-        })
-        status.addView(TextView(this).apply {
-            // 匹配到预设服务端时只显示名字（如 tvoracle），不暴露网址
-            text = ServerPresets.ALL
-                .firstOrNull { it.url.trimEnd('/') == prefs.serverUrl.trimEnd('/') }
-                ?.name
-                ?: prefs.serverUrl.removePrefix("https://").removePrefix("http://").trimEnd('/')
-            setTextColor(Color.WHITE)
-            setTextSize(if (isTvDevice) 21f else 17f)
-            setTypeface(null, Typeface.BOLD)
-            maxLines = 1
-            ellipsize = android.text.TextUtils.TruncateAt.MIDDLE
-            setPadding(0, dp(7), 0, dp(4))
-        })
-        status.addView(TextView(this).apply {
-            text = "${prefs.sources().size} 个片源  ·  点击切换服务端"
-            setTextColor(0xFFC6E5DD.toInt())
-            setTextSize(13f)
-        })
-        col.addView(status, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(14) })
-
         fun section(title: String) {
             col.addView(titleText(title, if (isTvDevice) 19f else 16f).apply {
                 setTypeface(null, Typeface.BOLD)
@@ -3357,7 +3320,7 @@ class MainActivity : Activity() {
 
         // 按「最省事 → 最麻烦」排序，每项给一句用途说明
         val options = listOf(
-            Triple("内置默认片源", "16 个实测点播接口，https 源可设备直连", {
+            Triple("内置默认片源", "${BuiltInSources.ALL.size} 个内置点播接口，https 源可设备直连", {
                 runApi("导入中…", { loadBuiltInDefaultSources() }, { sources ->
                     if (sources.isEmpty()) toast("内置地址暂不可用，请手动添加片源")
                     else {
