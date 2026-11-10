@@ -2501,7 +2501,7 @@ class MainActivity : Activity() {
             setPadding(0, dp(18), 0, 0)
         })
         col.addView(hintText("让观影体验保持顺手、稳定。"))
-        col.addView(button("儿童每日固定 ${ChildrenQuota.dailyMinutes(this)} 分钟 · 设置 / 今天加时") { ChildrenQuota.parent(this) { showSetupCompact() } })
+        col.addView(button("儿童计时管理 · ${ChildrenQuota.label(this)}") { ChildrenQuota.parent(this) { showSetupCompact() } })
 
         fun section(title: String) {
             col.addView(titleText(title, if (isTvDevice) 19f else 16f).apply {
@@ -4750,8 +4750,8 @@ class MainActivity : Activity() {
         val current = sourceUrl.takeIf { it.isNotEmpty() }?.let {
             SearchItem(sourceName, vodId, title, cover, "", "", "", it)
         }
-        val normalized = cleanKeyword(title)
-        fun isSameTitle(item: SearchItem) = cleanKeyword(item.name).equals(normalized, ignoreCase = true)
+        val normalized = sourceTitleKey(title)
+        fun isSameTitle(item: SearchItem) = sourceTitleKey(item.name) == normalized
         val known = lastResults.filter(::isSameTitle)
         val initial = (listOfNotNull(current) + known).filter { it.sourceUrl.isNotEmpty() }
             .distinctBy { it.sourceUrl }
@@ -4834,7 +4834,7 @@ class MainActivity : Activity() {
                     val job = coroutineContext[Job]
                     val connections = SearchConnections()
                     try {
-                        directThenServerSearch(title, enabledSources, requests = connections,
+                        directThenServerSearch(sourceSearchKeyword(title), enabledSources, requests = connections,
                             shouldContinue = { job?.isActive != false })
                     } finally {
                         connections.cancel()
@@ -5039,7 +5039,7 @@ class MainActivity : Activity() {
 
         val transferIndex = pendingSourceEpisode
         if (pendingSourceUrl.isNotEmpty() && pendingSourceUrl != item.sourceUrl && transferIndex >= 0 &&
-            normalizeSeries(pendingSourceTitle) == normalizeSeries(item.name)) {
+            sourceTitleKey(pendingSourceTitle) == sourceTitleKey(item.name)) {
             pendingSourceEpisode = -1
             pendingSourceUrl = ""
             if (transferIndex < detail.episodes.size) {
@@ -5694,7 +5694,7 @@ class MainActivity : Activity() {
         val title = h.seriesTitle.ifEmpty { seriesNameOf(h.title) }
         val tracked = ChildrenQuota.isChild(this, title)
         AlertDialog.Builder(this).setTitle(title)
-            .setItems(arrayOf(if (tracked) "儿童计时管理" else "加入儿童计时", "查看详情", "删除观看记录")) { _, which ->
+            .setItems(arrayOf(if (tracked) "儿童计时管理 · ${ChildrenQuota.origin(this, title)}" else "加入儿童计时", "查看详情", "删除观看记录")) { _, which ->
                 when (which) {
                     1 -> {
                         childrenSearchOrigin = null

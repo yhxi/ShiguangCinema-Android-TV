@@ -30,4 +30,12 @@ class ChildrenQuotaMatchingTest {
         assertFalse(matchesChildQuotaTitle("", saved))
         assertFalse(matchesChildQuotaTitle("普通电视剧 第一季", catalog))
     }
+
+    @Test fun explicitSeriesSubtitlesAreAutomaticButCommentaryIsNot() {
+        listOf("大耳朵图图-彩色世界", "大耳朵图图彩色世界", "宝宝巴士启蒙音乐剧之细菌来了", "猪猪侠：竞速小英雄 第二季").forEach {
+            assertTrue(it, matchesChildQuotaTitle(it, catalog))
+        }
+        assertFalse(matchesChildQuotaTitle("聊聊大耳朵图图", catalog))
+        assertFalse(matchesChildQuotaTitle("大耳朵图图幕后访谈", catalog))
+    }
 }

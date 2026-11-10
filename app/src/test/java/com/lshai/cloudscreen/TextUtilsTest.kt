@@ -47,4 +47,14 @@ class TextUtilsTest {
         assertEquals("测试", normalizeSeries("（测试）"))
         assertEquals(normalizeSeries("第1集：测试"), normalizeSeries("第1集 测试"))
     }
+
+    @Test fun sourceMatchingPreservesSeasonAndSubtitleIdentity() {
+        assertEquals("海底小纵队", sourceSearchKeyword("海底小纵队 第一季（普通话版）"))
+        assertEquals("电影2025", sourceSearchKeyword("电影2025"))
+        assertEquals(sourceTitleKey("海底小纵队 第一季（普通话版）"), sourceTitleKey("海底小纵队第1季"))
+        assertEquals(sourceTitleKey("某动画第二十三季"), sourceTitleKey("某动画 第23季 英文版"))
+        org.junit.Assert.assertNotEquals(sourceTitleKey("海底小纵队第一季"), sourceTitleKey("海底小纵队第二季"))
+        org.junit.Assert.assertNotEquals(sourceTitleKey("海底小纵队"), sourceTitleKey("海底小纵队第一季"))
+        org.junit.Assert.assertNotEquals(sourceTitleKey("海底小纵队第一季"), sourceTitleKey("海底小纵队第一季番外篇"))
+    }
 }

@@ -20,6 +20,8 @@ internal object ChildrenQuota {
     private var last = 0L
     private var day = ""
     private var used = 0L
+    private var persistedUsed = 0L
+    private var lastPersistedAt = 0L
     private var browsing = false
     private var player: ExoPlayer? = null
     private var childPlayback = false
@@ -44,6 +46,8 @@ internal object ChildrenQuota {
         day = store.getString("day", "").orEmpty()
         used = store.getLong("used", 0L)
         last = SystemClock.elapsedRealtime()
+        persistedUsed = used
+        lastPersistedAt = last
         started = true
         settle()
         handler.post(tick)
@@ -62,16 +66,32 @@ internal object ChildrenQuota {
             used = quotaUsage(false, used, now - last, wasActive, calendar.timeInMillis - midnight.timeInMillis)
             day = currentDay
             store.edit().putString("day", day).putLong("used", used).putInt("bonus", 0).apply()
+            persistedUsed = used
+            lastPersistedAt = now
         } else if (wasActive && now > last) {
             used = quotaUsage(true, used, now - last, true, 0)
-            store.edit().putLong("used", used).apply()
+
         }
         last = now
         wasActive = active()
+        persistUsage(false)
     }
-    fun browse(value: Boolean) { settle(); browsing = value; wasActive = active() }
+    private fun persistUsage(force: Boolean) {
+        val now = SystemClock.elapsedRealtime()
+        if (used != persistedUsed && (force || now - lastPersistedAt >= 5_000L)) {
+            store.edit().putLong("used", used).apply()
+            persistedUsed = used
+            lastPersistedAt = now
+        }
+    }
+    fun browse(value: Boolean) {
+        settle()
+        if (!value && browsing) persistUsage(true)
+        browsing = value
+        wasActive = active()
+    }
     private val listener = object : Player.Listener {
-        override fun onIsPlayingChanged(isPlaying: Boolean) { settle(); enforce() }
+        override fun onIsPlayingChanged(isPlaying: Boolean) { settle(); if (!isPlaying) persistUsage(true); enforce() }
     }
     fun attach(context: Context, target: ExoPlayer, child: Boolean) {
         init(context); settle()
@@ -82,7 +102,7 @@ internal object ChildrenQuota {
     }
     fun detach(target: ExoPlayer?) {
         if (player !== target) return
-        settle(); player?.removeListener(listener); player = null; childPlayback = false; wasActive = active()
+        settle(); persistUsage(true); player?.removeListener(listener); player = null; childPlayback = false; wasActive = active()
     }
     private fun enforce() {
         val target = player
@@ -109,7 +129,7 @@ internal object ChildrenQuota {
     fun mark(context: Context, title: String) {
         init(context)
         val key = childQuotaKey(title)
-        if (key.isEmpty()) return
+        if (key.isEmpty() || isBuiltIn(title)) return
         val titles = store.getStringSet("titles", emptySet()).orEmpty().toMutableSet()
         if (titles.add(key)) store.edit().putStringSet("titles", titles).apply()
     }
@@ -259,17 +279,27 @@ internal object ChildrenQuota {
         dialog.show()
     }
 
-    fun parent(activity: Activity, after: () -> Unit) {
+    private fun verifyParent(activity: Activity, accepted: () -> Unit) {
         init(activity)
         val random = java.util.Random()
         val a = random.nextInt(8) + 2; val b = random.nextInt(8) + 2
         val digits = arrayOf("零", "壹", "贰", "叁", "肆", "伍", "陆", "柒", "捌", "玖")
         numberPanel(activity, "家长验证：${digits[a]} × ${digits[b]} = ？", "点击数字输入答案，输入 10 请依次按 1、0。", 2,
-            validate = { if (it == a * b) null else "答案不正确，请删除后重新输入" }, accepted = {
+            validate = { if (it == a * b) null else "答案不正确，请删除后重新输入" }, accepted = { accepted() })
+    }
+    fun parent(activity: Activity, after: () -> Unit) {
+        verifyParent(activity) { showParentMenu(activity, after) }
+    }
+    private fun showParentMenu(activity: Activity, after: () -> Unit) {
+        settle()
                 val daily = dailyMinutes(activity)
                 AlertDialog.Builder(android.view.ContextThemeWrapper(activity, android.R.style.Theme_Material_Light_Dialog_Alert))
-                    .setCustomTitle(panelTitle(activity, "每日固定 $daily 分钟"))
-                    .setItems(arrayOf("修改每日固定额度（以后每天生效）", "仅今天加时（明天仍为 $daily 分钟）")) { _, which ->
+                    .setCustomTitle(panelTitle(activity, "儿童计时管理 · 每日 $daily 分钟\n已用 ${(used + 59_999) / 60_000} 分钟 · ${label(activity)}"))
+                    .setItems(arrayOf("修改每日固定额度（以后每天生效）", "仅今天加时（明天仍为 $daily 分钟）", "受管理作品（自动 / 手动）")) { _, which ->
+                        if (which == 2) {
+                            showManagedTitles(activity, after)
+                            return@setItems
+                        }
                         val fixed = which == 0
                         numberPanel(activity, if (fixed) "修改每日固定额度" else "仅今天加时",
                             if (fixed) "当前每天 $daily 分钟。修改后今天立即生效，以后每天沿用新额度；已用时间不清零。"
@@ -292,7 +322,37 @@ internal object ChildrenQuota {
                                 after()
                             })
                     }.setNegativeButton("关闭", null).create().also { menu -> menu.setOnShowListener { stylePanel(activity, menu) }; menu.show() }
-            })
+    }
+
+    private fun isBuiltIn(title: String): Boolean = matchesChildQuotaTitle(title, catalogKeys)
+    fun origin(context: Context, title: String): String {
+        init(context)
+        return if (isBuiltIn(title)) "自动识别" else "手动/历史加入"
+    }
+    private fun showManagedTitles(activity: Activity, after: () -> Unit) {
+        val automatic = ChildrenCatalog.preloadOrder()
+        val manual = store.getStringSet("titles", emptySet()).orEmpty().filterNot(::isBuiltIn).sorted()
+        val rows = manual.map { "手动/历史 · $it" } + automatic.map { "自动 · $it" }
+        AlertDialog.Builder(activity).setTitle("受管理作品 · 自动 ${automatic.size} 部 / 手动 ${manual.size} 部")
+            .setItems(rows.toTypedArray()) { _, index ->
+                if (index >= manual.size) {
+                    AlertDialog.Builder(activity).setTitle(automatic[index - manual.size])
+                        .setMessage("内置系列自动纳入，每季及匹配的系列副标题共同受每日额度限制。")
+                        .setPositiveButton("关闭", null).show()
+                } else {
+                    val title = manual[index]
+                    AlertDialog.Builder(activity).setTitle("移除《$title》的儿童计时？")
+                        .setMessage("移除后该作品不再计入儿童额度。不会清零今天已用时间。")
+                        .setPositiveButton("家长验证后移除") { _, _ ->
+                            verifyParent(activity) {
+                                val titles = store.getStringSet("titles", emptySet()).orEmpty().toMutableSet()
+                                titles.remove(title)
+                                store.edit().putStringSet("titles", titles).apply()
+                                after()
+                            }
+                        }.setNegativeButton("取消", null).show()
+                }
+            }.setNegativeButton("关闭", null).show()
     }
     fun locked(activity: Activity, onClose: (() -> Unit)? = null, after: () -> Unit) {
         AlertDialog.Builder(android.view.ContextThemeWrapper(activity, android.R.style.Theme_Material_Light_Dialog_Alert))

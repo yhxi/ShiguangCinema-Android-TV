@@ -38,3 +38,13 @@ object BuiltInSources {
         SourceConfig("非凡(ffzy5)", "http://ffzy5.tv/api.php/provide/vod"),
     )
 }
+
+
+/** Return a merged copy without changing custom sources, order, or disabled flags. */
+internal fun supplementBuiltInSources(current: List<SourceConfig>): List<SourceConfig> {
+    val additions = BuiltInSources.ALL.filter { it.name in setOf("厂长", "红牛", "金鹰", "猫眼") }
+    val oldUrls = BuiltInSources.ALL.filterNot { it in additions }.map { it.url.trimEnd('/') }.toSet()
+    if (current.none { it.url.trimEnd('/') in oldUrls }) return current
+    val seen = current.map { it.url.trimEnd('/') }.toMutableSet()
+    return current + additions.filter { seen.add(it.url.trimEnd('/')) }
+}

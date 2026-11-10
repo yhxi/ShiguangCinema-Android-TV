@@ -189,6 +189,17 @@ class Prefs(ctx: Context) {
             }
         } catch (_: Exception) {
         }
+        // Per-server, one-time addition; existing disabled sources and custom entries retain their state.
+        val marker = scoped("builtin_sources_nov2026_migrated")
+        if (out.isNotEmpty() && !sp.getBoolean(marker, false)) {
+            val merged = supplementBuiltInSources(out)
+            if (merged.size != out.size) {
+                out.clear()
+                out.addAll(merged)
+                saveSources(out)
+            }
+            sp.edit().putBoolean(marker, true).apply()
+        }
         return out
     }
 

@@ -39,3 +39,24 @@ internal fun normalizeSeries(series: String): String =
 
 /** Empty results stay retryable, including after a successful but stale source response. */
 internal fun shouldCacheSearchResult(itemCount: Int, failures: Int): Boolean = itemCount > 0
+
+
+/** Same season only: whitespace, language labels and Chinese/Arabic season numbers may differ. */
+internal fun sourceTitleKey(title: String): String {
+    val languages = Regex("中文版|英文版|普通话版|国语版|英语版|粤语版|普通话|国语|英语|粤语")
+    val season = Regex("第([一二三四五六七八九十两0-9]+)(季|部)")
+    return season.replace(normalizeSeries(title.replace(languages, ""))) { m ->
+        val text = m.groupValues[1]
+        val digits = mapOf('一' to 1, '二' to 2, '两' to 2, '三' to 3, '四' to 4, '五' to 5, '六' to 6, '七' to 7, '八' to 8, '九' to 9)
+        val number = text.toIntOrNull() ?: if ('十' in text) {
+            val parts = text.split('十')
+            (parts[0].firstOrNull()?.let { digits[it] } ?: 1) * 10 + (parts[1].firstOrNull()?.let { digits[it] } ?: 0)
+        } else digits[text.first()] ?: return@replace m.value
+        "第$number${m.groupValues[2]}"
+    }
+}
+
+
+/** Search the series broadly, then filter with sourceTitleKey to keep the original season. */
+internal fun sourceSearchKeyword(title: String): String =
+    sourceTitleKey(title).replace(Regex("第[0-9]+(季|部).*$"), "")
