@@ -387,7 +387,7 @@ class MainActivity : Activity() {
             else ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
 
         root = FrameLayout(this)
-        root.setBackgroundColor(SOFT)
+        root.background = SoftBackgroundDrawable()
         setContentView(root)
         hideSystemUi()
         applySafeArea()
@@ -720,9 +720,8 @@ class MainActivity : Activity() {
         if (currentScreen != "recommend" && currentScreen != "favorites") favoriteCheckJob?.cancel()
         if (currentScreen != "home") hotSearchJob?.cancel()
         root.removeAllViews()
-        // 以前首页铺过一条绿色渐变当"装饰"，结果半透明的入口瓦片叠上去整页发绿，
-        // 文字对比度也塌了，看着像渲染坏了。现在全站统一同一个深色底，装饰靠卡片和留白做。
-        root.background = android.graphics.drawable.ColorDrawable(SOFT)
+        // Share the restrained warm-white/sage background across phone and TV pages.
+        root.background = SoftBackgroundDrawable()
         root.addView(view, FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         // 加载胶囊挂在 root 上，removeAllViews 会把它一起摘掉，这里重新挂回最上层
@@ -5478,7 +5477,7 @@ class MainActivity : Activity() {
     private fun historyProgressLabel(h: HistoryEntry): String {
         if (h.durationMs <= 0L) return "已看 ${formatTime(h.positionMs.coerceAtLeast(0L))}"
         val percent = ((h.positionMs.toDouble() / h.durationMs).coerceIn(0.0, 1.0) * 100).toInt()
-        return "已看 $percent%"
+        return if (percent == 0) "刚开始看" else "已看 $percent%"
     }
 
     private fun formatTime(ms: Long): String {
@@ -5815,9 +5814,10 @@ class MainActivity : Activity() {
             clipChildren = false
             clipToPadding = false
         }
-        val height = dp((144 * resources.configuration.fontScale.coerceIn(1f, 1.5f)).toInt())
-        val coverWidth = dp(if (isTvDevice) 80 else 50)
+        val coverWidth = dp(96)
         val coverHeight = coverWidth * 3 / 2
+        val contentHeight = maxOf(coverHeight, dp((128 * resources.configuration.fontScale.coerceIn(1f, 1.5f)).toInt()))
+        val height = contentHeight + dp(16)
         recent.forEachIndexed { index, h ->
             val card = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
@@ -5831,7 +5831,7 @@ class MainActivity : Activity() {
                         confirmRemoveHistory(h); true
                     } else false
                 }
-                setPadding(dp(if (isTvDevice) 10 else 4), dp(8), dp(if (isTvDevice) 10 else 4), dp(8))
+                setPadding(dp(2), dp(8), dp(2), dp(8))
                 // Borderless at rest; a soft highlight keeps TV focus visible.
                 background = android.graphics.drawable.StateListDrawable().apply {
                     fun surface(color: Int, focus: Boolean = false) = GradientDrawable().apply {
@@ -5869,9 +5869,10 @@ class MainActivity : Activity() {
             detail.addView(TextView(this).apply {
                 text = historyTitle(h)
                 setTextColor(INK)
-                setTextSize(if (isTvDevice) 18f else 15f)
+                setTextSize(19f)
                 setTypeface(null, Typeface.BOLD)
-                if (isTvDevice) setLines(2) else maxLines = 2
+                setLines(2)
+                gravity = Gravity.CENTER_VERTICAL
                 includeFontPadding = false
                 ellipsize = android.text.TextUtils.TruncateAt.END
             }, LinearLayout.LayoutParams(-1, -2))
@@ -5879,7 +5880,7 @@ class MainActivity : Activity() {
                 val number = Regex("第\\s*(\\d+)").find(h.title)?.groupValues?.getOrNull(1)
                 text = listOfNotNull(number?.let { "第 $it 集" }, historyProgressLabel(h)).joinToString(" · ")
                 setTextColor(BRIGHTER_TEXT)
-                setTextSize(if (isTvDevice) 13f else 11f)
+                setTextSize(14f)
                 maxLines = 1
                 ellipsize = android.text.TextUtils.TruncateAt.END
                 setPadding(0, dp(5), 0, dp(7))
@@ -5896,12 +5897,12 @@ class MainActivity : Activity() {
             if (isTvDevice) detail.addView(TextView(this).apply {
                 text = "继续播放  ›"
                 setTextColor(ACCENT)
-                setTextSize(if (isTvDevice) 14f else 11f)
+                setTextSize(15f)
                 setTypeface(null, Typeface.BOLD)
                 maxLines = 1
                 setPadding(0, dp(7), 0, 0)
             })
-            card.addView(detail, LinearLayout.LayoutParams(0, -2, 1f))
+            card.addView(detail, LinearLayout.LayoutParams(0, contentHeight, 1f))
             card.contentDescription = "${historyTitle(h)}，继续播放，长按管理"
             if (!isTvDevice) {
                 card.addView(TextView(this).apply {
@@ -7008,10 +7009,8 @@ class MainActivity : Activity() {
         }
         val col = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            // 手机端这一列会被塞进 RecyclerView 当「头部 item」，左右留白由 RecyclerView 的
-            // padding 统一给（网格行和头部才能对齐），所以这里不要再加一层
-            setPadding(if (isTvDevice) dp(48) else 0, dp(22),
-                if (isTvDevice) dp(48) else 0, dp(16))
+            // Header and poster grid share the RecyclerView's outer gutters on both devices.
+            setPadding(0, dp(22), 0, dp(16))
         }
         val brandBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -7184,7 +7183,7 @@ class MainActivity : Activity() {
                     override fun getSpanSize(position: Int): Int = if (position == 0) columns else 1
                 }
             }
-            setPadding(dp(20), 0, dp(20), dp(16))
+            setPadding(dp(if (isTvDevice) 48 else 20), 0, dp(if (isTvDevice) 48 else 20), dp(16))
             clipToPadding = false
             clipChildren = false
             isVerticalScrollBarEnabled = false
