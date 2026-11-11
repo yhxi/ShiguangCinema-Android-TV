@@ -997,7 +997,7 @@ object HomeBar {
         "live" -> "直播"
         "kids" -> "儿童"
         "history" -> "继续"
-        "fav" -> "追剧"
+        "fav" -> "收藏"
         "sources" -> "片源"
         "setup" -> "设置"
         else -> id

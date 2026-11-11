@@ -61,7 +61,7 @@ import java.net.URL
 private const val TYPE_HEADER = 0
 private const val TYPE_CELL = 1
 
-/** 追剧自动检查更新的最小间隔（6 小时） */
+/** 收藏自动检查更新的最小间隔（6 小时） */
 private const val FAVORITE_CHECK_INTERVAL_MS = 6 * 3_600_000L
 
 /** 搜索结果复用的时间窗：3 分钟内的同一关键词不再重复请求 */
@@ -167,7 +167,7 @@ class MainActivity : EdgeSwipeBackActivity() {
     private var lastRepeatKeyAt = 0L
     private var homeFocusedTitle: String? = null
     private var homeLastHeaderFocus: View? = null
-    /** 追剧自动检查的节流：本次进程内最近一次检查时间 */
+    /** 收藏自动检查的节流：本次进程内最近一次检查时间 */
     private var lastFavoriteCheckAt = 0L
     /** 搜索结果短时缓存：key = 关键词 + 源集合，value = (写入时间, 结果) */
     private val searchCache = HashMap<String, Pair<Long, List<SearchItem>>>()
@@ -5114,13 +5114,13 @@ class MainActivity : EdgeSwipeBackActivity() {
             col.addView(hintText("看过 $watchedCount / ${detail.episodes.size} 集"))
         }
 
-        // 追剧：只记「加入时这部剧共几集」，之后集数变多就说明更新了（纯本地比对）
+        // 收藏：只记「加入时这部剧共几集」，之后集数变多就说明更新了（纯本地比对）
         val faved = prefs.isFavorite(progressKey)
         col.addView(
-            button(if (faved) "✓ 已追剧" else "＋ 加入追剧") {
+            button(if (faved) "✓ 已收藏" else "＋ 加入收藏") {
                 if (prefs.isFavorite(progressKey)) {
                     prefs.removeFavorite(progressKey)
-                    toast("已取消追剧")
+                    toast("已取消收藏")
                 } else {
                     prefs.addFavorite(
                         Favorite(
@@ -5133,9 +5133,9 @@ class MainActivity : EdgeSwipeBackActivity() {
                             checkedAt = System.currentTimeMillis(),
                         ),
                     )
-                    toast("已加入追剧，有新集会提示")
+                    toast("已加入收藏，有新集会提示")
                 }
-                (findButtonByText(col, "✓ 已追剧") ?: findButtonByText(col, "＋ 加入追剧"))?.let { (it as Button).text = if (prefs.isFavorite(progressKey)) "✓ 已追剧" else "＋ 加入追剧" }
+                (findButtonByText(col, "✓ 已收藏") ?: findButtonByText(col, "＋ 加入收藏"))?.let { (it as Button).text = if (prefs.isFavorite(progressKey)) "✓ 已收藏" else "＋ 加入收藏" }
             },
             LinearLayout.LayoutParams(dp(200), ViewGroup.LayoutParams.WRAP_CONTENT)
                 .apply { bottomMargin = dp(8) },
@@ -5484,7 +5484,7 @@ class MainActivity : EdgeSwipeBackActivity() {
             setPadding(pagePad(48), dp(24), pagePad(48), dp(20))
         }
         col.addView(topBar())
-        col.addView(titleText("全部记录", 20f))
+        col.addView(titleText("全部历史", 20f))
 
         if (items.isEmpty()) {
             col.addView(hintText("还没有观看记录。播过的片子会出现在这里，方便接着看。"))
@@ -5536,7 +5536,7 @@ class MainActivity : EdgeSwipeBackActivity() {
             setPadding(pagePad(40), dp(20), pagePad(40), dp(16))
         }
         col.addView(topBar())
-        col.addView(titleText("全部记录", 18f))
+        col.addView(titleText("全部历史", 18f))
 
         if (items2.isEmpty()) {
             col.addView(hintText("还没有观看记录。播过的片子会出现在这里，方便接着看。"))
@@ -5631,7 +5631,7 @@ class MainActivity : EdgeSwipeBackActivity() {
         return "%d:%02d".format(total / 60, total % 60)
     }
 
-    /* ------------------------------------------------------------ 追剧 */
+    /* ------------------------------------------------------------ 收藏 */
 
     private fun relativeTime(ms: Long): String {
         if (ms <= 0L) return "还没检查过"
@@ -5644,7 +5644,7 @@ class MainActivity : EdgeSwipeBackActivity() {
         }
     }
 
-    /** 追剧列表：只看「这部剧更到第几集了」，点进去还是详情页 */
+    /** 收藏列表：只看「这部剧更到第几集了」，点进去还是详情页 */
     private fun showFavorites() {
         currentScreen = "favorites"
         val list = prefs.favorites()
@@ -5657,7 +5657,7 @@ class MainActivity : EdgeSwipeBackActivity() {
         val bar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         bar.addView(
             titleText(
-                if (updates > 0) "追剧 · ${list.size} 部（$updates 部有新集）" else "追剧 · ${list.size} 部",
+                if (updates > 0) "收藏 · ${list.size} 部（$updates 部有新集）" else "收藏 · ${list.size} 部",
                 18f,
             ),
         )
@@ -5668,9 +5668,9 @@ class MainActivity : EdgeSwipeBackActivity() {
         col.addView(hScroll(bar))
 
         if (list.isEmpty()) {
-            col.addView(hintText("还没有追的剧。进详情页点「加入追剧」，之后服务端更新了集数，这里会自动告诉你。"))
+            col.addView(hintText("还没有收藏的节目。进详情页点「加入收藏」，有新集时这里会提示。"))
         } else {
-            col.addView(hintText("选中进入详情；长按可取消追剧"))
+            col.addView(hintText("选中进入详情；长按可取消收藏"))
             val grid = newGrid().apply {
                 numColumns = if (compact) 1 else 3
                 horizontalSpacing = dp(12)
@@ -5753,12 +5753,12 @@ class MainActivity : EdgeSwipeBackActivity() {
             grid.setOnItemLongClickListener { _, _, pos, _ ->
                 val f = list.getOrNull(pos) ?: return@setOnItemLongClickListener true
                 AlertDialog.Builder(this)
-                    .setTitle("取消追剧？")
-                    .setMessage("《${f.title}》将从追剧列表移除，观看记录不受影响。")
-                    .setPositiveButton("取消追剧") {
+                    .setTitle("取消收藏？")
+                    .setMessage("《${f.title}》将从收藏列表移除，观看记录不受影响。")
+                    .setPositiveButton("取消收藏") {
                             _, _ ->
                         prefs.removeFavorite(f.title)
-                        toast("已取消追剧")
+                        toast("已取消收藏")
                         showFavorites()
                     }
                     .setNegativeButton("算了", null)
@@ -5775,14 +5775,14 @@ class MainActivity : EdgeSwipeBackActivity() {
     }
 
     /**
-     * 检查追剧更新。
+     * 检查收藏更新。
      *
-     * 纯本地比对：把当前集数和追剧时记下的 [Favorite.episodeCount] 比一下，
+     * 纯本地比对：把当前集数和收藏时记下的 [Favorite.episodeCount] 比一下，
      * 变多就算更新。6 小时内查过的跳过（[force] = 手动点「检查更新」时无视）。
      */
     private fun checkFavoritesUpdate(force: Boolean = false) {
         if (favoriteCheckJob?.isActive == true) {
-            if (force) toast("追剧更新检查正在进行")
+            if (force) toast("收藏更新检查正在进行")
             return
         }
         val list = prefs.favorites()
@@ -5873,7 +5873,7 @@ class MainActivity : EdgeSwipeBackActivity() {
             .show()
     }
 
-    /** 进首页时顺手跑一次追剧检查：静默，失败就当没发生，不弹任何东西 */
+    /** 进首页时顺手跑一次收藏检查：静默，失败就当没发生，不弹任何东西 */
     private fun autoCheckFavorites() {
         if (prefs.favorites().isEmpty()) return
         if (System.currentTimeMillis() - lastFavoriteCheckAt < 3_600_000L) return
@@ -5939,7 +5939,7 @@ class MainActivity : EdgeSwipeBackActivity() {
 
     /** Compact recent items: two on phones, three on TV; full history stays available. */
     private fun addContinueWatchingB(col: LinearLayout) {
-        val recent = prefs.history().take(if (isTvDevice) 3 else 2)
+        val recent = prefs.history()
         if (recent.isEmpty()) return
         val head = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -5949,8 +5949,13 @@ class MainActivity : EdgeSwipeBackActivity() {
         head.addView(titleText("最近观看", if (isTvDevice) 25f else 21f).apply {
             setTypeface(null, Typeface.BOLD)
         }, LinearLayout.LayoutParams(0, -2, 1f))
-        head.addView(button("全部记录") { showHistoryCards() })
+        head.addView(button("全部历史") { showHistoryCards() })
         col.addView(head)
+        if (recent.size > if (isTvDevice) 3 else 2) {
+            col.addView(hintText(if (isTvDevice) "左右键查看更多" else "左右滑动查看更多").apply {
+                setPadding(0, 0, 0, dp(6))
+            })
+        }
         if (!isTvDevice) {
             addMobileRecentPosters(col, recent)
             return
@@ -5960,6 +5965,8 @@ class MainActivity : EdgeSwipeBackActivity() {
             clipChildren = false
             clipToPadding = false
         }
+        val scroll = hScroll(row).apply { isFillViewport = false }
+        val cardWidth = ((resources.displayMetrics.widthPixels - dp(96) - dp(24)) / 3).coerceAtLeast(dp(180))
         val coverWidth = dp(96)
         val coverHeight = coverWidth * 3 / 2
         val contentHeight = maxOf(coverHeight, dp((128 * resources.configuration.fontScale.coerceIn(1f, 1.5f)).toInt()))
@@ -5973,9 +5980,15 @@ class MainActivity : EdgeSwipeBackActivity() {
                 setOnClickListener { playFromHistory(h) }
                 setOnLongClickListener { confirmRemoveHistory(h); true }
                 setOnKeyListener { _, code, event ->
-                    if (code == KeyEvent.KEYCODE_MENU && event.action == KeyEvent.ACTION_DOWN) {
-                        confirmRemoveHistory(h); true
-                    } else false
+                    if (event.action != KeyEvent.ACTION_DOWN) false
+                    else when (code) {
+                        KeyEvent.KEYCODE_MENU -> { confirmRemoveHistory(h); true }
+                        KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                            val next = index + if (code == KeyEvent.KEYCODE_DPAD_RIGHT) 1 else -1
+                            if (next in 0 until row.childCount) row.getChildAt(next).requestFocus() else true
+                        }
+                        else -> false
+                    }
                 }
                 setPadding(dp(2), dp(8), dp(2), dp(8))
                 // Borderless at rest; a soft highlight keeps TV focus visible.
@@ -6068,14 +6081,15 @@ class MainActivity : EdgeSwipeBackActivity() {
                     gravity = Gravity.CENTER_VERTICAL
                 })
             }
-            row.addView(card, if (isTvDevice) LinearLayout.LayoutParams(0, height, 1f).apply {
+            card.onFocusChangeListener = View.OnFocusChangeListener { _, focused ->
+                if (focused) scroll.post { scroll.requestChildRectangleOnScreen(row, android.graphics.Rect(card.left, card.top, card.right, card.bottom), false) }
+            }
+            row.addView(card, LinearLayout.LayoutParams(cardWidth, height).apply {
                 if (index > 0) leftMargin = dp(12)
-            } else LinearLayout.LayoutParams(-1, -2).apply {
-                if (index > 0) topMargin = dp(6)
             })
             if (homeHistoryFirst == null) homeHistoryFirst = card
         }
-        col.addView(row, LinearLayout.LayoutParams(-1, if (isTvDevice) height else -2))
+        col.addView(scroll, LinearLayout.LayoutParams(-1, height))
     }
 
     /** Phone history follows the same poster grid as the recommendations below. */
@@ -6107,14 +6121,12 @@ class MainActivity : EdgeSwipeBackActivity() {
             card.contentDescription = "${historyTitle(h)}，${metadata.text}，点击继续播放，长按管理"
             card.setOnClickListener { playFromHistory(h) }
             card.setOnLongClickListener { confirmRemoveHistory(h); true }
-            row.addView(card, LinearLayout.LayoutParams(0, -2, 1f).apply {
+            row.addView(card, LinearLayout.LayoutParams(metrics[0], -2).apply {
                 if (index > 0) leftMargin = dp(12)
             })
             if (homeHistoryFirst == null) homeHistoryFirst = card
         }
-        // Keep a single record the same width as a recommendation poster.
-        if (recent.size == 1) row.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f).apply { leftMargin = dp(12) })
-        col.addView(row, LinearLayout.LayoutParams(-1, -2))
+        col.addView(hScroll(row), LinearLayout.LayoutParams(-1, -2))
     }
 
     private fun addContinueWatching(col: LinearLayout) {
@@ -6316,7 +6328,7 @@ class MainActivity : EdgeSwipeBackActivity() {
         "fav" -> {
             // 有更新时在标签上带一句，用户不用进页面才知道有新集
             val updates = prefs.favoriteUpdateCount()
-            homeTile("fav", if (updates > 0) "追剧·$updates" else "追剧") { showFavorites() }
+            homeTile("fav", if (updates > 0) "收藏·$updates" else "收藏") { showFavorites() }
         }
         "sources" -> homeTile("sources", "片源") { showSources() }
         "setup" -> homeTile("setup", "设置") { showSetup() }
