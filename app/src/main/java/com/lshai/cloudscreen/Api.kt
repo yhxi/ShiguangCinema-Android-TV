@@ -363,8 +363,8 @@ class Api(baseUrl: String) {
         val conn = runCatching { URL(url).openConnection() as HttpURLConnection }.getOrNull()
             ?: return null
         val bytes = try {
-            conn.connectTimeout = 3_000
-            conn.readTimeout = 5_000
+            conn.connectTimeout = 2_000
+            conn.readTimeout = 4_000
             conn.instanceFollowRedirects = true
             conn.setRequestProperty(
                 "User-Agent",
@@ -399,8 +399,8 @@ class Api(baseUrl: String) {
     private fun proxiedImageBytes(picUrl: String): ByteArray? {
         val conn = URL(imageUrl(picUrl)).openConnection() as HttpURLConnection
         return try {
-            conn.connectTimeout = 8000
-            conn.readTimeout = 15000
+            conn.connectTimeout = 4000
+            conn.readTimeout = 8000
             cookie?.let { conn.setRequestProperty("Cookie", it) }
             if (conn.responseCode !in 200..299) null else boundedImageBytes(conn)
         } catch (e: Exception) {

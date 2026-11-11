@@ -54,21 +54,17 @@ class ImageLoader(private val context: Context, api: Api) {
             (value.byteCount / 1024).coerceAtLeast(1)
     }
     // 3 个线程时，24 张海报要分 8 批发；每张即使只要 0.5 秒也要 4 秒才铺满。
-    // 提到 6 个：弱网下再多会互相抢带宽，反而让单张更慢。
+    // 总计保持 6 个：5 个给可见图片、1 个给预取，避免后台占满队列。
     private val requestOrder = AtomicLong(0)
-    private class ImageTask(val priority: Int, val order: Long, val work: () -> Unit) : Runnable, Comparable<ImageTask> {
-        override fun compareTo(other: ImageTask): Int = compareValuesBy(this, other, { it.priority }, { it.order })
-        override fun run() = work()
-    }
-    private val pool = java.util.concurrent.ThreadPoolExecutor(6, 6, 0L, java.util.concurrent.TimeUnit.MILLISECONDS,
-        java.util.concurrent.PriorityBlockingQueue<Runnable>())
+    private val scheduler = ImageRequestScheduler()
+    private val scheduled = HashMap<String, ImageTask>()
     // 磁盘压缩单独排队，不占用下载线程；首屏后续海报无需等前一张落盘。
     private val diskPool = Executors.newSingleThreadExecutor()
     private val main = Handler(Looper.getMainLooper())
     @Volatile private var closed = false
 
     /** 正在下载的图：同一个 key 的后续请求排队等结果，不再各自发起下载 */
-    private data class ImageCallback(val ready: (Bitmap?) -> Unit, val cancelled: (() -> Unit)?, val needed: () -> Boolean)
+    private data class ImageCallback(val ready: (Bitmap?) -> Unit, val cancelled: (() -> Unit)?, val needed: () -> Boolean, val foreground: Boolean)
     private val inFlight = ConcurrentHashMap<String, MutableList<ImageCallback>>()
 
     private val diskDir = File(context.cacheDir, "poster_cache")
@@ -86,17 +82,22 @@ class ImageLoader(private val context: Context, api: Api) {
         if (url.isEmpty()) { onReady(null); return }
         val key = "$url@${reqWidth}x$reqHeight"
         cache.get(key)?.let { onReady(it); return }
-        val callback = ImageCallback(onReady, onCancelled, needed)
+        val callback = ImageCallback(onReady, onCancelled, needed, !background)
         val requestGeneration: Long
         synchronized(inFlight) {
             if (closed) { onCancelled?.invoke(); return }
             requestGeneration = generation.get()
             val waiting = inFlight[key]
-            if (waiting != null) { waiting.add(callback); return }
+            if (waiting != null) {
+                waiting.add(callback)
+                if (!background) scheduled[key]?.let { task -> runCatching { scheduler.promote(task) } }
+                return
+            }
             inFlight[key] = mutableListOf(callback)
         }
         try {
-            pool.execute(ImageTask(if (background) 1 else 0, requestOrder.incrementAndGet()) {
+            val task = ImageTask(if (background) 1 else 0, requestOrder.incrementAndGet()) {
+                if (closed || generation.get() != requestGeneration) return@ImageTask
                 val useful = synchronized(inFlight) { inFlight[key]?.any { it.needed() } == true }
                 if (!useful) {
                     main.post { deliver(key, requestGeneration, null) }
@@ -110,10 +111,15 @@ class ImageLoader(private val context: Context, api: Api) {
                         if (generation.get() == requestGeneration) writeToDisk(url, bmp, reqWidth)
                     } } }
                 }
-            })
+            }
+            synchronized(inFlight) {
+                if (closed || generation.get() != requestGeneration || !inFlight.containsKey(key)) return
+                scheduled[key] = task
+                scheduler.execute(task, inFlight[key]?.any { it.foreground } == true)
+            }
         } catch (_: java.util.concurrent.RejectedExecutionException) {
             val callbacks = synchronized(inFlight) {
-                if (generation.get() == requestGeneration) inFlight.remove(key) else null
+                if (generation.get() == requestGeneration) { scheduled.remove(key); inFlight.remove(key) } else null
             }
             callbacks?.forEach { it.ready(null) }
         }
@@ -128,9 +134,9 @@ class ImageLoader(private val context: Context, api: Api) {
         val callbacks = synchronized(inFlight) {
             closed = true
             generation.incrementAndGet()
-            inFlight.values.flatMap { it.toList() }.also { inFlight.clear() }
+            inFlight.values.flatMap { it.toList() }.also { inFlight.clear(); scheduled.clear() }
         }
-        pool.shutdownNow()
+        scheduler.shutdown()
         diskPool.shutdown()
         cancelCallbacks(callbacks)
     }
@@ -139,6 +145,7 @@ class ImageLoader(private val context: Context, api: Api) {
         val waiting = synchronized(inFlight) {
             if (closed || generation.get() != requestGeneration) return
             if (bmp != null) cache.put(key, bmp)
+            scheduled.remove(key)
             inFlight.remove(key)
         }
         waiting?.forEach { if (it.needed()) it.ready(bmp) else it.cancelled?.invoke() }
@@ -198,6 +205,18 @@ class ImageLoader(private val context: Context, api: Api) {
      * 而下回来的还是同样大小，永远收敛不了。
      */
     private val diskSmall = java.util.Collections.synchronizedSet(HashSet<String>())
+    private fun smallMarker(url: String): File = File(diskDir, sha1(url) + ".small")
+    private fun isKnownSmall(url: String): Boolean {
+        if (url in diskSmall) return true
+        val marker = smallMarker(url)
+        if (!SmallImageMarker.isFresh(marker, System.currentTimeMillis())) return false
+        diskSmall.add(url)
+        return true
+    }
+    private fun rememberSmall(url: String) {
+        diskSmall.add(url)
+        runCatching { if (!diskDir.exists()) diskDir.mkdirs(); SmallImageMarker.remember(smallMarker(url)) }
+    }
 
     private fun readFromDisk(url: String, reqWidth: Int, reqHeight: Int): Bitmap? {
         val f = diskFile(url)
@@ -206,12 +225,12 @@ class ImageLoader(private val context: Context, api: Api) {
         BitmapFactory.decodeFile(f.absolutePath, bounds)
         if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
             // 文件坏了（写一半被杀、空间不足）就删掉，下次重新下载
-            runCatching { f.delete() }
+            runCatching { f.delete(); smallMarker(url).delete(); diskSmall.remove(url) }
             return null
         }
         // 磁盘上是小图、这次要的是大图（先看了列表再进详情）：当作没有，重新下一张大的。
         // 但只重下一次 —— 原图就这么大的话，再下也没用。
-        if (bounds.outWidth < reqWidth * 9 / 10 && url !in diskSmall) return null
+        if (bounds.outWidth < reqWidth * 9 / 10 && !isKnownSmall(url)) return null
         val opts = BitmapFactory.Options().apply {
             inSampleSize = sampleFor(bounds.outWidth, bounds.outHeight, reqWidth, reqHeight)
             inPreferredConfig = configFor(reqWidth)
@@ -222,7 +241,7 @@ class ImageLoader(private val context: Context, api: Api) {
             null
         }
         if (bmp == null) {
-            runCatching { f.delete() }
+            runCatching { f.delete(); smallMarker(url).delete(); diskSmall.remove(url) }
             return null
         }
         // 刷新访问时间，让 LRU 淘汰真正按"最近用过的"来
@@ -238,7 +257,7 @@ class ImageLoader(private val context: Context, api: Api) {
             // 覆盖前先记下旧文件的宽度：新图没有更大，说明原图已经到顶
             val oldWidth = if (target.isFile) storedWidth(target) else 0
             if (oldWidth >= bmp.width && oldWidth > 0) {
-                if (bmp.width < reqWidth * 9 / 10) diskSmall.add(url)
+                if (bmp.width < reqWidth * 9 / 10) rememberSmall(url)
                 return
             }
             val oldLen = if (target.isFile) target.length() else 0L
@@ -260,7 +279,7 @@ class ImageLoader(private val context: Context, api: Api) {
             diskBytes.addAndGet(target.length() - oldLen)
             // 新图还是不够这次要的尺寸（原图就这么大），或者根本没比旧的大：
             // 记下来，以后别再为同一张图反复重下
-            if (bmp.width <= oldWidth || bmp.width < reqWidth * 9 / 10) diskSmall.add(url)
+            if (bmp.width <= oldWidth || bmp.width < reqWidth * 9 / 10) rememberSmall(url)
             trimDiskIfNeeded()
         }
     }
@@ -281,12 +300,15 @@ class ImageLoader(private val context: Context, api: Api) {
     /** 超过上限就从最久没访问的开始删，删到 80% 以下，避免每写一张都触发一轮淘汰 */
     private fun trimDiskIfNeeded() {
         if (diskBytes.get() <= maxDiskBytes) return
-        val files = diskDir.listFiles()?.filter { it.isFile } ?: return
+        val files = diskDir.listFiles()?.filter { it.isFile && it.name.endsWith(".img") } ?: return
         val sorted = files.sortedBy { it.lastModified() }
         for (f in sorted) {
             if (diskBytes.get() <= maxDiskBytes * 8 / 10) break
             val len = f.length()
-            if (runCatching { f.delete() }.getOrDefault(false)) diskBytes.addAndGet(-len)
+            if (runCatching { f.delete() }.getOrDefault(false)) {
+                diskBytes.addAndGet(-len)
+                File(diskDir, f.name.removeSuffix(".img") + ".small").delete()
+            }
         }
     }
 
@@ -296,7 +318,8 @@ class ImageLoader(private val context: Context, api: Api) {
     fun clearCache(): Int {
         val callbacks = synchronized(inFlight) {
             generation.incrementAndGet()
-            inFlight.values.flatMap { it.toList() }.also { inFlight.clear() }
+            scheduler.clearQueued()
+            inFlight.values.flatMap { it.toList() }.also { inFlight.clear(); scheduled.clear() }
         }
         cancelCallbacks(callbacks)
         val n = cache.snapshot().size

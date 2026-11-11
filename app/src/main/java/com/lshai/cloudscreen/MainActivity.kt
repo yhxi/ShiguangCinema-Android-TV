@@ -465,6 +465,7 @@ class MainActivity : Activity() {
         if (currentScreen == "children") childrenOverviewScrollY = childrenOverviewScroll?.scrollY ?: 0
         // Do not keep speculative cover requests running while the app is in the background.
         childrenPrefetchJob?.cancel()
+        childrenNearPrefetchJob?.cancel()
         childrenCoverJobs.values.toList().forEach { it.cancel() }
         childrenPreloadedSignature = ""
         super.onPause()
@@ -6374,6 +6375,8 @@ class MainActivity : Activity() {
     private val childrenCoverJobs = mutableMapOf<String, Job>()
     private val childrenBadCovers = mutableMapOf<String, MutableSet<String>>()
     private var childrenPrefetchJob: Job? = null
+    private var childrenNearPrefetchJob: Job? = null
+    private var homePrefetchGeneration = 0L
     private var childrenCoverSignature = ""
     /** 手动指定的封面（片名 → URL）：优先级高于自动解析，永远不会被覆盖 */
     private var childrenPinnedCovers: Map<String, String> = emptyMap()
@@ -6422,10 +6425,10 @@ class MainActivity : Activity() {
     private data class ChildrenImageResult(val bitmap: android.graphics.Bitmap?)
 
     /** Null means the wait expired; a result with a null bitmap means an actual load failure. */
-    private suspend fun awaitChildrenImage(url: String, width: Int, height: Int): ChildrenImageResult? =
+    private suspend fun awaitChildrenImage(url: String, width: Int, height: Int, background: Boolean = true): ChildrenImageResult? =
         kotlinx.coroutines.withTimeoutOrNull(35_000) {
             kotlinx.coroutines.suspendCancellableCoroutine { continuation ->
-                imageLoader.load(url, width, height, background = true, needed = { continuation.isActive }, onCancelled = {
+                imageLoader.load(url, width, height, background = background, needed = { continuation.isActive }, onCancelled = {
                     continuation.cancel(kotlinx.coroutines.CancellationException("图片缓存已清理"))
                 }) { bitmap ->
                     if (continuation.isActive) continuation.resumeWith(Result.success(ChildrenImageResult(bitmap)))
@@ -6646,7 +6649,7 @@ class MainActivity : Activity() {
     private fun queueChildrenCover(title: String, width: Int, height: Int, image: ImageView? = null): Job? {
         val signature = childrenCoverSignature
         val pinned = childrenPinnedCovers[title]
-        val cached = childrenCovers[title] ?: pinned
+        val cached = pinned ?: childrenCovers[title]
         if (cached != null) {
             if (image != null) imageLoader.load(cached, width, height, onCancelled = {
                 if (image.tag == title) updateChildrenCoverStatus(image, "可重试")
@@ -6689,6 +6692,7 @@ class MainActivity : Activity() {
                 val deadline = android.os.SystemClock.elapsedRealtime() + 25_000L
                 val watchdog = scope.launch { delay(26_000); coverConnections.cancel() }
                 try {
+                        var earlyShown = false
                         suspend fun tryCoverUrls(urls: List<String>, perImageBudget: Long = 15_000L): String {
                             val candidates = urls.filter { it !in childrenBadCovers[title].orEmpty() }.take(4)
                             var best = ""
@@ -6700,9 +6704,30 @@ class MainActivity : Activity() {
                                 val remaining = (deadline - android.os.SystemClock.elapsedRealtime()).coerceAtLeast(0L)
                                 if (remaining == 0L) break
                                 val pair = candidates.subList(i, minOf(i + 2, candidates.size))
-                                val results = kotlinx.coroutines.withTimeoutOrNull(minOf(remaining, perImageBudget)) {
-                                    pair.map { candidate -> async { awaitChildrenImage(candidate, width, height) } }.awaitAll()
-                                } ?: List(pair.size) { null }
+                                // Keep completed results even if a sibling times out; publish a good
+                                // matching cover immediately while remaining candidates are compared.
+                                val arrived = arrayOfNulls<ChildrenImageResult>(pair.size)
+                                kotlinx.coroutines.withTimeoutOrNull(minOf(remaining, perImageBudget)) {
+                                    pair.mapIndexed { index, candidate -> async {
+                                        val visible = waiting.any { it.get()?.tag == title }
+                                        val result = awaitChildrenImage(candidate, width, height, background = !visible)
+                                        arrived[index] = result
+                                        val bitmap = result?.bitmap
+                                        if (!earlyShown && bitmap != null && waiting.any { it.get()?.tag == title } && signature == childrenCoverSignature &&
+                                            childrenPinnedCovers[title] == null &&
+                                            childrenCoverQuality(bitmap.width, bitmap.height, width, height) >= .82) {
+                                            earlyShown = true
+                                            waiting.forEach { ref ->
+                                                val target = ref.get()
+                                                if (target != null && target.tag == title) {
+                                                    setChildrenBitmap(target, bitmap)
+                                                    updateChildrenCoverStatus(target, null)
+                                                }
+                                            }
+                                        }
+                                    } }.awaitAll()
+                                }
+                                val results = arrived.toList()
                                 for ((idx, result) in results.withIndex()) {
                                     val candidate = pair[idx]
                                     if (result?.bitmap != null) {
@@ -6717,6 +6742,17 @@ class MainActivity : Activity() {
                             }
                             return best
                         }
+                    val previewSlot = kotlinx.coroutines.sync.Semaphore(1)
+                    suspend fun revealFromSearch(items: List<SearchItem>) {
+                        if (items.isEmpty() || waiting.none { it.get()?.tag == title }) return
+                        previewSlot.acquire()
+                        try {
+                            if (!earlyShown && childrenPinnedCovers[title] == null && signature == childrenCoverSignature) {
+                                val candidates = childrenCoverCandidates(title, items.map { it.name to it.pic })
+                                if (candidates.isNotEmpty()) tryCoverUrls(candidates, perImageBudget = 4_000L)
+                            }
+                        } finally { previewSlot.release() }
+                    }
                     val independent = withContext(Dispatchers.IO) { ChildrenArtworkIndex.urls(applicationContext, title) }
                     var chosen = tryCoverUrls(independent, perImageBudget = 6_000L)
                     // 直连源全部并发查：原来逐源串行，一个慢源卡几秒就把后面全部拖住。
@@ -6727,8 +6763,10 @@ class MainActivity : Activity() {
                             val items = withContext(Dispatchers.IO) {
                                 directSources.map { src ->
                                     async {
-                                        runCatching { coverConnections.run { DirectCms.search(src, title) } }
+                                        val found = runCatching { coverConnections.run { DirectCms.search(src, title) } }
                                             .getOrDefault(emptyList())
+                                        withContext(Dispatchers.Main) { revealFromSearch(found) }
+                                        found
                                     }
                                 }.awaitAll()
                             }.flatten()
@@ -6742,8 +6780,10 @@ class MainActivity : Activity() {
                         val items = withContext(Dispatchers.IO) {
                             batch.map { src ->
                                 async {
-                                    runCatching { coverConnections.run { requestApi.search(title, listOf(src), readTimeoutMs = 6_000).items } }
+                                    val found = runCatching { coverConnections.run { requestApi.search(title, listOf(src), readTimeoutMs = 6_000).items } }
                                         .getOrDefault(emptyList())
+                                    withContext(Dispatchers.Main) { revealFromSearch(found) }
+                                    found
                                 }
                             }.awaitAll()
                         }.flatten()
@@ -6753,6 +6793,8 @@ class MainActivity : Activity() {
                     if (requestApi !== api || signature != childrenCoverSignature) return@launch
                     childrenCoverTried.add(title)
                     if (chosen.isNotEmpty()) {
+                        // A parent may have selected a cover while this search was running.
+                        chosen = childrenPinnedCovers[title] ?: chosen
                         childrenCovers[title] = chosen
                         persistChildrenCovers(signature)
                         waiting.forEach { ref ->
@@ -6810,8 +6852,10 @@ class MainActivity : Activity() {
         childrenPrefetchJob = scope.launch {
             // 先让可见卡片的解析占用并发坑，4 秒后再开始后台预热
             delay(4_000)
-            // 每批 3 个并发预取：配合 8 个信号量槽，给可见卡片留足余量
-            for (batch in (ChildrenCatalog.sections.indices.flatMap { childrenDailyPicks(it, if (isTvDevice) 3 else 2) } + ChildrenCatalog.preloadOrder()).distinct().chunked(3)) {
+            // 只预热首页附近的候选，给可见卡片和下一屏留出下载资源。
+            val nearby = ChildrenCatalog.sections.indices.flatMap { childrenDailyPicks(it, if (isTvDevice) 3 else 2) } +
+                ChildrenCatalog.sections.flatMap { it.titles.take(if (isTvDevice) 4 else 3) }
+            for (batch in nearby.distinct().chunked(2)) {
                 if (signature != childrenCoverSignature) break
                 batch.map { title -> async {
                     val cover = childrenCovers[title]
@@ -7114,6 +7158,27 @@ class MainActivity : Activity() {
                 true
             }
         }
+        var lastPrefetchKey = ""
+        grid.setOnScrollListener(object : android.widget.AbsListView.OnScrollListener {
+            override fun onScrollStateChanged(view: android.widget.AbsListView?, state: Int) = Unit
+            override fun onScroll(view: android.widget.AbsListView?, first: Int, visible: Int, total: Int) {
+                if (visible <= 0 || first + visible >= total) return
+                val start = first + visible
+                val key = "$childrenMoreFilter:$start:${items.getOrNull(start)}"
+                if (lastPrefetchKey == key) return
+                lastPrefetchKey = key
+                val next = items.drop(start).take(columns)
+                childrenNearPrefetchJob?.cancel()
+                childrenNearPrefetchJob = scope.launch {
+                    delay(250)
+                    if (currentScreen != "children_more" || childrenMoreGrid !== grid) return@launch
+                    for (batch in next.chunked(2)) {
+                        if (currentScreen != "children_more") break
+                        batch.map { title -> async { queueChildrenCover(title, width, height)?.join() } }.awaitAll()
+                    }
+                }
+            }
+        })
         childrenMoreGrid = grid
         rootColumn.addView(grid, LinearLayout.LayoutParams(-1, 0, 1f))
         val savedTitle = childrenMoreTitle
@@ -7331,12 +7396,13 @@ class MainActivity : Activity() {
                 val lm = recyclerView.layoutManager as? LinearLayoutManager ?: return
                 homeRvPosition = lm.findFirstVisibleItemPosition()
                 homeRvOffset = lm.findViewByPosition(homeRvPosition)?.top?.minus(recyclerView.paddingTop) ?: 0
+                val last = lm.findLastVisibleItemPosition()
+                scheduleHomePosterPrefetch(rv, last, columns)
                 if (suppressAutoLoad) {
                     // 刚恢复位置的那一次回滚不算「用户滑到底」
                     suppressAutoLoad = false
                     return
                 }
-                val last = lm.findLastVisibleItemPosition()
                 if (feed.itemCount - last <= 6 &&
                     !isLoadingMore && recommendRetry == null && !noMoreRecommend && recommendItems.isNotEmpty()
                 ) {
@@ -7577,6 +7643,22 @@ class MainActivity : Activity() {
                 setPadding(0, dp(3), 0, 0)
             })
         }
+    }
+
+    /** Preload only the next row, after visible requests have had a chance to start. */
+    private fun scheduleHomePosterPrefetch(rv: RecyclerView, lastVisible: Int, columns: Int) {
+        if (lastVisible < 0) return
+        val generation = ++homePrefetchGeneration
+        rv.postDelayed({
+            if (!rv.isAttachedToWindow || currentScreen != "recommend" || generation != homePrefetchGeneration) return@postDelayed
+            val metrics = recommendCellMetrics()
+            // Position zero is the full-width header, so lastVisible is the next item index.
+            for (index in lastVisible until minOf(lastVisible + columns, recommendItems.size)) {
+                val item = recommendItems[index]
+                imageLoader.load(item.cover, metrics[0], metrics[1], background = true,
+                    needed = { rv.isAttachedToWindow && currentScreen == "recommend" && generation == homePrefetchGeneration }) { }
+            }
+        }, 250)
     }
 
     /** 把一个单元格填上第 position 条推荐（图片按 URL 校验，快速滚动不会串图） */
