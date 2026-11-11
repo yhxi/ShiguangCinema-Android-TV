@@ -459,6 +459,8 @@ class MainActivity : EdgeSwipeBackActivity() {
     }
 
     override fun onPause() {
+        recommendRetryJob?.cancel()
+        recommendRetryJob = null
         quotaVisible = false
         quotaHandler.removeCallbacks(quotaTick)
         uiMonitor?.stop()
@@ -478,6 +480,7 @@ class MainActivity : EdgeSwipeBackActivity() {
         super.onResume()
         ChildrenQuota.init(this)
         quotaVisible = true
+        if (currentScreen == "recommend") scheduleRecommendRetry()
         quotaHandler.removeCallbacks(quotaTick)
         quotaHandler.post(quotaTick)
         if (BuildConfig.TEST_BUILD && prefs.uiStatsEnabled) startUiMonitor()
@@ -617,7 +620,7 @@ class MainActivity : EdgeSwipeBackActivity() {
             }
             return
         }
-        if (currentScreen != "home" && currentScreen != "recommend") lastHomeBackAt = 0L
+        if (currentScreen != "recommend") lastHomeBackAt = 0L
         when (currentScreen) {
             "files" -> if (browseLiveImport) { browseLiveImport = false; showLive() } else showSources()
             "qradd" -> { qrServer?.stop(); qrServer = null; showSources() }
@@ -637,7 +640,14 @@ class MainActivity : EdgeSwipeBackActivity() {
             "live_import" -> showLive()
             "sources" -> returnFromSources()
             "vodsources" -> showSources()
-            "home", "recommend" -> {
+            "home" -> {
+                homeKeywordField?.let { field ->
+                    (getSystemService(INPUT_METHOD_SERVICE) as? InputMethodManager)?.hideSoftInputFromWindow(field.windowToken, 0)
+                    field.clearFocus()
+                }
+                showRecommend()
+            }
+            "recommend" -> {
                 if (isTvDevice) super.onBackPressed()
                 else {
                     val now = android.os.SystemClock.uptimeMillis()
@@ -5943,11 +5953,6 @@ class MainActivity : EdgeSwipeBackActivity() {
         }, LinearLayout.LayoutParams(0, -2, 1f))
         head.addView(button("全部历史") { showHistoryCards() })
         col.addView(head)
-        if (recent.size > if (isTvDevice) 3 else 2) {
-            col.addView(hintText(if (isTvDevice) "左右键查看更多" else "左右滑动查看更多").apply {
-                setPadding(0, 0, 0, dp(6))
-            })
-        }
         if (!isTvDevice) {
             addMobileRecentPosters(col, recent)
             return
@@ -7236,6 +7241,7 @@ class MainActivity : EdgeSwipeBackActivity() {
 
     private fun showRecommend() {
         currentScreen = "recommend"
+        scheduleRecommendRetry()
         childrenSearchOrigin = null
         homeHistoryCoverViews.clear()
         if (recommendItems.isEmpty() && !recommendRequested) {
@@ -7380,21 +7386,10 @@ class MainActivity : EdgeSwipeBackActivity() {
             loadRecommend()
         })
         col.addView(titleRow)
-        // 启动/连接中不显示「暂时没有推荐」：那时还没有结果，
-        // 顶部已经有一行状态说明，再来一条只会让首屏显得像出错了。
-        // 首屏空态分两种，别混在一起：
-        //   还在拉数据 → 只留一行"正在整理…"，不摆「重试推荐」（那时按了也没用，反而像出错）
-        //   拉完了确实没有 → 才给说明 + 重试
         if (recommendItems.isEmpty() && bootNotice == null) {
-            if (isLoadingMore) {
-                col.addView(hintText("正在整理最新热播剧集…"))
-            } else {
-                col.addView(hintText("暂时没有推荐，仍可搜索或从历史继续观看。"))
-                col.addView(button("重试推荐") { recommendRequested = false; showRecommend() })
-            }
+            col.addView(hintText("正在整理最新热门推荐…"))
         }
 
-        recommendRetry?.let { retry -> col.addView(button("推荐加载失败 · 点击重试") { retry() }) }
         showRecommendFeed(col)
     }
 
@@ -7556,6 +7551,10 @@ class MainActivity : EdgeSwipeBackActivity() {
                 return@runApiK
             }
             // 数据到手才换：分类、列表、分页状态一起切
+            recommendRetryJob?.cancel()
+            recommendRetryJob = null
+            recommendRetry = null
+            recommendRetryAttempts = 0
             mediaType = type
             recommendItems = items
             recommendPage = 0
@@ -7574,18 +7573,40 @@ class MainActivity : EdgeSwipeBackActivity() {
     }
 
     private var recommendRetry: (() -> Unit)? = null
+    private var recommendRetryJob: Job? = null
+    private var recommendRetryAttempts = 0
+
+    private fun scheduleRecommendRetry() {
+        if (!quotaVisible || currentScreen != "recommend" || recommendRetry == null || recommendRetryJob?.isActive == true) return
+        val waitMs = minOf(60_000L, 5_000L * (1L shl recommendRetryAttempts.coerceIn(0, 4)))
+        recommendRetryJob = scope.launch {
+            delay(waitMs)
+            recommendRetryJob = null
+            if (quotaVisible && currentScreen == "recommend") recommendRetry?.invoke()
+        }
+    }
+
+    private fun queueRecommendRetry(more: Boolean) {
+        recommendRetry = { loadRecommend(more) }
+        scheduleRecommendRetry()
+        recommendRetryAttempts = (recommendRetryAttempts + 1).coerceAtMost(4)
+    }
+
     private fun loadRecommend(more: Boolean = false) {
         if (more && (isLoadingMore || noMoreRecommend)) return
+        recommendRetryJob?.cancel()
+        recommendRetryJob = null
         recommendRetry = null
         isLoadingMore = true
         val page = if (more) recommendPage + 1 else 0
         // 记下发起时的分类：切换分类的请求在另一个槽位，可能先回来了。
         // 这时这份结果已经过期，直接丢掉，否则会把「电影」的一页追加到「剧集」列表后面。
         val loadingType = mediaType
+        val loadingTag = prefs.recommendTag
         // 翻页不要提示：以前滚到底部会弹一个「加载更多…」对话框，非常吵。
         // 首屏加载也有页面内的「正在整理最新热播剧集…」兜着，同样不需要胶囊。
         runApiK("recommend", null, {
-            val tag = prefs.recommendTag
+            val tag = loadingTag
             // 混合模式两路各取 8；单选某个榜单就一次取 16，条数别变少
             val specs = if (tag.isEmpty()) listOf("最新" to 8, "热门" to 8) else listOf(tag to 16)
             specs.map { (t, n) ->
@@ -7595,16 +7616,16 @@ class MainActivity : EdgeSwipeBackActivity() {
             }.awaitAll().flatten().distinctBy { it.title.trim() }
         }, { items ->
             isLoadingMore = false
-            if (loadingType != mediaType) return@runApiK
+            if (loadingType != mediaType || loadingTag != prefs.recommendTag) return@runApiK
             if (items.isEmpty()) {
                 if (more) {
                     noMoreRecommend = true
                     toast("已经到底了")
                 } else {
-                    noMoreRecommend = true
-                    showRecommend()
+                    queueRecommendRetry(more = false)
                 }
             } else {
+                recommendRetryAttempts = 0
                 val appending = more && recommendItems.isNotEmpty() && currentScreen == "recommend"
                 val previousCount = recommendItems.size
                 val updated = (if (more) recommendItems + items else items)
@@ -7635,9 +7656,8 @@ class MainActivity : EdgeSwipeBackActivity() {
             }
         }, quiet = true, onError = {
             isLoadingMore = false
-            if (currentScreen == "recommend" && loadingType == mediaType) {
-                recommendRetry = { loadRecommend(more) }
-                showRecommend()
+            if (loadingType == mediaType && loadingTag == prefs.recommendTag) {
+                queueRecommendRetry(more)
             }
         })
     }
