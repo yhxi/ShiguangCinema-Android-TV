@@ -32,8 +32,11 @@ import java.io.File
 class LivePlayerActivity : Activity() {
     private val handler = Handler(Looper.getMainLooper())
     private var player: ExoPlayer? = null
+    private lateinit var httpFactory: androidx.media3.datasource.DefaultHttpDataSource.Factory
     private var playlistFile: File? = null
     private var channels = emptyList<Channel>()
+    private var channelLines = emptyList<List<Channel>>()
+    private var lineIndex = 0
     private var index = 0
     private lateinit var banner: TextView
     private lateinit var status: TextView
@@ -69,14 +72,24 @@ class LivePlayerActivity : Activity() {
         try {
             require(filename.startsWith("live-session-") && filename == file.name && file.isFile)
             val json = JSONArray(file.readText(Charsets.UTF_8))
-            channels = (0 until json.length()).mapNotNull { i ->
+            val incoming = (0 until json.length()).mapNotNull { i ->
                 val o = json.getJSONObject(i)
                 val url = o.optString("url")
                 if (!url.startsWith("http://", true) && !url.startsWith("https://", true)) null
-                else Channel(o.optString("name"), url, o.optString("group", "其他"), "")
+                else Channel(o.optString("name"), url, o.optString("group", "其他"), "", readLiveHeaders(o))
             }
+            require(incoming.isNotEmpty())
+            val initial = incoming[intent.getIntExtra("channel_index", 0).coerceIn(incoming.indices)]
+            val grouped = linkedMapOf<String, MutableList<Channel>>()
+            incoming.forEach { channel ->
+                val key = liveChannelKey(channel.name).ifBlank { channel.url }
+                val lines = grouped.getOrPut(key) { mutableListOf() }
+                if (lines.none { it.url == channel.url && it.headers == channel.headers }) lines.add(channel)
+            }
+            channelLines = grouped.values.map { it.toList() }
+            channels = channelLines.map { it.first() }
+            index = channelLines.indexOfFirst { list -> list.any { it.url == initial.url } }.coerceAtLeast(0)
             playlistFile = file
-            require(channels.isNotEmpty())
         } catch (_: Exception) {
             Toast.makeText(this, "无法读取频道列表，请重新进入电视直播", Toast.LENGTH_LONG).show()
             finish()
@@ -128,10 +141,10 @@ class LivePlayerActivity : Activity() {
         })
         setContentView(root)
         BackgroundPlayback.player?.pause()
-        val http = androidx.media3.datasource.DefaultHttpDataSource.Factory()
+        httpFactory = androidx.media3.datasource.DefaultHttpDataSource.Factory()
             .setAllowCrossProtocolRedirects(true)
         player = ExoPlayer.Builder(this)
-            .setMediaSourceFactory(androidx.media3.exoplayer.source.DefaultMediaSourceFactory(http))
+            .setMediaSourceFactory(androidx.media3.exoplayer.source.DefaultMediaSourceFactory(httpFactory))
             .build().also { p ->
             p.setAudioAttributes(AudioAttributes.DEFAULT, true)
             p.setHandleAudioBecomingNoisy(true)
@@ -151,24 +164,37 @@ class LivePlayerActivity : Activity() {
                     }
                 }
                 override fun onPlayerError(error: PlaybackException) {
-                    status.text = "当前频道暂时无法播放\n上下换台 · 确定选择频道或重试"
-                    status.visibility = View.VISIBLE
-                    showBanner()
+                    val failedChannel = index
+                    val failedLine = lineIndex
+                    if (failedLine + 1 < channelLines[failedChannel].size) {
+                        status.text = "当前线路不可用，正在切换备用线路…"
+                        status.visibility = View.VISIBLE
+                        handler.post {
+                            if (index == failedChannel && lineIndex == failedLine && !isFinishing)
+                                tune(failedChannel, failedLine + 1)
+                        }
+                    } else {
+                        status.text = "当前频道暂时无法播放\n上下换台 · 确定选择频道或重试"
+                        status.visibility = View.VISIBLE
+                        showBanner()
+                    }
                 }
             })
         }
-        tune((savedInstanceState?.getInt("channel_index") ?: intent.getIntExtra("channel_index", 0))
-            .coerceIn(channels.indices))
+        tune((savedInstanceState?.getInt("channel_index") ?: index).coerceIn(channels.indices))
     }
 
-    private fun tune(target: Int) {
+    private fun tune(target: Int, line: Int = 0) {
         index = target
+        lineIndex = line.coerceIn(channelLines[index].indices)
         digits = ""
         handler.removeCallbacks(commitDigits)
         status.text = "正在打开 ${channels[index].name}…"
         status.visibility = View.VISIBLE
+        val line = channelLines[index][lineIndex]
+        httpFactory.setDefaultRequestProperties(line.headers)
         player?.apply {
-            setMediaItem(MediaItem.fromUri(channels[index].url))
+            setMediaItem(MediaItem.fromUri(line.url))
             prepare()
             play()
         }
@@ -181,7 +207,8 @@ class LivePlayerActivity : Activity() {
 
     private fun showBanner() {
         if (!::banner.isInitialized) return
-        banner.text = "${index + 1}  ${channels[index].name}\n${channels[index].group} · 上下换台 / 确定选频道"
+        val line = if (channelLines[index].size > 1) " · 线路 ${lineIndex + 1}/${channelLines[index].size}" else ""
+        banner.text = "${index + 1}  ${channels[index].name}$line\n${channels[index].group} · 上下换台 / 确定选频道"
         banner.visibility = View.VISIBLE
         controls.visibility = View.VISIBLE
         handler.removeCallbacks(hideBanner)
@@ -193,11 +220,63 @@ class LivePlayerActivity : Activity() {
         handler.removeCallbacks(commitDigits)
         digits = ""
         showBanner()
+        var group = "全部分组"
+        var visible = channels.indices.toList()
+        val list = android.widget.ListView(this).apply {
+            choiceMode = android.widget.ListView.CHOICE_MODE_SINGLE
+        }
+        val search = android.widget.EditText(this).apply {
+            hint = "搜索频道"
+            isSingleLine = true
+        }
+        val groupButton = android.widget.Button(this).apply { text = group }
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), 0, dp(16), 0)
+        }
+        val filters = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        filters.addView(groupButton, LinearLayout.LayoutParams(-2, -2))
+        filters.addView(search, LinearLayout.LayoutParams(0, -2, 1f))
+        content.addView(filters)
+        content.addView(list, LinearLayout.LayoutParams(-1, minOf(dp(340), (resources.displayMetrics.heightPixels * 0.52f).toInt())))
+        fun refresh() {
+            val query = search.text.toString().trim()
+            visible = channels.indices.filter { i ->
+                (group == "全部分组" || channels[i].group == group) &&
+                    (query.isEmpty() || channels[i].name.contains(query, ignoreCase = true))
+            }
+            list.adapter = android.widget.ArrayAdapter(this, android.R.layout.simple_list_item_single_choice,
+                visible.map { i -> "${i + 1}  ${channels[i].name} · ${channels[i].group}" })
+            val selected = visible.indexOf(index)
+            if (selected >= 0) { list.setItemChecked(selected, true); list.setSelection(selected) }
+        }
+        groupButton.setOnClickListener {
+            val groups = listOf("全部分组") + channels.map { it.group }.distinct().sorted()
+            AlertDialog.Builder(this).setTitle("选择分组").setItems(groups.toTypedArray()) { _, which ->
+                group = groups[which]; groupButton.text = group; refresh()
+            }.setNegativeButton("取消", null).show()
+        }
+        search.addTextChangedListener(object : android.text.TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) = refresh()
+            override fun afterTextChanged(s: android.text.Editable?) = Unit
+        })
+        list.setOnItemClickListener { _, _, position, _ ->
+            val target = visible.getOrNull(position) ?: return@setOnItemClickListener
+            picker?.dismiss()
+            tune(target)
+        }
+        refresh()
         picker = AlertDialog.Builder(this).setTitle("电视直播 · 选择频道")
-            .setSingleChoiceItems(channels.mapIndexed { i, c -> "${i + 1}  ${c.name} · ${c.group}" }.toTypedArray(), index) { dialog, target ->
-                dialog.dismiss()
-                tune(target)
-            }.setNegativeButton("关闭", null).show()
+            .setView(content)
+            .setNeutralButton("重试当前台") { _, _ -> tune(index) }
+            .setNegativeButton("关闭", null).create().also { dialog ->
+                dialog.setOnShowListener {
+                    dialog.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN)
+                    list.requestFocus()
+                }
+                dialog.show()
+            }
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {

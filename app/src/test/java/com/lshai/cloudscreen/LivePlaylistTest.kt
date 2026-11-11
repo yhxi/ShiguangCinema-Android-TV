@@ -41,4 +41,26 @@ class LivePlaylistTest {
         assertEquals(0, stepLiveChannel(0, 1, 1))
         assertEquals(-1, stepLiveChannel(0, 1, 0))
     }
+
+    @Test fun orderIsCctvThenLocalThenOtherWithoutBreakingCctv5Plus() {
+        val names = listOf("其他频道", "湖南卫视", "CCTV-15", "CCTV5+", "CCTV-2", "CCTV-1", "CCTV-5", "地方新闻")
+        val channels = names.map { Channel(it, "https://example.com/$it", if (it == "地方新闻") "地方台" else "其他", "") }
+        assertEquals(listOf("CCTV-1", "CCTV-2", "CCTV-5", "CCTV5+", "CCTV-15", "湖南卫视", "地方新闻", "其他频道"), sortedLiveChannels(channels).map { it.name })
+        assertTrue(isCctvOne("央视CCTV-1"))
+        assertEquals(liveChannelKey("CCTV-1 综合高清"), liveChannelKey("CCTV1"))
+        assertEquals(liveChannelKey("央视综合"), liveChannelKey("CCTV1"))
+        assertNotEquals(liveChannelKey("CCTV5"), liveChannelKey("CCTV5+"))
+        assertNotEquals(liveChannelKey("CCTV4K"), liveChannelKey("CCTV8K"))
+        assertNotEquals(liveChannelKey("CCTV4K"), liveChannelKey("CCTV4"))
+    }
+    @Test fun quotedCommasHeadersAndUnsupportedLinesAreReported() {
+        val report = inspectLocalLivePlaylist("#EXTM3U\n#EXTINF:-1 group-title=\"新闻,综合\",CCTV-1\n#EXTVLCOPT:http-user-agent=MyPlayer\n#EXTVLCOPT:http-referrer=https://example.com/\nhttps://example.com/one.m3u8\n#EXTINF:-1,第二台\n#KODIPROP:inputstream.adaptive.license_key=ignored\nrelative.m3u8\nhttps://example.com/two.m3u8")
+        assertEquals("CCTV-1", report.channels[0].name)
+        assertEquals("新闻,综合", report.channels[0].group)
+        assertEquals("MyPlayer", report.channels[0].headers["User-Agent"])
+        assertEquals("https://example.com/", report.channels[0].headers["Referer"])
+        assertTrue(report.channels[1].headers.isEmpty())
+        assertEquals(1, report.skipped)
+        assertEquals(1, report.unsupportedDirectives)
+    }
 }

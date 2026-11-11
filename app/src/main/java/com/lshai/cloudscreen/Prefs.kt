@@ -46,7 +46,8 @@ class Prefs(ctx: Context) {
 
     data class ServerProfile(val url: String, val password: String, val cookie: String)
 
-    private val sp = ctx.applicationContext.getSharedPreferences("cloudscreen", Context.MODE_PRIVATE)
+    private val appContext = ctx.applicationContext
+    private val sp = appContext.getSharedPreferences("cloudscreen", Context.MODE_PRIVATE)
     // The raw preference string is the cache key, so writes by other Prefs instances invalidate it.
     private var cachedHistoryRaw: String? = null
     private var cachedHistory: List<HistoryEntry> = emptyList()
@@ -310,20 +311,54 @@ class Prefs(ctx: Context) {
         sp.edit().putBoolean(marker, true).apply()
     }
 
+    private fun localLiveFile(id: String): android.util.AtomicFile =
+        android.util.AtomicFile(java.io.File(appContext.filesDir, "live-" + stableDigest(serverUrl + "|" + id) + ".json"))
+
+    private fun writeLiveFile(id: String, text: String) {
+        val file = localLiveFile(id)
+        val output = file.startWrite()
+        try {
+            output.write(text.toByteArray(Charsets.UTF_8))
+            file.finishWrite(output)
+        } catch (e: Exception) {
+            file.failWrite(output)
+            throw e
+        }
+    }
     fun saveLocalLivePlaylist(name: String, channels: List<Channel>): String {
         val json = JSONArray()
-        channels.forEach { json.put(JSONObject().put("name", it.name).put("url", it.url).put("group", it.group).put("logo", it.logo)) }
-        val id = "local-live:" + stableDigest(json.toString())
-        sp.edit().putString(scoped(id), json.toString()).putString(scoped("label:$id"), name).apply()
+        channels.forEach { json.put(JSONObject().put("name", it.name).put("url", it.url).put("group", it.group).put("logo", it.logo).put("headers", JSONObject(it.headers))) }
+        val text = json.toString()
+        val id = "local-live:" + stableDigest(text)
+        writeLiveFile(id, text)
+        sp.edit().putString(scoped("label:$id"), name).apply()
         saveLiveUrls((liveUrls() + id).distinct())
         activeLiveUrl = id
         return id
     }
     fun localLiveChannels(id: String): List<Channel> {
-        val json = JSONArray(sp.getString(scoped(id), "[]"))
+        val file = localLiveFile(id)
+        val legacy = sp.getString(scoped(id), null)
+        val text = try {
+            file.openRead().bufferedReader(Charsets.UTF_8).use { it.readText() }
+        } catch (_: java.io.FileNotFoundException) {
+            if (legacy != null) {
+                writeLiveFile(id, legacy)
+                sp.edit().remove(scoped(id)).apply()
+                legacy
+            } else "[]"
+        }
+        val json = JSONArray(text)
         return (0 until json.length()).map { i ->
             val o = json.getJSONObject(i)
-            Channel(o.optString("name"), o.optString("url"), o.optString("group", "其他"), o.optString("logo"))
+            Channel(o.optString("name"), o.optString("url"), o.optString("group", "其他"), o.optString("logo"), readLiveHeaders(o))
+        }
+    }
+    fun removeLiveSource(id: String) {
+        saveLiveUrls(liveUrls().filterNot { it == id })
+        if (id.startsWith("local-live:")) {
+            localLiveFile(id).delete()
+            sp.edit().remove(scoped(id)).remove(scoped("label:$id")).apply()
         }
     }
     fun liveSourceLabel(id: String): String = if (id.startsWith("local-live:"))

@@ -92,7 +92,15 @@ data class DoubanItem(val title: String, val cover: String, val rating: String)
 
 data class SearchResult(val items: List<SearchItem>, val failures: Int)
 
-data class Channel(val name: String, val url: String, val group: String, val logo: String)
+data class Channel(val name: String, val url: String, val group: String, val logo: String, val headers: Map<String, String> = emptyMap())
+
+internal fun readLiveHeaders(item: JSONObject): Map<String, String> {
+    val headers = item.optJSONObject("headers") ?: return emptyMap()
+    return listOf("User-Agent", "Referer", "Origin").mapNotNull { key ->
+        headers.optString(key).takeIf { it.isNotEmpty() && it.length <= 512 && '\n' !in it && '\r' !in it }?.let { key to it }
+    }.toMap()
+}
+
 
 class HttpError(val status: Int, val body: String) : Exception("HTTP $status")
 
