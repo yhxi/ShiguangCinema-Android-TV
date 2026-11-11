@@ -88,7 +88,7 @@ private const val PARTIAL_RENDER_INTERVAL_MS = 400L
  *
  * 屏幕：设置 → 片源 → 首页（搜索 + 结果）→ 详情（选集）→ 播放器（独立 Activity）
  */
-class MainActivity : Activity() {
+class MainActivity : EdgeSwipeBackActivity() {
 
     private val isTvDevice: Boolean by lazy {
         resources.configuration.uiMode and Configuration.UI_MODE_TYPE_MASK == Configuration.UI_MODE_TYPE_TELEVISION ||
@@ -369,8 +369,16 @@ class MainActivity : Activity() {
         return null
     }
 
+    private var lastHomeBackAt = 0L
+    private var systemBackCallback: android.window.OnBackInvokedCallback? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (Build.VERSION.SDK_INT >= 33 && !isTvDevice) {
+            systemBackCallback = android.window.OnBackInvokedCallback { onBackPressed() }.also {
+                onBackInvokedDispatcher.registerOnBackInvokedCallback(android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT, it)
+            }
+        }
         CrashLog.install(this)
         prefs = Prefs(this)
         // Discard update metadata left by older builds that followed the upstream project.
@@ -410,6 +418,7 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        if (Build.VERSION.SDK_INT >= 33) systemBackCallback?.let { onBackInvokedDispatcher.unregisterOnBackInvokedCallback(it) }
         cancelUpdateDownload(showMessage = false)
         homeMaintenanceJob?.cancel()
         favoriteCheckJob?.cancel()
@@ -614,6 +623,7 @@ class MainActivity : Activity() {
             }
             return
         }
+        if (currentScreen != "home" && currentScreen != "recommend") lastHomeBackAt = 0L
         when (currentScreen) {
             "files" -> if (browseLiveImport) { browseLiveImport = false; showLive() } else showSources()
             "qradd" -> { qrServer?.stop(); qrServer = null; showSources() }
@@ -633,7 +643,14 @@ class MainActivity : Activity() {
             "live_import" -> showLive()
             "sources" -> returnFromSources()
             "vodsources" -> showSources()
-            "home", "recommend" -> super.onBackPressed()
+            "home", "recommend" -> {
+                if (isTvDevice) super.onBackPressed()
+                else {
+                    val now = android.os.SystemClock.uptimeMillis()
+                    if (lastHomeBackAt != 0L && now - lastHomeBackAt < 2000L) super.onBackPressed()
+                    else { lastHomeBackAt = now; toast("再返回一次退出应用") }
+                }
+            }
             // 导入流程内的页面：逐级退回上一级，而不是退出 App
             "input" -> showAddSource()
             "manualadd" -> showAddSource()
@@ -5012,7 +5029,7 @@ class MainActivity : Activity() {
 
         val coverUrl = detail.info.cover.ifEmpty { item.pic }
         if (coverUrl.isNotEmpty()) {
-            imageLoader.load(coverUrl, dp(300), dp(440)) { bmp -> bmp?.let { cover.setImageBitmap(it) } }
+            imageLoader.load(coverUrl, dp(300), dp(440), onPreview = { cover.setImageBitmap(it) }) { bmp -> bmp?.let { cover.setImageBitmap(it) } }
         }
 
         col.addView(hintText("选择集数（共 ${detail.episodes.size} 集）："))
@@ -5915,7 +5932,7 @@ class MainActivity : Activity() {
     private fun updateHomeHistoryCover(playUrl: String, cover: String) {
         val (view, width, height) = homeHistoryCoverViews[playUrl] ?: return
         view.tag = cover
-        imageLoader.load(cover, width, height) { bmp ->
+        imageLoader.load(cover, width, height, onPreview = { bmp -> if (view.tag == cover) view.setImageBitmap(bmp) }) { bmp ->
             if (view.tag == cover && bmp != null) view.setImageBitmap(bmp)
         }
     }
@@ -7683,7 +7700,7 @@ class MainActivity : Activity() {
         val previousCover = img.tag as? String
         img.tag = item.cover
         if (previousCover != item.cover) img.setImageDrawable(null)
-        imageLoader.load(item.cover, posterWidth, posterHeight, needed = posterSubscription(img)::get) { bmp ->
+        imageLoader.load(item.cover, posterWidth, posterHeight, needed = posterSubscription(img)::get, onPreview = { bmp -> if (img.tag == item.cover) img.setImageBitmap(bmp) }) { bmp ->
             if (img.tag == item.cover) img.setImageBitmap(bmp)
         }
         cell.setOnClickListener { doSearch(item.title) }

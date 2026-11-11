@@ -69,7 +69,7 @@ import androidx.media3.ui.PlayerView
  * 片名默认隐藏，只在暂停、操作栏打开、或出错时出现。
  * 缓冲时在「缓冲中…」下面显示实时网速（按累计字节差分计算）。
  */
-class PlayerActivity : Activity() {
+class PlayerActivity : EdgeSwipeBackActivity() {
 
     private val isTvDevice: Boolean by lazy {
         resources.configuration.uiMode and Configuration.UI_MODE_TYPE_MASK == Configuration.UI_MODE_TYPE_TELEVISION ||
@@ -1266,7 +1266,7 @@ class PlayerActivity : Activity() {
         // 余量 1.5 秒：手动往前拖一点重看片头结尾时不要再被弹走
         if (pos >= end - 1_500) return
         // 标记来自别的源（时长不同的版本）时可能超过本集总长，直接判为无效，免得一跳到底
-        if (p.duration > 0 && end > p.duration - 60_000) return
+        if (p.duration > 0 && end >= p.duration - 1_000) return
         p.seekTo(currentIndex, end)
         toast("已跳过片头（${formatTime(end)} 处开始）")
     }
@@ -1317,19 +1317,35 @@ class PlayerActivity : Activity() {
     }
 
     private fun markOutroHere() {
-        val key = skipKey()
         val p = player ?: return
+        val key = skipKey()
         val pos = p.currentPosition
-        if (key.isEmpty() || pos < 1_000L || (p.duration > 0 && pos >= p.duration - 5_000L)) {
-            toast("播放到片尾开始处，再点片尾")
-            return
+        // Record a usable outro point for subsequent episodes, but a manual skip is
+        // still allowed near the end (or before a usable point can be recorded).
+        val recorded = key.isNotEmpty() && pos >= 1_000L &&
+            (p.duration <= 0 || pos < p.duration - 5_000L)
+        if (recorded) {
+            prefs.saveOutroStart(key, pos)
+            prefs.skipOutroEnabled = true
+            updateSkipButtons()
         }
-        prefs.saveOutroStart(key, pos)
-        prefs.skipOutroEnabled = true
-        // 此集刚标记时不立即切集；下一集开始恢复自动跳片尾。
-        outroMarkedUrl = currentUrl()
-        updateSkipButtons()
-        toast("已记片尾 ${formatTime(pos)}，本剧后续集数自动跳过")
+        val originalUrl = currentUrl()
+        fun playNext() {
+            if (isFinishing || isDestroyed || currentUrl() != originalUrl) return
+            if (currentIndex + 1 in urls.indices) {
+                switchEpisode(currentIndex + 1)
+            } else {
+                toast(if (recorded) "已记录片尾，当前没有下一集" else "当前没有下一集")
+            }
+        }
+        if (currentIndex + 1 in urls.indices) {
+            playNext()
+        } else if (urls.size <= 1) {
+            toast("正在查找下一集…")
+            resolveEpisodes(onDone = { playNext() }, silent = true)
+        } else {
+            toast(if (recorded) "已记录片尾，当前没有下一集" else "当前没有下一集")
+        }
     }
 
     private fun updateSkipButtons() {

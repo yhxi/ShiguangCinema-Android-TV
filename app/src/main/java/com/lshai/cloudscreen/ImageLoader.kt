@@ -9,7 +9,6 @@ import android.util.LruCache
 import java.io.File
 import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
@@ -24,8 +23,8 @@ import java.util.concurrent.atomic.AtomicLong
  *      进程一被杀就全部重下，冷启动时满屏灰格子一个一个变亮；而且 3 个下载线程各干各的，
  *      同一张海报被几个格子同时请求就重复下载几次。
  *
- * 磁盘缓存放在 cacheDir（系统空间不足时会自动清掉，不需要存储权限），
- * 上限 50MB，按 LRU（文件的 lastModified 当最后一次访问时间）淘汰。
+ * 磁盘缓存放在应用私有文件目录，重启后保留，不需要存储权限，
+ * 上限 200MB，按 LRU（文件的 lastModified 当最后一次访问时间）淘汰。
  */
 class ImageLoader(private val context: Context, api: Api) {
 
@@ -58,17 +57,16 @@ class ImageLoader(private val context: Context, api: Api) {
     private val requestOrder = AtomicLong(0)
     private val scheduler = ImageRequestScheduler()
     private val scheduled = HashMap<String, ImageTask>()
-    // 磁盘压缩单独排队，不占用下载线程；首屏后续海报无需等前一张落盘。
-    private val diskPool = Executors.newSingleThreadExecutor()
     private val main = Handler(Looper.getMainLooper())
     @Volatile private var closed = false
 
     /** 正在下载的图：同一个 key 的后续请求排队等结果，不再各自发起下载 */
-    private data class ImageCallback(val ready: (Bitmap?) -> Unit, val cancelled: (() -> Unit)?, val needed: () -> Boolean, val foreground: Boolean)
+    private data class ImageCallback(val ready: (Bitmap?) -> Unit, val preview: ((Bitmap) -> Unit)?, val cancelled: (() -> Unit)?, val needed: () -> Boolean, val foreground: Boolean)
     private val inFlight = ConcurrentHashMap<String, MutableList<ImageCallback>>()
 
-    private val diskDir = File(context.cacheDir, "poster_cache")
-    private val maxDiskBytes = 50L * 1024 * 1024
+    private val diskDir = File(context.filesDir, "poster_cache")
+    private val legacyDiskDir = File(context.cacheDir, "poster_cache")
+    private val maxDiskBytes = 200L * 1024 * 1024
     private val diskLock = Any()
     private val generation = AtomicLong(0)
     private val diskBytes = AtomicLong(0)
@@ -76,13 +74,13 @@ class ImageLoader(private val context: Context, api: Api) {
 
     fun load(
         url: String, reqWidth: Int, reqHeight: Int,
-        onCancelled: (() -> Unit)? = null, background: Boolean = false, needed: () -> Boolean = { true }, onReady: (Bitmap?) -> Unit,
+        onCancelled: (() -> Unit)? = null, background: Boolean = false, needed: () -> Boolean = { true }, onPreview: ((Bitmap) -> Unit)? = null, onReady: (Bitmap?) -> Unit,
     ) {
         if (closed) { onCancelled?.invoke(); return }
         if (url.isEmpty()) { onReady(null); return }
         val key = "$url@${reqWidth}x$reqHeight"
         cache.get(key)?.let { onReady(it); return }
-        val callback = ImageCallback(onReady, onCancelled, needed, !background)
+        val callback = ImageCallback(onReady, onPreview, onCancelled, needed, !background)
         val requestGeneration: Long
         synchronized(inFlight) {
             if (closed) { onCancelled?.invoke(); return }
@@ -104,13 +102,17 @@ class ImageLoader(private val context: Context, api: Api) {
                     return@ImageTask
                 }
                 val cached = runCatching { readFromDisk(url, reqWidth, reqHeight) }.getOrNull()
-                val bmp = cached ?: runCatching { download(url, reqWidth, reqHeight) }.getOrNull()
-                main.post { deliver(key, requestGeneration, bmp) }
-                if (cached == null && bmp != null && !closed) {
-                    runCatching { diskPool.execute { synchronized(diskLock) {
-                        if (generation.get() == requestGeneration) writeToDisk(url, bmp, reqWidth)
-                    } } }
+                val needsUpgrade = cached != null && cached.width < reqWidth * 9 / 10 && !isKnownSmall(url)
+                if (needsUpgrade) {
+                    main.post { deliverPreview(key, requestGeneration, cached!!) }
                 }
+                val downloaded = if (cached == null || needsUpgrade) runCatching { download(url, reqWidth, reqHeight) }.getOrNull() else null
+                // Commit before presenting the downloaded image; closing cannot discard an already displayed download.
+                if (downloaded != null) synchronized(diskLock) {
+                    if (generation.get() == requestGeneration) writeToDisk(url, downloaded, reqWidth)
+                }
+                val bmp = downloaded ?: cached
+                main.post { deliver(key, requestGeneration, bmp, cacheable = !needsUpgrade || downloaded != null) }
             }
             synchronized(inFlight) {
                 if (closed || generation.get() != requestGeneration || !inFlight.containsKey(key)) return
@@ -133,18 +135,24 @@ class ImageLoader(private val context: Context, api: Api) {
     fun close() {
         val callbacks = synchronized(inFlight) {
             closed = true
-            generation.incrementAndGet()
             inFlight.values.flatMap { it.toList() }.also { inFlight.clear(); scheduled.clear() }
         }
         scheduler.shutdown()
-        diskPool.shutdown()
         cancelCallbacks(callbacks)
     }
 
-    private fun deliver(key: String, requestGeneration: Long, bmp: Bitmap?) {
+    private fun deliverPreview(key: String, requestGeneration: Long, bmp: Bitmap) {
         val waiting = synchronized(inFlight) {
             if (closed || generation.get() != requestGeneration) return
-            if (bmp != null) cache.put(key, bmp)
+            inFlight[key]?.toList()
+        }
+        waiting?.forEach { if (it.needed()) it.preview?.invoke(bmp) }
+    }
+
+    private fun deliver(key: String, requestGeneration: Long, bmp: Bitmap?, cacheable: Boolean = true) {
+        val waiting = synchronized(inFlight) {
+            if (closed || generation.get() != requestGeneration) return
+            if (bmp != null && cacheable) cache.put(key, bmp)
             scheduled.remove(key)
             inFlight.remove(key)
         }
@@ -194,7 +202,7 @@ class ImageLoader(private val context: Context, api: Api) {
      * 用 JPEG(85) 而不是 PNG —— 海报是照片类内容，PNG 体积要大三四倍。
      *
      * 文件名只按 URL 算，**不带尺寸**：同一张海报在列表里是 240px、详情页要 600px，
-     * 按尺寸分目录会留下两三份副本，50MB 的缓存实际只装得下一半的片子。
+     * 按尺寸分目录会留下两三份副本，200MB 的缓存实际只装得下一半的片子。
      * 读取时按本次请求再降采样（见 [readFromDisk]）。
      */
     private fun diskFile(url: String): File = File(diskDir, sha1(url) + ".img")
@@ -220,6 +228,22 @@ class ImageLoader(private val context: Context, api: Api) {
 
     private fun readFromDisk(url: String, reqWidth: Int, reqHeight: Int): Bitmap? {
         val f = diskFile(url)
+        if (!f.isFile) synchronized(diskLock) {
+            val old = File(legacyDiskDir, f.name)
+            if (!f.isFile && old.isFile) runCatching {
+                diskDir.mkdirs()
+                ensureDiskScanned()
+                val tmp = File(diskDir, f.name + ".migrate")
+                old.copyTo(tmp, overwrite = true)
+                android.system.Os.rename(tmp.absolutePath, f.absolutePath)
+                File(legacyDiskDir, f.name.removeSuffix(".img") + ".small").let { marker ->
+                    if (marker.isFile) marker.copyTo(File(diskDir, marker.name), overwrite = true)
+                }
+                old.delete()
+                diskBytes.addAndGet(f.length())
+                trimDiskIfNeeded()
+            }
+        }
         if (!f.isFile || f.length() == 0L) return null
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeFile(f.absolutePath, bounds)
@@ -230,7 +254,6 @@ class ImageLoader(private val context: Context, api: Api) {
         }
         // 磁盘上是小图、这次要的是大图（先看了列表再进详情）：当作没有，重新下一张大的。
         // 但只重下一次 —— 原图就这么大的话，再下也没用。
-        if (bounds.outWidth < reqWidth * 9 / 10 && !isKnownSmall(url)) return null
         val opts = BitmapFactory.Options().apply {
             inSampleSize = sampleFor(bounds.outWidth, bounds.outHeight, reqWidth, reqHeight)
             inPreferredConfig = configFor(reqWidth)
@@ -270,11 +293,7 @@ class ImageLoader(private val context: Context, api: Api) {
                 return
             }
             // 先写临时文件再改名：中途被杀也不会留下半张图
-            if (target.exists()) target.delete()
-            if (!tmp.renameTo(target)) {
-                tmp.delete()
-                return
-            }
+            android.system.Os.rename(tmp.absolutePath, target.absolutePath)
             // 覆盖写要扣掉旧文件的体积，否则统计只增不减，缓存会被提前判满
             diskBytes.addAndGet(target.length() - oldLen)
             // 新图还是不够这次要的尺寸（原图就这么大），或者根本没比旧的大：
@@ -325,7 +344,7 @@ class ImageLoader(private val context: Context, api: Api) {
         val n = cache.snapshot().size
         cache.evictAll()
         synchronized(diskLock) {
-            runCatching { diskDir.deleteRecursively() }
+            runCatching { diskDir.deleteRecursively(); legacyDiskDir.deleteRecursively() }
             diskBytes.set(0)
             diskScanned.set(true)
             diskSmall.clear()

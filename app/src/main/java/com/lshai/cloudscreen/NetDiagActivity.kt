@@ -43,7 +43,7 @@ import javax.net.ssl.SSLSocketFactory
  * 这里按五类现象计时。接口结果是端到端耗时，不能从一次完整请求中
  * 减去另一笔完整请求，伪造“纯网络”或“纯服务端”的精确数字。
  */
-class NetDiagActivity : Activity() {
+class NetDiagActivity : EdgeSwipeBackActivity() {
 
     private lateinit var prefs: Prefs
     private lateinit var api: Api

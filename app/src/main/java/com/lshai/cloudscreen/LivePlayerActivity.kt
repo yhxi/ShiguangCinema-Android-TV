@@ -29,7 +29,7 @@ import org.json.JSONArray
 import java.io.File
 
 /** Live TV has its own controls and never writes VOD history or episode progress. */
-class LivePlayerActivity : Activity() {
+class LivePlayerActivity : EdgeSwipeBackActivity() {
     private val handler = Handler(Looper.getMainLooper())
     private var player: ExoPlayer? = null
     private lateinit var httpFactory: androidx.media3.datasource.DefaultHttpDataSource.Factory
