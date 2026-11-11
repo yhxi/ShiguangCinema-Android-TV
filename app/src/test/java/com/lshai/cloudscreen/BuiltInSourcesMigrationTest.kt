@@ -18,4 +18,18 @@ class BuiltInSourcesMigrationTest {
         assertEquals(custom, supplementBuiltInSources(custom))
         assertTrue(supplementBuiltInSources(emptyList()).isEmpty())
     }
+
+    @Test fun feifanUpgradeAddsOnlyMissingSourceAndPreservesSettings() {
+        val original = BuiltInSources.ALL.first().copy(enabled = false)
+        val custom = SourceConfig("自定义", "https://example.com/vod")
+        val current = listOf(original, custom)
+        val updated = supplementFeifanSource(current)
+        assertEquals(current, updated.take(2))
+        assertEquals("https://api.ffzyapi.com/api.php/provide/vod/", updated.last().url)
+        assertEquals(updated, supplementFeifanSource(updated))
+        val existing = updated.last().copy(enabled = false, url = updated.last().url.trimEnd('/'))
+        assertEquals(listOf(original, existing), supplementFeifanSource(listOf(original, existing)))
+        assertEquals(listOf(custom), supplementFeifanSource(listOf(custom)))
+        assertEquals(21, BuiltInSources.ALL.size)
+    }
 }

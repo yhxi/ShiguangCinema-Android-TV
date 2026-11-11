@@ -4,8 +4,8 @@ package com.lshai.cloudscreen
  * 内置默认片源。
  *
  * 之前是每次启动去拉 qist 的 TVBox 配置、现场筛出 https CMS —— 慢、而且会带入
- * 未经验证的死源。这里固化采集接口清单（原 16 个保留，2026-11-09 新增 4 个）：
- *   · 前 14 个：https + 标准苹果CMS（App 内可直连）；新增 4 个已验证搜索、详情与 HLS 清单可读取，未做实机播放验证
+ * 未经验证的死源。这里固化采集接口清单（原 16 个保留，2026-11-09 新增 4 个、2026-11-11 新增 1 个）：
+ *   · 前 15 个：https + 标准苹果CMS（App 内可直连）；新增 4 个已验证搜索、详情与 HLS 清单可读取，未做实机播放验证
  *   · 后 6 个：http 源，本机网络被拦未能实测，保留但走服务端代理
  *
  * 更新方式：tools/source-health 巡检后重新生成，替换这份清单再打包。
@@ -29,6 +29,8 @@ object BuiltInSources {
         SourceConfig("红牛", "https://www.hongniuzy2.com/api.php/provide/vod"),
         SourceConfig("金鹰", "https://jinyingzy.com/api.php/provide/vod"),
         SourceConfig("猫眼", "https://api.maoyanapi.top/api.php/provide/vod"),
+        // ---- 2026-11-11：HTTPS 搜索、详情及 HLS 清单已验证 ----
+        SourceConfig("非凡 HTTPS", "https://api.ffzyapi.com/api.php/provide/vod/"),
         // ---- 待验证（http，走服务端代理）----
         SourceConfig("电影天堂", "http://caiji.dyttzyapi.com/api.php/provide/vod"),
         SourceConfig("天涯", "http://tyyszy.com/api.php/provide/vod"),
@@ -43,8 +45,16 @@ object BuiltInSources {
 /** Return a merged copy without changing custom sources, order, or disabled flags. */
 internal fun supplementBuiltInSources(current: List<SourceConfig>): List<SourceConfig> {
     val additions = BuiltInSources.ALL.filter { it.name in setOf("厂长", "红牛", "金鹰", "猫眼") }
-    val oldUrls = BuiltInSources.ALL.filterNot { it in additions }.map { it.url.trimEnd('/') }.toSet()
+    val oldUrls = BuiltInSources.ALL.filterNot { it in additions || it.name == "非凡 HTTPS" }.map { it.url.trimEnd('/') }.toSet()
     if (current.none { it.url.trimEnd('/') in oldUrls }) return current
     val seen = current.map { it.url.trimEnd('/') }.toMutableSet()
     return current + additions.filter { seen.add(it.url.trimEnd('/')) }
+}
+
+/** Add the HTTPS Feifan endpoint once for existing built-in configurations. */
+internal fun supplementFeifanSource(current: List<SourceConfig>): List<SourceConfig> {
+    val addition = BuiltInSources.ALL.single { it.name == "非凡 HTTPS" }
+    val priorUrls = BuiltInSources.ALL.filterNot { it == addition }.map { it.url.trimEnd('/') }.toSet()
+    val seen = current.map { it.url.trimEnd('/') }.toSet()
+    return if (seen.any { it in priorUrls } && addition.url.trimEnd('/') !in seen) current + addition else current
 }

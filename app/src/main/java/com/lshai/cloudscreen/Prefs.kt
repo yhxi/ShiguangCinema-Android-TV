@@ -200,6 +200,15 @@ class Prefs(ctx: Context) {
             }
             sp.edit().putBoolean(marker, true).apply()
         }
+        val feifanMarker = scoped("builtin_feifan_https_migrated")
+        if (out.isNotEmpty() && !sp.getBoolean(feifanMarker, false)) {
+            val merged = supplementFeifanSource(out)
+            if (merged.size != out.size) {
+                out.clear(); out.addAll(merged)
+                saveSources(out)
+            }
+            sp.edit().putBoolean(feifanMarker, true).apply()
+        }
         return out
     }
 
@@ -283,9 +292,42 @@ class Prefs(ctx: Context) {
     /* --------------------------------------------------------------- 直播源 */
 
     fun liveUrls(): MutableList<String> {
-        val text = sp.getString(scoped("live_urls"), "") ?: ""
-        return if (text.isEmpty()) ArrayList() else text.split("\n").toMutableList()
+        val text = sp.getString(scoped("live_urls"), "").orEmpty()
+        val urls = text.split("\n").filter { it.isNotBlank() }.toMutableList()
+        val marker = scoped("legacy_live_removed")
+        if (!sp.getBoolean(marker, false)) {
+            urls.removeAll(BuiltInLiveSources.LEGACY.toSet())
+            saveLiveUrls(urls)
+            sp.edit().putBoolean(marker, true).apply()
+        }
+        return urls
     }
+
+    fun removeServerDefaultLiveSources(defaults: List<String>) {
+        val marker = scoped("server_live_defaults_removed")
+        if (sp.getBoolean(marker, false)) return
+        saveLiveUrls(liveUrls().filterNot { it in defaults })
+        sp.edit().putBoolean(marker, true).apply()
+    }
+
+    fun saveLocalLivePlaylist(name: String, channels: List<Channel>): String {
+        val json = JSONArray()
+        channels.forEach { json.put(JSONObject().put("name", it.name).put("url", it.url).put("group", it.group).put("logo", it.logo)) }
+        val id = "local-live:" + stableDigest(json.toString())
+        sp.edit().putString(scoped(id), json.toString()).putString(scoped("label:$id"), name).apply()
+        saveLiveUrls((liveUrls() + id).distinct())
+        activeLiveUrl = id
+        return id
+    }
+    fun localLiveChannels(id: String): List<Channel> {
+        val json = JSONArray(sp.getString(scoped(id), "[]"))
+        return (0 until json.length()).map { i ->
+            val o = json.getJSONObject(i)
+            Channel(o.optString("name"), o.optString("url"), o.optString("group", "其他"), o.optString("logo"))
+        }
+    }
+    fun liveSourceLabel(id: String): String = if (id.startsWith("local-live:"))
+        sp.getString(scoped("label:$id"), "本地直播列表").orEmpty() else id
 
     fun saveLiveUrls(list: List<String>) {
         sp.edit().putString(scoped("live_urls"), list.joinToString("\n")).apply()

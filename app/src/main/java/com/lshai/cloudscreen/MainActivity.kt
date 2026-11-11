@@ -134,6 +134,7 @@ class MainActivity : Activity() {
     private var recommendItems: List<DoubanItem> = emptyList()
     private var liveChannels: List<Channel> = emptyList()
     private var liveChannelSource: String = ""
+    private var homeLiveEntry: View? = null
     private var mediaType = "tv"
     private var recommendPage = 0
     private var recommendRequested = false
@@ -225,6 +226,7 @@ class MainActivity : Activity() {
     private var currentScreen = "setup"
     /** 设置页是否展开「服务器连接」区块。已连接时默认收起（低频操作不占首屏） */
     private var setupShowFields = false
+    private val REQ_PICK_LIVE = 1004
     private val REQ_PICK_JSON = 1001
     private val REQ_STORAGE = 1002
     private val REQ_PLAYER = 1003
@@ -627,6 +629,7 @@ class MainActivity : Activity() {
             "serversettings" -> showSetup()
             "detail" -> if (childrenSearchOrigin != null && lastResults.isNotEmpty()) showResultsFromDetail() else showRecommend()
             "live", "setup", "history" -> showRecommend()
+            "live_import" -> showLive()
             "sources" -> returnFromSources()
             "vodsources" -> showSources()
             "home", "recommend" -> super.onBackPressed()
@@ -1447,11 +1450,14 @@ class MainActivity : Activity() {
         ensureBuiltInLiveSources(st.defaultLiveSources)
     }
 
-    private fun ensureBuiltInLiveSources(serverDefaults: List<String> = emptyList()) {
-        val existing = prefs.liveUrls()
-        val combined = (BuiltInLiveSources.ALL + serverDefaults + existing).distinct()
-        if (combined != existing) prefs.saveLiveUrls(combined)
-        if (prefs.activeLiveUrl !in combined) prefs.activeLiveUrl = combined.firstOrNull().orEmpty()
+    private fun ensureBuiltInLiveSources(serverDefaults: List<String>? = null) {
+        if (serverDefaults != null) prefs.removeServerDefaultLiveSources(serverDefaults)
+        val urls = prefs.liveUrls()
+        if (prefs.activeLiveUrl !in urls) {
+            prefs.activeLiveUrl = urls.firstOrNull().orEmpty()
+            liveChannels = emptyList()
+            liveChannelSource = ""
+        }
     }
 
     /** 首次拉内置片源在后台进行，不阻塞服务端登录和首页展示。 */
@@ -1469,7 +1475,7 @@ class MainActivity : Activity() {
     }
 
     /**
-     * 内置默认片源：直接用 [BuiltInSources] 里固化的清单（2026-11-09 补充至 20 个）。
+     * 内置默认片源：直接用 [BuiltInSources] 里固化的清单（包含 2026-11-11 新增的非凡 HTTPS）。
      * 不再去拉 qist 的 TVBox 配置 —— 那样慢，还会带入一堆没验证过的死源。
      */
     private fun loadBuiltInDefaultSources(): List<SourceConfig> = BuiltInSources.ALL
@@ -1686,6 +1692,18 @@ class MainActivity : Activity() {
                 refreshHomeAfterPlayback = false
                 showRecommend()
             }
+            return
+        }
+        if (requestCode == REQ_PICK_LIVE) {
+            if (resultCode != RESULT_OK) return
+            val uri = data?.data ?: return
+            runApi("读取直播列表…", {
+                val bytes = contentResolver.openInputStream(uri)?.use { readBounded(it, 4 * 1024 * 1024) }
+                    ?: throw IOException("无法读取文件")
+                val utf8 = bytes.toString(Charsets.UTF_8)
+                val text = if ('\uFFFD' in utf8) bytes.toString(java.nio.charset.Charset.forName("GB18030")) else utf8
+                text
+            }, { text -> importLiveText(text, uri.lastPathSegment?.substringAfterLast('/') ?: "本地直播列表") })
             return
         }
         if (requestCode != REQ_PICK_JSON || resultCode != RESULT_OK) return
@@ -2569,7 +2587,7 @@ class MainActivity : Activity() {
         }
         section("观影设置")
         row("sources", "片源管理", "点播源 ${prefs.sources().size} 个 · 直播源 ${prefs.liveUrls().size} 个 · 管理") { showSources() }
-        row("live", "电视直播", "进入直播频道") { liveChannels = emptyList(); showLive() }
+        row("live", "电视直播", "导入、切换和管理直播源") { liveChannels = emptyList(); liveChannelSource = ""; showLive() }
         row("tv", "播放设置", "续播、画质、缓冲与跳过片头片尾") { showPlaySettings() }
         row("setup", "流畅模式：${if (prefs.smoothUi) "开" else "关"}", "减少页面淡入和焦点放大，保留焦点描边") {
             prefs.smoothUi = !prefs.smoothUi
@@ -3354,9 +3372,9 @@ class MainActivity : Activity() {
         val rows: List<Any> = listOf(
             "点播源 · 影视采集站（电影 / 剧集）",
         ) + options + listOf(
-            "直播源 · IPTV / M3U（已内置 ${BuiltInLiveSources.ALL.size} 个）",
+            "直播源 · 自行导入 M3U / TXT",
             Triple("管理直播源", "第一个直播源默认启用，也可切换备用源", { showLive() }),
-            Triple("添加其他直播源", "输入公开可访问的 M3U / M3U8 地址", { addLiveDialog() }),
+            Triple("导入直播源", "选择本地文件，或粘贴列表 / 订阅地址", { addLiveDialog() }),
         )
 
         val col = LinearLayout(this).apply {
@@ -3665,10 +3683,7 @@ class MainActivity : Activity() {
                     toast("服务器没配 DEFAULT_SOURCES / DEFAULT_SUBSCRIPTIONS（网页版的片源存在浏览器本地存储里，客户端读不到）")
                 } else {
                     val added = prefs.addSources(all)
-                    if (prefs.liveUrls().isEmpty() && st.defaultLiveSources.isNotEmpty()) {
-                        prefs.saveLiveUrls(st.defaultLiveSources)
-                        prefs.activeLiveUrl = st.defaultLiveSources.first()
-                    }
+                    ensureBuiltInLiveSources(st.defaultLiveSources)
                     toast("服务器共 ${all.size} 个片源，新增 $added")
                     showSources()
                 }
@@ -5223,20 +5238,64 @@ class MainActivity : Activity() {
 
     /* --------------------------------------------------------------- 直播页 */
 
+    private fun openLiveFromHome() {
+        ensureBuiltInLiveSources()
+        val active = prefs.activeLiveUrl
+        if (active.isBlank()) {
+            toast("请先到 设置 → 电视直播 导入直播源")
+            return
+        }
+        fun start(channels: List<Channel>) {
+            if (channels.isEmpty()) { toast("没有可播放频道，请到设置中的电视直播检查直播源"); return }
+            val index = defaultLiveChannelIndex(channels)
+            if (!isCctvOne(channels[index].name)) toast("列表中未找到 CCTV1，将播放第一个频道")
+            launchLivePlayer(channels, index)
+        }
+        if (liveChannelSource == active && liveChannels.isNotEmpty()) { start(liveChannels); return }
+        runApiK("live", "正在打开电视直播…", {
+            if (active.startsWith("local-live:")) prefs.localLiveChannels(active) else api.liveChannels(active)
+        }, { channels ->
+            liveChannels = channels; liveChannelSource = active
+            start(channels)
+        })
+    }
+    private fun launchLivePlayer(channels: List<Channel>, index: Int) {
+        if (channels.isEmpty()) return
+        val json = org.json.JSONArray()
+        channels.forEach { json.put(org.json.JSONObject().put("name", it.name).put("url", it.url).put("group", it.group)) }
+        // Keep large IPTV lists out of Binder's activity transaction size limit.
+        runApiK("live-session", "正在打开频道…", {
+            val file = File(cacheDir, "live-session-${java.util.UUID.randomUUID()}.json")
+            file.writeText(json.toString(), Charsets.UTF_8)
+            file.name
+        }, { name ->
+            startActivityForResult(Intent(this, LivePlayerActivity::class.java).apply {
+                putExtra("playlist_file", name)
+                putExtra("channel_index", index)
+            }, REQ_PLAYER)
+        })
+    }
+
     private fun showLive() {
         ensureBuiltInLiveSources()
         currentScreen = "live"
         val urls = prefs.liveUrls()
         if (urls.isEmpty()) {
-            addLiveDialog()
+            showLiveImportPage()
             return
         }
-        val active = prefs.activeLiveUrl.ifEmpty { urls.first() }
-        if (liveChannelSource != active || liveChannels.isEmpty()) {
-            runApiK("live", "正在加载频道…", { api.liveChannels(active) }, { list ->
+        val active = prefs.activeLiveUrl.takeIf { it in urls } ?: urls.first()
+        if (liveChannelSource != active) {
+            runApiK("live", "正在加载频道…", {
+                if (active.startsWith("local-live:")) prefs.localLiveChannels(active) else api.liveChannels(active)
+            }, { list ->
                 liveChannels = list
                 liveChannelSource = active
-                if (list.isEmpty()) toast("没解析到频道，换个直播源试试") else showLive()
+                if (list.isEmpty()) toast("没解析到频道，可重新导入或切换直播源")
+                showLive()
+            }, onError = { error ->
+                toast("读取直播源失败：${describe(error)}")
+                showLiveImportPage()
             })
             return
         }
@@ -5255,7 +5314,17 @@ class MainActivity : Activity() {
 
         val bar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         bar.addView(button("换源") { pickLiveSource() })
-        bar.addView(button("添加直播源") { addLiveDialog() })
+        bar.addView(button("导入直播源") { addLiveDialog() })
+        bar.addView(button("删除当前源") {
+            AlertDialog.Builder(this).setTitle("删除当前直播源？")
+                .setMessage(prefs.liveSourceLabel(active))
+                .setPositiveButton("删除") { _, _ ->
+                    prefs.saveLiveUrls(prefs.liveUrls().filterNot { it == active })
+                    prefs.activeLiveUrl = ""
+                    liveChannels = emptyList(); liveChannelSource = ""
+                    showLive()
+                }.setNegativeButton("取消", null).show()
+        })
         bar.addView(
             button(if (liveGroupFilter.isEmpty()) "分组" else "分组：" + liveGroupFilter.take(10)) {
                 val groups = listOf("全部分组") + liveChannels.map { it.group }.distinct().sorted()
@@ -5275,7 +5344,7 @@ class MainActivity : Activity() {
         val listView = newList()
         bindList(listView,
             sorted.map { "${it.group}  ·  ${it.name}" },
-            onItem = { idx -> play(sorted[idx].url, sorted[idx].name) },
+            onItem = { idx -> launchLivePlayer(sorted, idx) },
         )
         col.addView(listView, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
@@ -5287,45 +5356,76 @@ class MainActivity : Activity() {
     private fun pickLiveSource() {
         val urls = prefs.liveUrls()
         if (urls.isEmpty()) {
-            addLiveDialog()
+            showLiveImportPage()
             return
         }
         AlertDialog.Builder(this)
             .setTitle("选择直播源")
-            .setItems(urls.map(BuiltInLiveSources::label).toTypedArray()) { _, which ->
+            .setItems(urls.map(prefs::liveSourceLabel).toTypedArray()) { _, which ->
                 prefs.activeLiveUrl = urls[which]
                 liveChannels = emptyList()
                 liveChannelSource = ""
+                liveGroupFilter = ""
                 showLive()
             }
             .setPositiveButton("添加新的", { _, _ -> addLiveDialog() })
             .show()
     }
 
-    private fun addLiveDialog() {
-        val box = LinearLayout(this).apply {
+    private fun showLiveImportPage() {
+        currentScreen = "live"
+        val col = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(24), dp(12), dp(24), 0)
+            setPadding(pagePad(48), dp(24), pagePad(48), dp(20))
         }
-        box.addView(hintText("填 M3U 播放列表地址。服务端会去抓这个地址，所以必须是公网可访问的（内网地址会被拒）。"))
-        val urlField = field("https://iptv-org.github.io/iptv/countries/cn.m3u")
-        box.addView(urlField)
-        AlertDialog.Builder(this)
-            .setTitle("添加直播源")
-            .setView(box)
-            .setPositiveButton("添加") { _, _ ->
-                val u = urlField.text.toString().trim()
-                if (u.isEmpty()) return@setPositiveButton
-                val list = prefs.liveUrls()
-                if (!list.contains(u)) list.add(u)
-                prefs.saveLiveUrls(list)
-                prefs.activeLiveUrl = u
-                liveChannels = emptyList()
-                liveChannelSource = ""
-                showLive()
-            }
-            .setNegativeButton("取消", null)
-            .show()
+        col.addView(topBar())
+        col.addView(titleText("电视直播", 24f))
+        col.addView(hintText(if (prefs.liveUrls().isEmpty())
+            "尚未导入直播源。支持 M3U 和频道名,地址格式的 TXT 列表；支持 HTTP / HTTPS 频道地址。"
+            else "当前源未能加载，可选择已有源，或重新导入 M3U / TXT 列表。"))
+        if (prefs.liveUrls().isNotEmpty()) col.addView(button("选择已有直播源") { pickLiveSource() })
+        col.addView(button("从本地文件导入") { pickLiveFile() })
+        col.addView(button("粘贴直播源") { pasteLiveSource() })
+        setScreen(col)
+    }
+
+    private fun addLiveDialog() {
+        AlertDialog.Builder(this).setTitle("导入直播源")
+            .setItems(arrayOf("从本地文件导入（M3U / TXT）", "粘贴列表或订阅地址")) { _, which ->
+                if (which == 0) pickLiveFile() else pasteLiveSource()
+            }.setNegativeButton("取消", null).show()
+    }
+    private fun pickLiveFile() {
+        try {
+            startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE); type = "*/*"
+            }, REQ_PICK_LIVE)
+        } catch (_: Exception) {
+            toast("此设备没有系统文件选择器，请使用粘贴导入")
+            pasteLiveSource()
+        }
+    }
+    private fun pasteLiveSource() {
+        inputPage("粘贴直播源", "粘贴 M3U / TXT 列表内容，或一个 HTTP / HTTPS 订阅地址", multiline = true, backTo = { showLive() }) { text ->
+            importLiveText(text, "粘贴的直播列表", allowSubscription = true)
+        }
+        currentScreen = "live_import"
+    }
+    private fun importLiveText(text: String, name: String, allowSubscription: Boolean = false) {
+        val value = text.trim().removePrefix("\uFEFF")
+        if (value.length > 4 * 1024 * 1024) { toast("列表过大，请控制在 4MB 以内"); return }
+        if (allowSubscription && '\n' !in value && '\r' !in value &&
+            (value.startsWith("https://", true) || value.startsWith("http://", true))) {
+            prefs.saveLiveUrls((prefs.liveUrls() + value).distinct())
+            prefs.activeLiveUrl = value
+        } else {
+            val channels = parseLocalLivePlaylist(value)
+            if (channels.isEmpty()) { toast("没有识别到 HTTP / HTTPS 频道，请检查 M3U / TXT 格式"); return }
+            prefs.saveLocalLivePlaylist(name, channels)
+            toast("已导入 ${channels.size} 个频道，列表已保存在本机")
+        }
+        liveChannels = emptyList(); liveChannelSource = ""; liveGroupFilter = ""
+        showLive()
     }
 
     /* ------------------------------------------------------------ 继续观看 */
@@ -6161,7 +6261,7 @@ class MainActivity : Activity() {
         "tv" -> homeTile("tv", "点播") { applyMediaType("tv", "剧集") }
         "show" -> homeTile("show", "综艺") { applyMediaType("show", "综艺") }
         "search" -> homeTile("search", "搜索") { showHome() }
-        "live" -> homeTile("live", "直播") { liveChannels = emptyList(); showLive() }
+        "live" -> homeTile("live", "直播") { liveChannels = emptyList(); liveChannelSource = ""; showLive() }
         "kids" -> homeTile("kids", "儿童") { showChildren() }.apply {
             alpha = if (ChildrenQuota.remaining(this@MainActivity) <= 0L) 0.4f else 1f
             childrenQuotaTile = this
@@ -7098,6 +7198,10 @@ class MainActivity : Activity() {
             homeBar = bar
             homeBarRows.add(bar)
         }
+        col.addView(button("电视直播") { openLiveFromHome() }.apply {
+            contentDescription = "电视直播"
+            homeLiveEntry = this
+        }, LinearLayout.LayoutParams(-1, dp(if (isTvDevice) 52 else 48)).apply { topMargin = dp(10) })
         addContinueWatchingB(col)
         // 标题 + 榜单切换：以前"最新/热门"是写死的混合，用户以为没有这个功能
         val titleRow = LinearLayout(this).apply {
@@ -7218,7 +7322,7 @@ class MainActivity : Activity() {
                     if (event.action != KeyEvent.ACTION_DOWN) false
                     else if (code == KeyEvent.KEYCODE_DPAD_DOWN && rowIndex == homeBarRows.lastIndex) {
                         homeLastHeaderFocus = v
-                        val history = homeHistoryFirst
+                        val history = homeLiveEntry ?: homeHistoryFirst
                         if (history != null && history.isShown) history.requestFocus()
                         else if (recommendItems.isNotEmpty()) {
                             rv.scrollToPosition(1)
