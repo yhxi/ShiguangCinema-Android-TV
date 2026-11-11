@@ -437,23 +437,18 @@ class MainActivity : EdgeSwipeBackActivity() {
     private val quotaTick = object : Runnable {
         override fun run() {
             if (!quotaVisible) return
-            val childScreen = currentScreen == "children" || currentScreen == "children_more" ||
-                (childrenSearchOrigin != null && currentScreen in listOf("results", "detail", "playbacksources"))
-            ChildrenQuota.browse(childScreen)
             val locked = ChildrenQuota.remaining(this@MainActivity) <= 0L
             childrenQuotaTile?.let { tile ->
-                tile.alpha = if (locked) 0.4f else 1f
+                tile.alpha = 1f
                 (tile.getChildAt(1) as? TextView)?.text = "儿童"
                 tile.contentDescription = "儿童，${ChildrenQuota.label(this@MainActivity)}"
             }
             quotaLabelView?.text = "${ChildrenQuota.label(this@MainActivity)} · 家长设置 / 加时"
-            if (childScreen && locked) showChildrenLocked()
-            else if (currentScreen == "children_locked" && !locked) showChildren()
+            if (currentScreen == "children_locked" && !locked) showChildren()
             quotaHandler.postDelayed(this, 1000)
         }
     }
     private fun showChildrenLocked() {
-        ChildrenQuota.browse(false)
         currentScreen = "children_locked"
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(pagePad(40), dp(24), pagePad(40), dp(24)) }
         col.addView(titleText("今天的儿童时间已用完", 24f))
@@ -464,7 +459,6 @@ class MainActivity : EdgeSwipeBackActivity() {
     }
 
     override fun onPause() {
-        ChildrenQuota.browse(false)
         quotaVisible = false
         quotaHandler.removeCallbacks(quotaTick)
         uiMonitor?.stop()
@@ -732,8 +726,6 @@ class MainActivity : EdgeSwipeBackActivity() {
     private var lastRenderedScreen: String? = null
 
     private fun setScreen(view: View, focusFirst: Boolean = true) {
-        ChildrenQuota.browse(quotaVisible && (currentScreen == "children" || currentScreen == "children_more" ||
-            (childrenSearchOrigin != null && currentScreen in listOf("results", "detail", "playbacksources"))))
         if (currentScreen != "recommend") {
             homeMaintenanceJob?.cancel()
             homeHistoryCoverViews.clear()
@@ -6321,7 +6313,7 @@ class MainActivity : EdgeSwipeBackActivity() {
         "search" -> homeTile("search", "搜索") { showHome() }
         "live" -> homeTile("live", "直播") { liveChannels = emptyList(); liveChannelSource = ""; showLive() }
         "kids" -> homeTile("kids", "儿童") { showChildren() }.apply {
-            alpha = if (ChildrenQuota.remaining(this@MainActivity) <= 0L) 0.4f else 1f
+            alpha = 1f
             childrenQuotaTile = this
         }
         "history" -> homeTile("history", "继续") { showHistoryCards() }
@@ -6959,8 +6951,6 @@ class MainActivity : EdgeSwipeBackActivity() {
     }
 
     private fun showChildren() {
-        if (ChildrenQuota.remaining(this) <= 0L) { showChildrenLocked(); return }
-        ChildrenQuota.browse(quotaVisible)
         currentScreen = "children"
         prepareChildrenCovers()
         // 尽力拉取家里其他设备手动指定的封面（服务端不支持时静默跳过）
@@ -7040,31 +7030,55 @@ class MainActivity : EdgeSwipeBackActivity() {
             val calendar = java.util.Calendar.getInstance()
             val day = calendar.get(java.util.Calendar.YEAR).toLong() * 366 + calendar.get(java.util.Calendar.DAY_OF_YEAR)
             val ordered = dailyChildrenPicks(section.titles, day, prefs.history().map(::historyTitle).toSet(), section.titles.size)
+            val rowScroll = hScroll(row)
             scope.launch {
                 val listed = withContext(Dispatchers.IO) {
                     ordered.filter { ChildrenArtworkIndex.urls(applicationContext, it).isNotEmpty() }.toSet()
                 }
+                if (currentScreen != "children" || !row.isAttachedToWindow) return@launch
                 val candidates = (preferred.filter { it in childrenCovers || it in listed } + ordered.filter { it in childrenCovers || it in listed } + ordered).distinct()
-                // 立即出卡：候选顺序已把「有缓存封面 / 清单里有图」的排前面，
-                // 卡片先画出来（插画垫底 + 加载中角标），封面后台解析完自动换上
-                // （queueChildrenCover 的 waiting 机制会把成图灌回所有等它的 ImageView）。
-                // 不再像 v1.3.2 那样等封面解析成功才加卡 —— 冷启动会留下整行空白。
-                candidates.take(columns).forEach { title ->
-                    if (currentScreen != "children" || !row.isAttachedToWindow || row.childCount >= columns) return@forEach
-                    val cardIndex = row.childCount
-                    val card = childrenCard(width, height)
-                    bindChildrenCard(card, title, width, height)
-                    focusViews[title] = card
-                    row.addView(card, LinearLayout.LayoutParams(width, -2).apply {
-                        rightMargin = if (cardIndex < columns - 1) dp(8) else 0
-                    })
-                    if (firstCard == null) {
-                        firstCard = card
-                        if (isTvDevice && currentFocus == null) card.requestFocus()
+                var next = 0
+                lateinit var addMore: () -> Unit
+                addMore = {
+                    val end = minOf(next + columns, candidates.size)
+                    while (next < end) {
+                        val cardIndex = next++
+                        val title = candidates[cardIndex]
+                        val card = childrenCard(width, height)
+                        bindChildrenCard(card, title, width, height)
+                        focusViews[title] = card
+                        card.setOnKeyListener { _, code, event ->
+                            if (event.action != KeyEvent.ACTION_DOWN || code !in listOf(KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT)) false
+                            else {
+                                val target = cardIndex + if (code == KeyEvent.KEYCODE_DPAD_RIGHT) 1 else -1
+                                if (target >= row.childCount && target < candidates.size) addMore()
+                                if (target in 0 until row.childCount) row.getChildAt(target).requestFocus() else true
+                            }
+                        }
+                        val originalFocus = card.onFocusChangeListener
+                        card.onFocusChangeListener = View.OnFocusChangeListener { view, focused ->
+                            originalFocus?.onFocusChange(view, focused)
+                            if (focused) {
+                                if (cardIndex >= row.childCount - columns && next < candidates.size) addMore()
+                                rowScroll.post { rowScroll.requestChildRectangleOnScreen(row, android.graphics.Rect(card.left, card.top, card.right, card.bottom), false) }
+                            }
+                        }
+                        row.addView(card, LinearLayout.LayoutParams(width, -2).apply { rightMargin = dp(8) })
+                        if (firstCard == null) firstCard = card
+                        if (isTvDevice && childrenOverviewFocus == title) card.post { if (currentScreen == "children") card.requestFocus() }
                     }
                 }
+                addMore()
+                if (isTvDevice && childrenOverviewFocus != null) {
+                    val wanted = candidates.indexOf(childrenOverviewFocus)
+                    while (wanted >= next) addMore()
+                }
+                rowScroll.setOnScrollChangeListener { _, scrollX, _, _, _ ->
+                    if (next < candidates.size && scrollX + rowScroll.width >= row.width - width) addMore()
+                }
+                if (isTvDevice && currentFocus == null) firstCard?.requestFocus()
             }
-            panel.addView(row)
+            panel.addView(rowScroll)
             col.addView(panel, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(if (isTvDevice) 12 else 8) })
         }
         val scroll = ScrollView(this).apply {
@@ -7082,7 +7096,6 @@ class MainActivity : EdgeSwipeBackActivity() {
     }
 
     private fun showChildrenMore(index: Int) {
-        if (ChildrenQuota.remaining(this) <= 0L) { showChildrenLocked(); return }
         val section = ChildrenCatalog.sections.getOrNull(index) ?: return
         prepareChildrenCovers()
         syncChildrenPinnedCovers()

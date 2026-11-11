@@ -12,7 +12,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-/** Main-thread owner of one shared browsing/playback allowance. */
+/** Main-thread owner of one shared child playback allowance. */
 internal object ChildrenQuota {
     private lateinit var app: Context
     private val handler = Handler(Looper.getMainLooper())
@@ -22,7 +22,6 @@ internal object ChildrenQuota {
     private var used = 0L
     private var persistedUsed = 0L
     private var lastPersistedAt = 0L
-    private var browsing = false
     private var player: ExoPlayer? = null
     private var childPlayback = false
     private var wasActive = false
@@ -52,7 +51,7 @@ internal object ChildrenQuota {
         settle()
         handler.post(tick)
     }
-    private fun active() = browsing || (childPlayback && player?.isPlaying == true)
+    private fun active() = quotaPlaybackActive(childPlayback, player?.isPlaying == true)
     private fun settle() {
         if (!started) return
         val now = SystemClock.elapsedRealtime()
@@ -83,12 +82,6 @@ internal object ChildrenQuota {
             persistedUsed = used
             lastPersistedAt = now
         }
-    }
-    fun browse(value: Boolean) {
-        settle()
-        if (!value && browsing) persistUsage(true)
-        browsing = value
-        wasActive = active()
     }
     private val listener = object : Player.Listener {
         override fun onIsPlayingChanged(isPlaying: Boolean) { settle(); if (!isPlaying) persistUsage(true); enforce() }
