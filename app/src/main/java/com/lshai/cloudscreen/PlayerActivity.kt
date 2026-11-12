@@ -168,6 +168,12 @@ class PlayerActivity : EdgeSwipeBackActivity() {
 
     /** 这一集是否已经原地重试过一次：避免同一个坏源把重试变成死循环 */
     private var autoRetried = false
+    private var pendingIntroIndex: Int? = null
+    private val longBufferActions = Runnable {
+        if (player?.playbackState == Player.STATE_BUFFERING && player?.playWhenReady == true) {
+            showPlaybackErrorActions("缓冲时间较长，可以重试或换源")
+        }
+    }
     private var currentIndex = 0
     private var seriesTitle = ""
     /** 干净剧名（不含「 · 第 x/y 集」），用于回查整季 */
@@ -966,11 +972,18 @@ class PlayerActivity : EdgeSwipeBackActivity() {
                         }
                         // 每一集（含起播、自动连播、手动切集）都过一遍片头跳过。
                         // 延迟给 setMediaItems 的起播位置落地，否则刚 seek 到续播点就被误判成"在片头"
-                        handler.postDelayed({ applyAutoIntroSkip() }, 600)
+                        pendingIntroIndex = currentIndex
+                        if (exo.playbackState == Player.STATE_READY) handler.post { applyAutoIntroSkipWhenReady() }
                     }
 
                     override fun onPlaybackStateChanged(playbackState: Int) {
-                        if (playbackState == Player.STATE_READY) hidePlaybackErrorActions()
+                        handler.removeCallbacks(longBufferActions)
+                        if (playbackState == Player.STATE_READY) {
+                            hidePlaybackErrorActions()
+                            handler.post { applyAutoIntroSkipWhenReady() }
+                        } else if (playbackState == Player.STATE_BUFFERING && exo.playWhenReady) {
+                            handler.postDelayed(longBufferActions, 15_000L)
+                        }
                         val buffering = playbackState == Player.STATE_BUFFERING
                         // 中央「缓冲中…」延迟 700ms 才出现：HLS 换分片经常卡几百毫秒，
                         // 每次都弹大字会闪个不停；短暂卡顿用户根本无感，长卡才需要解释。
@@ -1254,6 +1267,13 @@ class PlayerActivity : EdgeSwipeBackActivity() {
      * 只在「当前位置还在片头区间内」时才跳 —— 续播点已经在 20 分钟时不能被拽回片头。
      * 延迟 600ms 执行：要给 setMediaItems(…, startPosition) 的 seek 留出落地时间。
      */
+    private fun applyAutoIntroSkipWhenReady() {
+        val p = player ?: return
+        if (p.playbackState != Player.STATE_READY || pendingIntroIndex != p.currentMediaItemIndex) return
+        pendingIntroIndex = null
+        applyAutoIntroSkip()
+    }
+
     private fun applyAutoIntroSkip() {
         if (!prefs.skipIntroEnabled) return
         val key = skipKey()
@@ -1285,10 +1305,9 @@ class PlayerActivity : EdgeSwipeBackActivity() {
         if (System.currentTimeMillis() < outroSkipGraceUntil) return
         val key = skipKey()
         if (key.isEmpty()) return
-        val start = prefs.outroStartOf(key)
-        if (start <= 0) return
         val p = player ?: return
         if (p.playbackState != Player.STATE_READY || !p.isPlaying) return
+        val start = safeOutroStart(prefs.outroStartOf(key), prefs.outroRemainingOf(key), prefs.outroDurationOf(key), p.duration) ?: return
         if (p.currentPosition < start) return
         // 片尾点比总时长还靠后（换了个更短的源）时不跳，否则一进去就没了
         if (p.duration > 0 && start > p.duration - 5_000) return
@@ -1325,7 +1344,7 @@ class PlayerActivity : EdgeSwipeBackActivity() {
         val recorded = key.isNotEmpty() && pos >= 1_000L &&
             (p.duration <= 0 || pos < p.duration - 5_000L)
         if (recorded) {
-            prefs.saveOutroStart(key, pos)
+            prefs.saveOutroStart(key, pos, p.duration)
             prefs.skipOutroEnabled = true
             updateSkipButtons()
         }
@@ -1399,7 +1418,7 @@ class PlayerActivity : EdgeSwipeBackActivity() {
         }
         box.addView(hintLine("片尾开始：" + if (outro > 0) formatTime(outro) else "未设置"))
         box.addView(skipAction("记当前位置为片尾开始") {
-            prefs.saveOutroStart(key, pos)
+            prefs.saveOutroStart(key, pos, duration)
             outroMarkedUrl = currentUrl()
             updateSkipButtons()
             toast("片尾开始已记为 ${formatTime(pos)}，之后到这就会自动下一集")
@@ -3775,6 +3794,7 @@ class PlayerActivity : EdgeSwipeBackActivity() {
         handler.removeCallbacks(hideAfterBuffering)
         handler.removeCallbacks(speedTick)
         handler.removeCallbacks(showBufferingUi)
+        handler.removeCallbacks(longBufferActions)
         handler.removeCallbacks(hideActions)
         handler.removeCallbacks(clearPendingSeek)
         handler.removeCallbacks(nextTick)

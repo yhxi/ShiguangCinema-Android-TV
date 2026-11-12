@@ -780,9 +780,14 @@ class Prefs(ctx: Context) {
     fun outroStartOf(key: String): Long =
         if (key.isEmpty()) 0L else sp.getLong(stableKey("outro_start:", key), 0L)
 
-    fun saveOutroStart(key: String, ms: Long) {
+    fun outroRemainingOf(key: String): Long = if (key.isEmpty()) 0L else sp.getLong(stableKey("outro_remaining:", key), 0L)
+    fun outroDurationOf(key: String): Long = if (key.isEmpty()) 0L else sp.getLong(stableKey("outro_duration:", key), 0L)
+
+    fun saveOutroStart(key: String, ms: Long, duration: Long = 0L) {
         if (key.isEmpty()) return
-        sp.edit().putLong(stableKey("outro_start:", key), ms.coerceAtLeast(0L)).apply()
+        sp.edit().putLong(stableKey("outro_start:", key), ms.coerceAtLeast(0L))
+            .putLong(stableKey("outro_remaining:", key), if (duration > ms) duration - ms else 0L)
+            .putLong(stableKey("outro_duration:", key), duration.coerceAtLeast(0L)).apply()
     }
 
     fun clearSkipMarks(key: String) {
@@ -790,6 +795,8 @@ class Prefs(ctx: Context) {
         sp.edit()
             .remove(stableKey("intro_end:", key))
             .remove(stableKey("outro_start:", key))
+            .remove(stableKey("outro_remaining:", key))
+            .remove(stableKey("outro_duration:", key))
             .apply()
     }
 

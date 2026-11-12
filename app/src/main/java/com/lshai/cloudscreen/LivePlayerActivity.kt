@@ -222,6 +222,9 @@ class LivePlayerActivity : EdgeSwipeBackActivity() {
         showBanner()
         var group = "全部分组"
         var visible = channels.indices.toList()
+        val favoriteStore = getSharedPreferences("live_channel_favorites", MODE_PRIVATE)
+        val favorites = favoriteStore.getStringSet("channels", emptySet()).orEmpty().toMutableSet()
+        fun channelKey(i: Int) = liveChannelKey(channels[i].name).ifBlank { channels[i].url }
         val list = android.widget.ListView(this).apply {
             choiceMode = android.widget.ListView.CHOICE_MODE_SINGLE
         }
@@ -237,6 +240,8 @@ class LivePlayerActivity : EdgeSwipeBackActivity() {
         val filters = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
         filters.addView(groupButton, LinearLayout.LayoutParams(-2, -2))
         filters.addView(search, LinearLayout.LayoutParams(0, -2, 1f))
+        val favoriteButton = android.widget.Button(this).apply { text = "收藏当前台" }
+        filters.addView(favoriteButton, LinearLayout.LayoutParams(-2, -2))
         content.addView(filters)
         content.addView(list, LinearLayout.LayoutParams(-1, minOf(dp(340), (resources.displayMetrics.heightPixels * 0.52f).toInt())))
         fun refresh() {
@@ -244,11 +249,23 @@ class LivePlayerActivity : EdgeSwipeBackActivity() {
             visible = channels.indices.filter { i ->
                 (group == "全部分组" || channels[i].group == group) &&
                     (query.isEmpty() || channels[i].name.contains(query, ignoreCase = true))
-            }
+            }.sortedBy { if (channelKey(it) in favorites) 0 else 1 }
             list.adapter = android.widget.ArrayAdapter(this, android.R.layout.simple_list_item_single_choice,
-                visible.map { i -> "${i + 1}  ${channels[i].name} · ${channels[i].group}" })
+                visible.map { i -> "${if (channelKey(i) in favorites) "★ " else ""}${i + 1}  ${channels[i].name} · ${channels[i].group}" })
+            favoriteButton.text = if (channelKey(index) in favorites) "取消收藏当前台" else "收藏当前台"
             val selected = visible.indexOf(index)
             if (selected >= 0) { list.setItemChecked(selected, true); list.setSelection(selected) }
+        }
+        fun toggleFavorite(target: Int) {
+            val key = channelKey(target)
+            if (!favorites.add(key)) favorites.remove(key)
+            favoriteStore.edit().putStringSet("channels", favorites.toSet()).apply()
+            refresh()
+        }
+        favoriteButton.setOnClickListener { toggleFavorite(index) }
+        list.setOnItemLongClickListener { _, _, position, _ ->
+            visible.getOrNull(position)?.let { toggleFavorite(it) }
+            true
         }
         groupButton.setOnClickListener {
             val groups = listOf("全部分组") + channels.map { it.group }.distinct().sorted()

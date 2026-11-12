@@ -6389,6 +6389,8 @@ class MainActivity : EdgeSwipeBackActivity() {
     private var childrenOverviewScroll: ScrollView? = null
     private var childrenOverviewScrollY = 0
     private var childrenOverviewFocus: String? = null
+    private var childrenOverviewFocusSection: Int? = null
+    private val childrenOverviewRowOffsets = mutableMapOf<Int, Int>()
     private var childrenMoreGrid: GridView? = null
     private var childrenMoreTitle: String? = null
     private var childrenMoreFilter = 0
@@ -7051,6 +7053,13 @@ class MainActivity : EdgeSwipeBackActivity() {
                         val title = candidates[cardIndex]
                         val card = childrenCard(width, height)
                         bindChildrenCard(card, title, width, height)
+                        card.setOnClickListener {
+                            childrenOverviewFocus = title
+                            childrenOverviewFocusSection = index
+                            childrenOverviewScrollY = childrenOverviewScroll?.scrollY ?: 0
+                            childrenOverviewRowOffsets[index] = rowScroll.scrollX
+                            doSearch(title)
+                        }
                         focusViews[title] = card
                         card.setOnKeyListener { _, code, event ->
                             if (event.action != KeyEvent.ACTION_DOWN || code !in listOf(KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT)) false
@@ -7070,15 +7079,20 @@ class MainActivity : EdgeSwipeBackActivity() {
                         }
                         row.addView(card, LinearLayout.LayoutParams(width, -2).apply { rightMargin = dp(8) })
                         if (firstCard == null) firstCard = card
-                        if (isTvDevice && childrenOverviewFocus == title) card.post { if (currentScreen == "children") card.requestFocus() }
+                        if (isTvDevice && childrenOverviewFocusSection == index && childrenOverviewFocus == title) card.post { if (currentScreen == "children") card.requestFocus() }
                     }
                 }
                 addMore()
-                if (isTvDevice && childrenOverviewFocus != null) {
+                val savedOffset = childrenOverviewRowOffsets[index] ?: 0
+                val restoreCount = (savedOffset / (width + dp(8))) + columns + 1
+                while (next < minOf(candidates.size, restoreCount)) addMore()
+                if (isTvDevice && childrenOverviewFocusSection == index && childrenOverviewFocus != null) {
                     val wanted = candidates.indexOf(childrenOverviewFocus)
                     while (wanted >= next) addMore()
                 }
+                rowScroll.post { if (currentScreen == "children") rowScroll.scrollTo(savedOffset, 0) }
                 rowScroll.setOnScrollChangeListener { _, scrollX, _, _, _ ->
+                    childrenOverviewRowOffsets[index] = scrollX
                     if (next < candidates.size && scrollX + rowScroll.width >= row.width - width) addMore()
                 }
                 if (isTvDevice && currentFocus == null) firstCard?.requestFocus()
@@ -7609,12 +7623,17 @@ class MainActivity : EdgeSwipeBackActivity() {
             val tag = loadingTag
             // 混合模式两路各取 8；单选某个榜单就一次取 16，条数别变少
             val specs = if (tag.isEmpty()) listOf("最新" to 8, "热门" to 8) else listOf(tag to 16)
-            specs.map { (t, n) ->
+            val results = specs.map { (t, n) ->
                 async(Dispatchers.IO) {
-                    api.douban(loadingType, t, page * n, n)
+                    try { Result.success(api.douban(loadingType, t, page * n, n)) }
+                    catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                    catch (e: Exception) { Result.failure(e) }
                 }
-            }.awaitAll().flatten().distinctBy { it.title.trim() }
-        }, { items ->
+            }.awaitAll()
+            val available = results.flatMap { it.getOrDefault(emptyList()) }.distinctBy { it.title.trim() }
+            if (available.isEmpty() && results.any { it.isFailure }) throw results.first { it.isFailure }.exceptionOrNull()!!
+            available to results.any { it.isFailure }
+        }, { (items, partialFailure) ->
             isLoadingMore = false
             if (loadingType != mediaType || loadingTag != prefs.recommendTag) return@runApiK
             if (items.isEmpty()) {
@@ -7625,7 +7644,7 @@ class MainActivity : EdgeSwipeBackActivity() {
                     queueRecommendRetry(more = false)
                 }
             } else {
-                recommendRetryAttempts = 0
+                if (partialFailure && !more) queueRecommendRetry(more = false) else recommendRetryAttempts = 0
                 val appending = more && recommendItems.isNotEmpty() && currentScreen == "recommend"
                 val previousCount = recommendItems.size
                 val updated = (if (more) recommendItems + items else items)
