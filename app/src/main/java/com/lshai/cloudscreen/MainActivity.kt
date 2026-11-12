@@ -135,6 +135,7 @@ class MainActivity : EdgeSwipeBackActivity() {
     private var liveChannels: List<Channel> = emptyList()
     private var liveChannelSource: String = ""
     private var homeLiveEntry: View? = null
+    private var homeFeatureEntry: View? = null
     private var mediaType = "tv"
     private var recommendPage = 0
     private var recommendRequested = false
@@ -238,14 +239,16 @@ class MainActivity : EdgeSwipeBackActivity() {
 
     // 电视上最致命的问题就是「看不出焦点在哪」。统一用高对比度方案：
     // 聚焦 = 亮蓝填充 + 深色文字 + 4dp 亮色描边 + 轻微放大。
-    private val ACCENT = 0xFF0F766E.toInt()
-    private val BRIGHT = 0xFF0F766E.toInt()
-    private val INK = 0xFF173B35.toInt()
-    private val TEXT_COLOR = 0xFF173B35.toInt()
-    private val PANEL = 0xFFFFFFFF.toInt()
-    private val BRIGHTER_TEXT = 0xFF617A70.toInt()
-    private val SOFT = 0xFFF5F7F1.toInt()
-    private val BORDER = 0xFFDFE8E2.toInt()
+    private val cinemaTheme: Boolean get() = currentScreen !in listOf("children", "children_more", "children_empty", "children_locked") &&
+        !(childrenSearchOrigin != null && currentScreen in listOf("results", "detail", "playbacksources"))
+    private val ACCENT get() = if (cinemaTheme) 0xFF7DD8BD.toInt() else 0xFF0F766E.toInt()
+    private val BRIGHT get() = if (cinemaTheme) 0xFF9DE5D0.toInt() else 0xFF0F766E.toInt()
+    private val INK get() = if (cinemaTheme) 0xFFF4F0E5.toInt() else 0xFF173B35.toInt()
+    private val TEXT_COLOR get() = INK
+    private val PANEL get() = if (cinemaTheme) 0xFF1C3831.toInt() else 0xFFFFFFFF.toInt()
+    private val BRIGHTER_TEXT get() = if (cinemaTheme) 0xFFB2C5B9.toInt() else 0xFF617A70.toInt()
+    private val SOFT get() = if (cinemaTheme) 0xFF263F36.toInt() else 0xFFF5F7F1.toInt()
+    private val BORDER get() = if (cinemaTheme) 0xFF3B5B4D.toInt() else 0xFFDFE8E2.toInt()
 
     /**
      * 给任意可聚焦控件装上焦点视觉。
@@ -744,7 +747,7 @@ class MainActivity : EdgeSwipeBackActivity() {
         if (currentScreen != "home") hotSearchJob?.cancel()
         root.removeAllViews()
         // Share the restrained warm-white/sage background across phone and TV pages.
-        root.background = SoftBackgroundDrawable()
+        root.background = if (cinemaTheme) CinemaBackgroundDrawable() else SoftBackgroundDrawable()
         root.addView(view, FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         // 加载胶囊挂在 root 上，removeAllViews 会把它一起摘掉，这里重新挂回最上层
@@ -1083,7 +1086,7 @@ class MainActivity : EdgeSwipeBackActivity() {
             setOnClickListener { onClick() }
             applyFocusStyle(
                 this,
-                if (primary) ACCENT else PANEL,
+                if (primary && cinemaTheme) 0xFF17695C.toInt() else if (primary) ACCENT else PANEL,
                 this,
                 if (primary) Color.WHITE else TEXT_COLOR,
                 if (primary) 0xFF0A544F.toInt() else ACCENT,
@@ -2886,9 +2889,9 @@ class MainActivity : EdgeSwipeBackActivity() {
                 gravity = Gravity.CENTER_VERTICAL
                 setPadding(dp(18), dp(12), dp(18), dp(12))
                 background = GradientDrawable().apply {
-                    setColor(Color.WHITE)
+                    setColor(PANEL)
                     cornerRadius = dp(14).toFloat()
-                    setStroke(dp(1), 0xFFE0EAE4.toInt())
+                    setStroke(dp(1), BORDER)
                 }
                 isFocusable = true
                 isFocusableInTouchMode = true
@@ -5994,8 +5997,8 @@ class MainActivity : EdgeSwipeBackActivity() {
                         setColor(color); cornerRadius = dp(12).toFloat()
                         if (focus && isTvDevice) setStroke(dp(2), ACCENT)
                     }
-                    addState(intArrayOf(android.R.attr.state_pressed), surface(0xFFD5E7DF.toInt()))
-                    addState(intArrayOf(android.R.attr.state_focused), surface(0xFFE2EDE5.toInt(), true))
+                    addState(intArrayOf(android.R.attr.state_pressed), surface(if (cinemaTheme) 0xFF27493E.toInt() else 0xFFD5E7DF.toInt()))
+                    addState(intArrayOf(android.R.attr.state_focused), surface(if (cinemaTheme) 0xFF27493E.toInt() else 0xFFE2EDE5.toInt(), true))
                     addState(intArrayOf(), surface(Color.TRANSPARENT))
                 }
             }
@@ -6267,7 +6270,7 @@ class MainActivity : EdgeSwipeBackActivity() {
      */
     private fun homeTile(kind: String, label: String, onClick: () -> Unit): LinearLayout =
         LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
+            orientation = if (isTvDevice) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL
             gravity = Gravity.CENTER
             setPadding(dp(3), dp(8), dp(3), dp(8))
             isFocusable = true
@@ -6278,7 +6281,7 @@ class MainActivity : EdgeSwipeBackActivity() {
             setOnClickListener { onClick() }
             // 图标自绘（HomeIconView）：用字体里的 ▷ ⌕ ⚙ 这些符号，各家字体大小粗细不一，
             // 真机上「搜索」「设置」会明显比别人小一圈，看着像没渲染出来
-            val iconSize = dp(if (isTvDevice) 34 else 25)
+            val iconSize = dp(if (isTvDevice) 21 else 25)
             val icon = HomeIconView(this@MainActivity, kind).apply {
                 tintColor = INK
             }
@@ -6291,15 +6294,15 @@ class MainActivity : EdgeSwipeBackActivity() {
                 includeFontPadding = false
                 isSingleLine = true
                 maxLines = 1
-                setPadding(0, dp(4), 0, 0)
+                setPadding(if (isTvDevice) dp(6) else 0, if (isTvDevice) 0 else dp(4), 0, 0)
             }
-            addView(caption, LinearLayout.LayoutParams(-1, -2))
-            applyFocusStyle(this, PANEL,
+            addView(caption, LinearLayout.LayoutParams(if (isTvDevice) -2 else -1, -2))
+            applyFocusStyle(this, if (isTvDevice && cinemaTheme) Color.TRANSPARENT else PANEL,
                 onFocusChanged = { focused ->
                     icon.tintColor = if (focused) Color.WHITE else INK
                     caption.setTextColor(if (focused) Color.WHITE else INK)
                     if (focused) background = GradientDrawable().apply {
-                        setColor(ACCENT)
+                        setColor(if (cinemaTheme) 0xFF17695C.toInt() else ACCENT)
                         cornerRadius = dp(14).toFloat()
                         setStroke(dp(2), 0xFFB8DED4.toInt())
                     }
@@ -7253,6 +7256,103 @@ class MainActivity : EdgeSwipeBackActivity() {
         }
     }
 
+    /** Rotate three real recommendations; never replace the existing feed or history. */
+    private fun addCinemaFeature(parent: LinearLayout) {
+        val items = recommendItems.filter { it.title.isNotBlank() && it.cover.isNotBlank() }.shuffled().take(3)
+        if (items.isEmpty()) return
+        var selected = 0
+        val height = dp(if (isTvDevice) 190 else 132)
+        val feature = FrameLayout(this).apply {
+            isFocusable = true
+            isClickable = true
+            background = GradientDrawable().apply { setColor(0xFF203D34.toInt()); cornerRadius = dp(16).toFloat() }
+            clipToOutline = true
+        }
+        val image = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
+        feature.addView(image, FrameLayout.LayoutParams(-1, -1))
+        feature.addView(View(this).apply {
+            background = GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT,
+                intArrayOf(0xF20B211B.toInt(), 0xD30B211B.toInt(), 0x550B211B.toInt()))
+        }, FrameLayout.LayoutParams(-1, -1))
+        val title = TextView(this).apply {
+            setTextSize(if (isTvDevice) 27f else 19f)
+            setTextColor(0xFFFFF9E9.toInt()); setTypeface(null, Typeface.BOLD)
+            maxLines = 2; ellipsize = android.text.TextUtils.TruncateAt.END
+            setPadding(0, dp(6), 0, dp(6))
+        }
+        val subtitle = TextView(this).apply {
+            setTextSize(if (isTvDevice) 15f else 13f); setTextColor(0xFFE7F7ED.toInt())
+            setPadding(dp(14), dp(6), dp(14), dp(6))
+            background = GradientDrawable().apply {
+                setColor(0xFF17695C.toInt()); cornerRadius = dp(18).toFloat()
+                setStroke(dp(1), 0xFF83DEC0.toInt())
+            }
+        }
+        val copy = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(if (isTvDevice) 28 else 18), dp(14), dp(18), dp(14))
+            addView(TextView(this@MainActivity).apply {
+                text = "为你推荐"; setTextSize(if (isTvDevice) 14f else 12f)
+                setTextColor(0xFF98DCC5.toInt()); setTypeface(null, Typeface.BOLD)
+            })
+            addView(title)
+            addView(subtitle, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        }
+        feature.addView(copy, FrameLayout.LayoutParams(if (isTvDevice) (resources.displayMetrics.widthPixels * .48f).toInt() else -1, -1))
+        val dots = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER }
+        repeat(items.size) {
+            dots.addView(View(this), LinearLayout.LayoutParams(dp(6), dp(6)).apply { leftMargin = dp(3); rightMargin = dp(3) })
+        }
+        feature.addView(dots, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply { bottomMargin = dp(10) })
+        fun show(index: Int) {
+            selected = (index + items.size) % items.size
+            val item = items[selected]
+            feature.contentDescription = "推荐：${item.title}，点击查看，左右切换"
+            title.text = item.title
+            subtitle.text = if (item.rating.isBlank()) "▶  立即观看" else "▶  立即观看  ·  ★ ${item.rating}"
+            for (i in 0 until dots.childCount) dots.getChildAt(i).background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(if (i == selected) 0xFF83DEC0.toInt() else 0x889AC5B2.toInt())
+            }
+            image.tag = item.cover
+            image.setImageDrawable(null)
+            imageLoader.load(item.cover, resources.displayMetrics.widthPixels, height,
+                needed = { feature.isAttachedToWindow && image.tag == item.cover },
+                onPreview = { if (image.tag == item.cover) image.setImageBitmap(it) }) {
+                if (image.tag == item.cover && it != null) image.setImageBitmap(it)
+            }
+        }
+        feature.setOnClickListener { doSearch(items[selected].title) }
+        feature.setOnKeyListener { _, code, event ->
+            if (event.action == KeyEvent.ACTION_DOWN && items.size > 1 && code in listOf(KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT)) {
+                show(selected + if (code == KeyEvent.KEYCODE_DPAD_RIGHT) 1 else -1); true
+            } else false
+        }
+        feature.onFocusChangeListener = View.OnFocusChangeListener { view, focused ->
+            view.foreground = if (focused) GradientDrawable().apply {
+                setColor(Color.TRANSPARENT); cornerRadius = dp(16).toFloat(); setStroke(dp(3), 0xFF9DE5D0.toInt())
+            } else null
+        }
+        val rotate = object : Runnable {
+            override fun run() {
+                if (!feature.isAttachedToWindow) return
+                if (quotaVisible && currentScreen == "recommend" && !feature.hasFocus()) show(selected + 1)
+                feature.postDelayed(this, 6_000L)
+            }
+        }
+        feature.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
+            override fun onViewAttachedToWindow(v: View) {
+                show(selected)
+                if (items.size > 1) { feature.removeCallbacks(rotate); feature.postDelayed(rotate, 6_000L) }
+            }
+            override fun onViewDetachedFromWindow(v: View) { feature.removeCallbacks(rotate) }
+        })
+        homeFeatureEntry = feature
+        parent.addView(feature, LinearLayout.LayoutParams(-1, height).apply { topMargin = dp(if (isTvDevice) 14 else 8); bottomMargin = dp(4) })
+    }
+
     private fun showRecommend() {
         currentScreen = "recommend"
         scheduleRecommendRetry()
@@ -7273,13 +7373,14 @@ class MainActivity : EdgeSwipeBackActivity() {
         }
         brandBar.addView(
             brandRow(),
-            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f),
+            LinearLayout.LayoutParams(if (isTvDevice) -2 else 0, ViewGroup.LayoutParams.WRAP_CONTENT, if (isTvDevice) 0f else 1f),
         )
         updateBadgeBar = brandBar
         updateBadge = updateCapsule()
         updateBadge?.let { brandBar.addView(it) }
-        col.addView(brandBar)
+        if (!isTvDevice) col.addView(brandBar)
         homeHistoryFirst = null
+        homeFeatureEntry = null
         // 启动阶段的状态行：非模态，不挡任何操作，连上后自动消失
         bootNotice?.let { notice ->
             val row = LinearLayout(this).apply {
@@ -7309,7 +7410,25 @@ class MainActivity : EdgeSwipeBackActivity() {
         val tiles = visibleIds.map { id -> homeTileFor(id) }
         homeBar = null
         homeBarRows.clear()
-        if (compact) {
+        if (isTvDevice) {
+            val bar = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                clipChildren = false; clipToPadding = false
+            }
+            bar.addView(brandBar, LinearLayout.LayoutParams(-2, dp(58)).apply { rightMargin = dp(12) })
+            tiles.forEach { tile ->
+                bar.addView(tile, LinearLayout.LayoutParams(-2, dp(54)).apply { rightMargin = dp(3) })
+            }
+            val live = button("电视直播") { openLiveFromHome() }.apply {
+                contentDescription = "电视直播"
+                homeLiveEntry = this
+            }
+            bar.addView(live, LinearLayout.LayoutParams(-2, dp(52)).apply { leftMargin = dp(12) })
+            col.addView(hScroll(bar), LinearLayout.LayoutParams(-1, dp(60)))
+            homeBar = bar
+            homeBarRows.add(bar)
+        } else if (compact) {
             // 方案 B：手机五个主入口保持单行，避免首屏被九宫格占满。
             val rows = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
             val rowHeight = dp(76)
@@ -7353,10 +7472,11 @@ class MainActivity : EdgeSwipeBackActivity() {
             homeBar = bar
             homeBarRows.add(bar)
         }
-        col.addView(button("电视直播") { openLiveFromHome() }.apply {
+        if (!isTvDevice) col.addView(button("电视直播") { openLiveFromHome() }.apply {
             contentDescription = "电视直播"
             homeLiveEntry = this
-        }, LinearLayout.LayoutParams(-1, dp(if (isTvDevice) 52 else 48)).apply { topMargin = dp(10) })
+        }, LinearLayout.LayoutParams(-1, dp(48)).apply { topMargin = dp(10) })
+        if (isTvDevice) addCinemaFeature(col)
         addContinueWatchingB(col)
         // 标题 + 榜单切换：以前"最新/热门"是写死的混合，用户以为没有这个功能
         val titleRow = LinearLayout(this).apply {
@@ -7467,7 +7587,7 @@ class MainActivity : EdgeSwipeBackActivity() {
                     if (event.action != KeyEvent.ACTION_DOWN) false
                     else if (code == KeyEvent.KEYCODE_DPAD_DOWN && rowIndex == homeBarRows.lastIndex) {
                         homeLastHeaderFocus = v
-                        val history = homeLiveEntry ?: homeHistoryFirst
+                        val history = homeFeatureEntry ?: homeHistoryFirst ?: homeLiveEntry
                         if (history != null && history.isShown) history.requestFocus()
                         else if (recommendItems.isNotEmpty()) {
                             rv.scrollToPosition(1)
