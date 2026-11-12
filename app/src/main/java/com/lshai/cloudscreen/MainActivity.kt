@@ -239,7 +239,7 @@ class MainActivity : EdgeSwipeBackActivity() {
 
     // 电视上最致命的问题就是「看不出焦点在哪」。统一用高对比度方案：
     // 聚焦 = 亮蓝填充 + 深色文字 + 4dp 亮色描边 + 轻微放大。
-    private val cinemaTheme: Boolean get() = currentScreen !in listOf("children", "children_more", "children_empty", "children_locked") &&
+    private val cinemaTheme: Boolean get() = isTvDevice && currentScreen !in listOf("children", "children_more", "children_empty", "children_locked") &&
         !(childrenSearchOrigin != null && currentScreen in listOf("results", "detail", "playbacksources"))
     private val ACCENT get() = if (cinemaTheme) 0xFF7DD8BD.toInt() else 0xFF0F766E.toInt()
     private val BRIGHT get() = if (cinemaTheme) 0xFF9DE5D0.toInt() else 0xFF0F766E.toInt()
@@ -1086,7 +1086,8 @@ class MainActivity : EdgeSwipeBackActivity() {
             setOnClickListener { onClick() }
             applyFocusStyle(
                 this,
-                if (primary && cinemaTheme) 0xFF17695C.toInt() else if (primary) ACCENT else PANEL,
+                if (primary && cinemaTheme) 0xFF17695C.toInt() else if (primary) ACCENT
+                else if (!isTvDevice && currentScreen == "recommend") 0xFFEDF3EA.toInt() else PANEL,
                 this,
                 if (primary) Color.WHITE else TEXT_COLOR,
                 if (primary) 0xFF0A544F.toInt() else ACCENT,
@@ -6297,7 +6298,8 @@ class MainActivity : EdgeSwipeBackActivity() {
                 setPadding(if (isTvDevice) dp(6) else 0, if (isTvDevice) 0 else dp(4), 0, 0)
             }
             addView(caption, LinearLayout.LayoutParams(if (isTvDevice) -2 else -1, -2))
-            applyFocusStyle(this, if (isTvDevice && cinemaTheme) Color.TRANSPARENT else PANEL,
+            applyFocusStyle(this, if (isTvDevice && cinemaTheme) Color.TRANSPARENT
+                else if (!isTvDevice && currentScreen == "recommend") 0xFFEDF3EA.toInt() else PANEL,
                 onFocusChanged = { focused ->
                     icon.tintColor = if (focused) Color.WHITE else INK
                     caption.setTextColor(if (focused) Color.WHITE else INK)
