@@ -5552,6 +5552,20 @@ class MainActivity : EdgeSwipeBackActivity() {
                 numColumns = if (compact) 1 else 3
                 horizontalSpacing = dp(12)
                 verticalSpacing = dp(12)
+                if (isTvDevice) {
+                    setDrawSelectorOnTop(true)
+                    setSelector(Color.TRANSPARENT)
+                    setOnFocusChangeListener { view, focused ->
+                        val target = view as GridView
+                        target.setSelector(if (focused) GradientDrawable().apply {
+                            setColor(0x3344C7A3.toInt())
+                            cornerRadius = dp(14).toFloat()
+                            setStroke(dp(3), 0xFF9DE5D0.toInt())
+                        } else android.graphics.drawable.ColorDrawable(Color.TRANSPARENT))
+                        if (focused && target.selectedItemPosition < 0 && target.count > 0) target.setSelection(0)
+                        target.invalidate()
+                    }
+                }
             }
             grid.adapter = object : BaseAdapter() {
                 override fun getCount() = items2.size
@@ -5560,6 +5574,7 @@ class MainActivity : EdgeSwipeBackActivity() {
                 override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
                     val cell = (convertView as? LinearLayout) ?: LinearLayout(this@MainActivity).apply {
                         orientation = LinearLayout.HORIZONTAL
+                        if (isTvDevice) { isFocusable = false; isFocusableInTouchMode = false }
                         setPadding(dp(8), dp(8), dp(8), dp(8))
                         addView(
                             ImageView(this@MainActivity).apply {
@@ -5621,6 +5636,7 @@ class MainActivity : EdgeSwipeBackActivity() {
             }
             col.addView(grid, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+            if (isTvDevice) grid.post { if (currentScreen == "history") { grid.requestFocus(); if (grid.selectedItemPosition < 0) grid.setSelection(0) } }
         }
         setScreen(col)
         col.post { col.findFocus() ?: col.requestFocus() }
@@ -7478,7 +7494,6 @@ class MainActivity : EdgeSwipeBackActivity() {
             contentDescription = "电视直播"
             homeLiveEntry = this
         }, LinearLayout.LayoutParams(-1, dp(48)).apply { topMargin = dp(10) })
-        if (isTvDevice) addCinemaFeature(col)
         addContinueWatchingB(col)
         // 标题 + 榜单切换：以前"最新/热门"是写死的混合，用户以为没有这个功能
         val titleRow = LinearLayout(this).apply {
@@ -7589,7 +7604,7 @@ class MainActivity : EdgeSwipeBackActivity() {
                     if (event.action != KeyEvent.ACTION_DOWN) false
                     else if (code == KeyEvent.KEYCODE_DPAD_DOWN && rowIndex == homeBarRows.lastIndex) {
                         homeLastHeaderFocus = v
-                        val history = homeFeatureEntry ?: homeHistoryFirst ?: homeLiveEntry
+                        val history = homeHistoryFirst ?: homeLiveEntry
                         if (history != null && history.isShown) history.requestFocus()
                         else if (recommendItems.isNotEmpty()) {
                             rv.scrollToPosition(1)

@@ -285,36 +285,125 @@ internal object ChildrenQuota {
     }
     private fun showParentMenu(activity: Activity, after: () -> Unit) {
         settle()
-                val daily = dailyMinutes(activity)
-                AlertDialog.Builder(android.view.ContextThemeWrapper(activity, android.R.style.Theme_Material_Light_Dialog_Alert))
-                    .setCustomTitle(panelTitle(activity, "儿童计时管理 · 每日 $daily 分钟\n已用 ${(used + 59_999) / 60_000} 分钟 · ${label(activity)}"))
-                    .setItems(arrayOf("修改每日固定额度（以后每天生效）", "仅今天加时（明天仍为 $daily 分钟）", "受管理作品（自动 / 手动）")) { _, which ->
-                        if (which == 2) {
-                            showManagedTitles(activity, after)
-                            return@setItems
+        fun dp(n: Int) = (n * activity.resources.displayMetrics.density).toInt()
+        val daily = dailyMinutes(activity)
+        val left = remaining(activity)
+        val total = (daily + store.getInt("bonus", 0)).coerceAtLeast(1) * 60_000L
+        val manual = store.getStringSet("titles", emptySet()).orEmpty().filterNot(::isBuiltIn).sorted()
+        val ink = 0xFF203C33.toInt()
+        val muted = 0xFF637B70.toInt()
+        fun rounded(color: Int, stroke: Int? = null) = android.graphics.drawable.GradientDrawable().apply {
+            setColor(color); cornerRadius = dp(15).toFloat()
+            if (stroke != null) setStroke(dp(1).coerceAtLeast(1), stroke)
+        }
+        fun label(text: String, size: Float, color: Int = ink) = android.widget.TextView(activity).apply {
+            this.text = text; textSize = size; setTextColor(color)
+        }
+        fun action(text: String, primary: Boolean = false, click: () -> Unit) = android.widget.TextView(activity).apply {
+            this.text = text; textSize = 16f; gravity = android.view.Gravity.CENTER
+            setTextColor(if (primary) android.graphics.Color.WHITE else 0xFF306C50.toInt())
+            setTypeface(null, android.graphics.Typeface.BOLD)
+            setPadding(dp(10), dp(10), dp(10), dp(10))
+            isFocusable = true; isClickable = true
+            background = rounded(if (primary) 0xFF599F7D.toInt() else 0xFFE6F2EA.toInt())
+            setOnFocusChangeListener { view, focused ->
+                view.background = rounded(if (primary) 0xFF599F7D.toInt() else 0xFFE6F2EA.toInt(),
+                    if (focused) 0xFF1E765A.toInt() else null)
+            }
+            setOnClickListener { click() }
+        }
+        lateinit var dialog: AlertDialog
+        fun openLimit(fixed: Boolean) {
+            dialog.dismiss()
+            numberPanel(activity, if (fixed) "修改每日固定额度" else "仅今天加时",
+                if (fixed) "当前每天 $daily 分钟。修改后今天立即生效，以后每天沿用新额度；已用时间不清零。"
+                else "每日固定 $daily 分钟。这里只增加今天的时间，不改变每日固定额度。", 3,
+                preview = { input ->
+                    val minutes = input.toIntOrNull()
+                    if (minutes == null || minutes !in 1..240) "请输入 1—240 分钟"
+                    else if (fixed) "确认后：每天 $minutes 分钟，明天也是 $minutes 分钟。"
+                    else "今天额外增加 $minutes 分钟；明天恢复为 $daily 分钟。"
+                },
+                validate = { if (it != null && it in 1..240) null else "请输入 1—240 的分钟数" },
+                accepted = { minutes ->
+                    settle()
+                    store.edit().putInt(if (fixed) "limit" else "bonus",
+                        if (fixed) minutes else store.getInt("bonus", 0) + minutes).apply()
+                    android.widget.Toast.makeText(activity,
+                        if (fixed) "每日固定额度已改为 $minutes 分钟，明天同样生效" else "今天已加 $minutes 分钟，明天仍为 $daily 分钟",
+                        android.widget.Toast.LENGTH_LONG).show()
+                    after()
+                })
+        }
+        val content = android.widget.LinearLayout(activity).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            setPadding(dp(20), dp(18), dp(20), dp(16))
+        }
+        val heading = android.widget.LinearLayout(activity).apply {
+            orientation = android.widget.LinearLayout.HORIZONTAL; gravity = android.view.Gravity.CENTER_VERTICAL
+        }
+        heading.addView(label("儿童时间管理", 22f).apply { setTypeface(null, android.graphics.Typeface.BOLD) },
+            android.widget.LinearLayout.LayoutParams(0, -2, 1f))
+        val close = action("关闭") { dialog.dismiss() }.apply {
+            setTextColor(muted); background = rounded(0xFFFFFDF6.toInt()); setTypeface(null, android.graphics.Typeface.NORMAL)
+        }
+        heading.addView(close, android.widget.LinearLayout.LayoutParams(-2, dp(48)))
+        content.addView(heading)
+        val status = android.widget.LinearLayout(activity).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            setPadding(dp(16), dp(14), dp(16), dp(14))
+            background = rounded(android.graphics.Color.WHITE, 0xFFDCE9DF.toInt())
+        }
+        val statusLine = android.widget.LinearLayout(activity).apply {
+            orientation = android.widget.LinearLayout.HORIZONTAL; gravity = android.view.Gravity.CENTER_VERTICAL
+        }
+        statusLine.addView(label(if (left <= 0) "今日时间已用完" else "今日剩余 ${(left + 59_999) / 60_000} 分钟", 19f).apply {
+            setTypeface(null, android.graphics.Typeface.BOLD)
+        }, android.widget.LinearLayout.LayoutParams(0, -2, 1f))
+        statusLine.addView(label("每日 $daily 分钟", 14f, muted))
+        status.addView(statusLine)
+        val progress = android.widget.ProgressBar(activity, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 1000; this.progress = ((left.toDouble() / total).coerceIn(0.0, 1.0) * 1000).toInt()
+            progressTintList = android.content.res.ColorStateList.valueOf(0xFF599F7D.toInt())
+            progressBackgroundTintList = android.content.res.ColorStateList.valueOf(0xFFE6F2EA.toInt())
+            contentDescription = "今日剩余时间"
+        }
+        status.addView(progress, android.widget.LinearLayout.LayoutParams(-1, dp(5)).apply { topMargin = dp(12) })
+        content.addView(status, android.widget.LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12) })
+        val actions = android.widget.LinearLayout(activity).apply { orientation = android.widget.LinearLayout.HORIZONTAL }
+        actions.addView(action("改每日额度") { openLimit(true) }, android.widget.LinearLayout.LayoutParams(0, dp(56), 1f).apply { rightMargin = dp(6) })
+        actions.addView(action("仅今天加时", true) { openLimit(false) }, android.widget.LinearLayout.LayoutParams(0, dp(56), 1f).apply { leftMargin = dp(6) })
+        content.addView(actions, android.widget.LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(14) })
+        content.addView(label("手动加入的作品（${manual.size}）", 16f, muted).apply { setPadding(0, dp(18), 0, dp(8)) })
+        if (manual.isEmpty()) content.addView(label("还没有手动加入的作品。内置儿童清单里的动画已自动计时。", 14f, muted))
+        else manual.forEach { title ->
+            content.addView(action("$title  ·  管理") {
+                dialog.dismiss()
+                AlertDialog.Builder(activity).setTitle("移除《$title》的儿童计时？")
+                    .setMessage("移除后该作品不再计入儿童额度，不会清零今天已用时间。")
+                    .setPositiveButton("家长验证后移除") { _, _ ->
+                        verifyParent(activity) {
+                            val titles = store.getStringSet("titles", emptySet()).orEmpty().toMutableSet()
+                            titles.remove(title)
+                            store.edit().putStringSet("titles", titles).apply()
+                            after()
                         }
-                        val fixed = which == 0
-                        numberPanel(activity, if (fixed) "修改每日固定额度" else "仅今天加时",
-                            if (fixed) "当前每天 $daily 分钟。修改后今天立即生效，以后每天沿用新额度；已用时间不清零。"
-                            else "每日固定 $daily 分钟。这里只增加今天的时间，不改变每日固定额度。", 3,
-                            preview = { input ->
-                                val minutes = input.toIntOrNull()
-                                if (minutes == null || minutes !in 1..240) "请输入 1—240 分钟"
-                                else if (fixed) "确认后：每天 $minutes 分钟，明天也是 $minutes 分钟。"
-                                else "今天额外增加 $minutes 分钟；明天恢复为 $daily 分钟。"
-                            },
-                            validate = { if (it != null && it in 1..240) null else "请输入 1—240 的分钟数" },
-                            accepted = { minutes ->
-                                settle()
-                                store.edit().putInt(if (fixed) "limit" else "bonus",
-                                    if (fixed) minutes else store.getInt("bonus", 0) + minutes).apply()
-                                android.widget.Toast.makeText(activity,
-                                    if (fixed) "每日固定额度已改为 $minutes 分钟，明天同样生效"
-                                    else "今天已加 $minutes 分钟，明天仍为 $daily 分钟",
-                                    android.widget.Toast.LENGTH_LONG).show()
-                                after()
-                            })
-                    }.setNegativeButton("关闭", null).create().also { menu -> menu.setOnShowListener { stylePanel(activity, menu) }; menu.show() }
+                    }.setNegativeButton("取消") { _, _ -> showParentMenu(activity, after) }.show()
+            }, android.widget.LinearLayout.LayoutParams(-1, dp(50)).apply { topMargin = dp(4) })
+        }
+        content.addView(label("内置清单自动识别，不能移除；手动加入的作品须经家长验证后移除。", 13f, muted).apply { setPadding(0, dp(14), 0, 0) })
+        content.addView(action("查看全部受管理作品") { dialog.dismiss(); showManagedTitles(activity, after) },
+            android.widget.LinearLayout.LayoutParams(-1, dp(48)).apply { topMargin = dp(10) })
+        val scroll = android.widget.ScrollView(activity).apply { isFillViewport = false; addView(content) }
+        dialog = AlertDialog.Builder(android.view.ContextThemeWrapper(activity, android.R.style.Theme_Material_Light_Dialog_Alert))
+            .setView(scroll).create()
+        dialog.setOnShowListener {
+            stylePanel(activity, dialog)
+            dialog.window?.setLayout(minOf(dp(520), (activity.resources.displayMetrics.widthPixels * .94f).toInt()),
+                android.view.WindowManager.LayoutParams.WRAP_CONTENT)
+            actions.getChildAt(0).requestFocus()
+        }
+        dialog.show()
     }
 
     private fun isBuiltIn(title: String): Boolean = matchesChildQuotaTitle(title, catalogKeys)
