@@ -74,4 +74,10 @@ class LivePlaylistTest {
         assertEquals(1, report.skipped)
         assertEquals(1, report.unsupportedDirectives)
     }
+    @Test fun fallbackOnlyAdvancesWithinSameChannelWhenOnline() {
+        assertEquals(1, nextLiveLine(0, 3, true))
+        assertEquals(2, nextLiveLine(1, 3, true))
+        assertNull(nextLiveLine(2, 3, true))
+        assertNull(nextLiveLine(0, 3, false))
+    }
 }

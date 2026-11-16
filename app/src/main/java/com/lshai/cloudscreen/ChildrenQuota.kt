@@ -24,6 +24,8 @@ internal object ChildrenQuota {
     private var lastPersistedAt = 0L
     private var player: ExoPlayer? = null
     private var childPlayback = false
+    private var playbackTitle = ""
+    private val dailyDetails = linkedMapOf<String, Long>()
     private var wasActive = false
     private var warnedDay = ""
     private val catalogKeys by lazy { ChildrenCatalog.preloadOrder().map(::normalizeSeries).toSet() }
@@ -44,6 +46,10 @@ internal object ChildrenQuota {
         app = context.applicationContext
         day = store.getString("day", "").orEmpty()
         used = store.getLong("used", 0L)
+        runCatching {
+            val json = org.json.JSONObject(store.getString("details", "{}").orEmpty())
+            json.keys().forEach { key -> dailyDetails[key] = json.optLong(key).coerceAtLeast(0L) }
+        }
         last = SystemClock.elapsedRealtime()
         persistedUsed = used
         lastPersistedAt = last
@@ -56,7 +62,9 @@ internal object ChildrenQuota {
         if (!started) return
         val now = SystemClock.elapsedRealtime()
         val currentDay = today()
-        if (day != currentDay) {
+        val previousUsed = used
+        val sameDay = day == currentDay
+        if (!sameDay) {
             val calendar = java.util.Calendar.getInstance()
             val midnight = (calendar.clone() as java.util.Calendar).apply {
                 set(java.util.Calendar.HOUR_OF_DAY, 0); set(java.util.Calendar.MINUTE, 0)
@@ -64,13 +72,15 @@ internal object ChildrenQuota {
             }
             used = quotaUsage(false, used, now - last, wasActive, calendar.timeInMillis - midnight.timeInMillis)
             day = currentDay
-            store.edit().putString("day", day).putLong("used", used).putInt("bonus", 0).apply()
-            persistedUsed = used
+            store.edit().putString("day", day).putLong("used", used).putString("details", "{}").putInt("bonus", 0).apply()
+            persistedUsed = -1L
             lastPersistedAt = now
         } else if (wasActive && now > last) {
             used = quotaUsage(true, used, now - last, true, 0)
 
         }
+        val charged = if (sameDay) (used - previousUsed).coerceAtLeast(0L) else used
+        addQuotaDetail(dailyDetails, playbackTitle, charged, newDay = !sameDay)
         last = now
         wasActive = active()
         persistUsage(false)
@@ -78,7 +88,9 @@ internal object ChildrenQuota {
     private fun persistUsage(force: Boolean) {
         val now = SystemClock.elapsedRealtime()
         if (used != persistedUsed && (force || now - lastPersistedAt >= 5_000L)) {
-            store.edit().putLong("used", used).apply()
+            val details = org.json.JSONObject()
+            dailyDetails.forEach { (title, millis) -> details.put(title, millis) }
+            store.edit().putLong("used", used).putString("details", details.toString()).apply()
             persistedUsed = used
             lastPersistedAt = now
         }
@@ -86,16 +98,17 @@ internal object ChildrenQuota {
     private val listener = object : Player.Listener {
         override fun onIsPlayingChanged(isPlaying: Boolean) { settle(); if (!isPlaying) persistUsage(true); enforce() }
     }
-    fun attach(context: Context, target: ExoPlayer, child: Boolean) {
+    fun attach(context: Context, target: ExoPlayer, child: Boolean, title: String) {
         init(context); settle()
         player?.removeListener(listener)
         player = target; childPlayback = child
+        playbackTitle = if (child) seriesNameOf(title).trim().ifBlank { "未命名作品" } else ""
         target.addListener(listener)
         wasActive = active(); enforce()
     }
     fun detach(target: ExoPlayer?) {
         if (player !== target) return
-        settle(); persistUsage(true); player?.removeListener(listener); player = null; childPlayback = false; wasActive = active()
+        settle(); persistUsage(true); player?.removeListener(listener); player = null; childPlayback = false; playbackTitle = ""; wasActive = active()
     }
     private fun enforce() {
         val target = player
@@ -377,6 +390,11 @@ internal object ChildrenQuota {
         actions.addView(action("改每日额度") { openLimit(true) }, android.widget.LinearLayout.LayoutParams(0, dp(56), 1f).apply { rightMargin = dp(6) })
         actions.addView(action("仅今天加时", true) { openLimit(false) }, android.widget.LinearLayout.LayoutParams(0, dp(56), 1f).apply { leftMargin = dp(6) })
         content.addView(actions, android.widget.LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(14) })
+        content.addView(label("今日观看明细", 16f, muted).apply { setPadding(0, dp(18), 0, dp(8)) })
+        if (dailyDetails.isEmpty()) content.addView(label("暂无本次更新后的观看明细，原有总用时仍保留。", 14f, muted))
+        else dailyDetails.entries.sortedByDescending { it.value }.forEach { (title, millis) ->
+            content.addView(label("$title  ·  约 ${(millis + 59_999) / 60_000} 分钟", 14f, ink).apply { setPadding(0, dp(4), 0, dp(4)) })
+        }
         content.addView(label("手动加入的作品（${manual.size}）", 16f, muted).apply { setPadding(0, dp(18), 0, dp(8)) })
         if (manual.isEmpty()) content.addView(label("还没有手动加入的作品。内置儿童清单里的动画已自动计时。", 14f, muted))
         else manual.forEach { title ->

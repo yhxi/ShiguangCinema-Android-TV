@@ -134,6 +134,7 @@ class MainActivity : EdgeSwipeBackActivity() {
     private var recommendItems: List<DoubanItem> = emptyList()
     private var liveChannels: List<Channel> = emptyList()
     private var liveChannelSource: String = ""
+    private var liveChannelLoadedAt = 0L
     private var homeLiveEntry: View? = null
     private var homeFeatureEntry: View? = null
     private var mediaType = "tv"
@@ -1192,7 +1193,7 @@ class MainActivity : EdgeSwipeBackActivity() {
     private fun listSelector(): android.graphics.drawable.Drawable {
         val ring = InsetDrawable(
             GradientDrawable().apply {
-                setColor(Color.TRANSPARENT)
+                setColor(if (isTvDevice) 0x2244C7A3 else Color.TRANSPARENT)
                 cornerRadius = dp(14).toFloat()
                 setStroke(dp(3), BRIGHT)
             },
@@ -1200,7 +1201,9 @@ class MainActivity : EdgeSwipeBackActivity() {
         )
         val empty = android.graphics.drawable.ColorDrawable(Color.TRANSPARENT)
         return android.graphics.drawable.StateListDrawable().apply {
+            addState(intArrayOf(android.R.attr.state_pressed), ring)
             addState(intArrayOf(android.R.attr.state_focused), ring)
+            addState(intArrayOf(android.R.attr.state_selected), ring)
             addState(intArrayOf(), empty)
         }
     }
@@ -1212,6 +1215,7 @@ class MainActivity : EdgeSwipeBackActivity() {
         dividerHeight = dp(7)
         setBackgroundColor(Color.TRANSPARENT)
         setSelector(listSelector())
+        if (isTvDevice) setDrawSelectorOnTop(true)
         // AdapterView 会把选中高亮一直留着，焦点移走后就变成「永远是聚焦状态」。
         // 失焦时把 selector 换成透明，重新聚焦再装回来。
         setOnFocusChangeListener { v, hasFocus ->
@@ -1260,6 +1264,13 @@ class MainActivity : EdgeSwipeBackActivity() {
         isFocusable = true
         isFocusableInTouchMode = true
         setSelector(listSelector())
+        if (isTvDevice) {
+            setDrawSelectorOnTop(true)
+            setOnFocusChangeListener { view, focused ->
+                (view as GridView).setSelector(if (focused) listSelector() else android.graphics.drawable.ColorDrawable(Color.TRANSPARENT))
+                view.invalidate()
+            }
+        }
     }
 
     /**
@@ -5249,6 +5260,58 @@ class MainActivity : EdgeSwipeBackActivity() {
 
     /* --------------------------------------------------------------- 直播页 */
 
+    private var liveHealthJob: Job? = null
+    private var liveHealthSource: String? = null
+    private val liveHealthCallbacks = mutableListOf<() -> Unit>()
+    private fun liveHealthKey(source: String): String = android.util.Base64.encodeToString(
+        java.security.MessageDigest.getInstance("SHA-256").digest(source.toByteArray(Charsets.UTF_8)), android.util.Base64.NO_WRAP)
+    private fun liveHealthLabel(source: String): String {
+        val state = getSharedPreferences("live_source_health", MODE_PRIVATE)
+        val key = liveHealthKey(source)
+        val checked = state.getLong("$key:time", 0L)
+        return if (checked == 0L || System.currentTimeMillis() - checked > 24 * 60 * 60 * 1000L) "待检查"
+        else state.getString("$key:state", "待检查") ?: "待检查"
+    }
+    /** Sample up to three different hosts; reachability is not a guarantee of playable video. */
+    private fun scheduleLiveHealth(source: String, channels: List<Channel>, force: Boolean = false, onDone: (() -> Unit)? = null) {
+        if (channels.isEmpty()) { onDone?.invoke(); return }
+        if (liveHealthJob?.isActive == true) {
+            if (liveHealthSource == source) { onDone?.let { liveHealthCallbacks.add(it) }; return }
+            liveHealthJob?.cancel()
+            liveHealthCallbacks.clear()
+        }
+        if (!force && liveHealthLabel(source) != "待检查") { onDone?.invoke(); return }
+        liveHealthSource = source
+        onDone?.let { liveHealthCallbacks.add(it) }
+        liveHealthJob = scope.launch {
+            val online = hasActiveNetwork(this@MainActivity)
+            val status = if (!online) "待检查" else withContext(Dispatchers.IO) {
+                val samples = sortedLiveChannels(channels).distinctBy {
+                    runCatching { java.net.URL(it.url).host.lowercase() }.getOrDefault(it.url)
+                }.take(3)
+                val reachable = samples.any { channel ->
+                    runCatching {
+                        val connection = java.net.URL(channel.url).openConnection() as HttpURLConnection
+                        try {
+                            connection.connectTimeout = 2500; connection.readTimeout = 2500
+                            connection.instanceFollowRedirects = true
+                            channel.headers.forEach { (name, value) -> connection.setRequestProperty(name, value) }
+                            connection.setRequestProperty("Range", "bytes=0-1023")
+                            connection.responseCode in 200..299
+                        } finally { connection.disconnect() }
+                    }.getOrDefault(false)
+                }
+                if (reachable) "可用" else "可能失效"
+            }
+            val state = getSharedPreferences("live_source_health", MODE_PRIVATE)
+            val key = liveHealthKey(source)
+            state.edit().putString("$key:state", status).putLong("$key:time", if (status == "待检查") 0L else System.currentTimeMillis()).apply()
+            val callbacks = liveHealthCallbacks.toList()
+            liveHealthCallbacks.clear()
+            callbacks.forEach { it() }
+        }
+    }
+
     private fun openLiveFromHome() {
         ensureBuiltInLiveSources()
         val active = prefs.activeLiveUrl
@@ -5263,7 +5326,11 @@ class MainActivity : EdgeSwipeBackActivity() {
             if (!isCctvOne(ordered[index].name)) toast("列表中未找到 CCTV1，将播放第一个频道")
             launchLivePlayer(ordered, index)
         }
-        if (liveChannelSource == active && liveChannels.isNotEmpty()) { start(liveChannels); return }
+        if (liveChannelSource == active && liveChannels.isNotEmpty() &&
+            (active.startsWith("local-live:") || active == "builtin-live:cctv" || android.os.SystemClock.elapsedRealtime() - liveChannelLoadedAt < 24 * 60 * 60 * 1000L)) {
+            scheduleLiveHealth(active, liveChannels)
+            start(liveChannels); return
+        }
         runApiK("live", "正在打开电视直播…", {
             when {
                 active == "builtin-live:cctv" -> assets.open("builtin_cctv.m3u").bufferedReader(Charsets.UTF_8).use { parseLocalLivePlaylist(it.readText()) }
@@ -5272,7 +5339,15 @@ class MainActivity : EdgeSwipeBackActivity() {
             }
         }, { channels ->
             liveChannels = channels; liveChannelSource = active
+            liveChannelLoadedAt = android.os.SystemClock.elapsedRealtime()
+            scheduleLiveHealth(active, channels)
             start(channels)
+        }, quiet = true, onError = {
+            AlertDialog.Builder(this).setTitle("无法打开电视直播")
+                .setMessage(if (hasActiveNetwork(this)) "当前直播源无法读取，可重试或在设置中换源。" else "网络未连接，请检查网络后重试。")
+                .setPositiveButton("重试") { _, _ -> openLiveFromHome() }
+                .setNeutralButton("换源") { _, _ -> showLive() }
+                .setNegativeButton("关闭", null).show()
         })
     }
     private fun launchLivePlayer(channels: List<Channel>, index: Int) {
@@ -5311,10 +5386,11 @@ class MainActivity : EdgeSwipeBackActivity() {
             }, { list ->
                 liveChannels = list
                 liveChannelSource = active
+                liveChannelLoadedAt = android.os.SystemClock.elapsedRealtime()
                 if (list.isEmpty()) toast("没解析到频道，可重新导入或切换直播源")
                 showLive()
-            }, onError = { error ->
-                toast("读取直播源失败：${describe(error)}")
+            }, quiet = true, onError = { error ->
+                toast(if (hasActiveNetwork(this)) "读取直播源失败：${describe(error)}" else "网络未连接，请检查网络")
                 showLiveImportPage()
             })
             return
@@ -5334,7 +5410,22 @@ class MainActivity : EdgeSwipeBackActivity() {
 
         val bar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         bar.addView(button("换源") { pickLiveSource() })
-        bar.addView(button("导入直播源") { addLiveDialog() })
+        val health = button("线路：${liveHealthLabel(active)}") {
+            toast("正在抽查当前直播源…")
+            scheduleLiveHealth(active, liveChannels, force = true) {
+                toast("当前源抽查：${liveHealthLabel(active)}；不代表所有频道均可播放")
+            }
+        }
+        bar.addView(health)
+        scheduleLiveHealth(active, liveChannels) {
+            if (health.isAttachedToWindow && prefs.activeLiveUrl == active) health.text = "线路：${liveHealthLabel(active)}"
+        }
+        bar.addView(button("刷新当前源") {
+            liveChannelSource = ""
+            liveChannelLoadedAt = 0L
+            showLive()
+        })
+        bar.addView(button("更新 / 导入") { addLiveDialog() })
         if (active != "builtin-live:cctv") bar.addView(button("删除当前源") {
             AlertDialog.Builder(this).setTitle("删除当前直播源？")
                 .setMessage(prefs.liveSourceLabel(active))
@@ -5382,7 +5473,7 @@ class MainActivity : EdgeSwipeBackActivity() {
         }
         AlertDialog.Builder(this)
             .setTitle("选择直播源")
-            .setItems(urls.map(prefs::liveSourceLabel).toTypedArray()) { _, which ->
+            .setItems(urls.map { "${prefs.liveSourceLabel(it)} · ${liveHealthLabel(it)}" }.toTypedArray()) { _, which ->
                 prefs.activeLiveUrl = urls[which]
                 liveChannels = emptyList()
                 liveChannelSource = ""

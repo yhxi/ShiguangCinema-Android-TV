@@ -169,6 +169,7 @@ class PlayerActivity : EdgeSwipeBackActivity() {
     /** 这一集是否已经原地重试过一次：避免同一个坏源把重试变成死循环 */
     private var autoRetried = false
     private var pendingIntroIndex: Int? = null
+    private var startAfterIntroIndex: Int? = null
     private val longBufferActions = Runnable {
         if (player?.playbackState == Player.STATE_BUFFERING && player?.playWhenReady == true) {
             showPlaybackErrorActions("缓冲时间较长，可以重试或换源")
@@ -1052,7 +1053,7 @@ class PlayerActivity : EdgeSwipeBackActivity() {
                                 return
                             }
                             hasError = true
-                            showPlaybackErrorActions("这个来源暂时无法播放")
+                            showPlaybackErrorActions(if (hasActiveNetwork(this@PlayerActivity)) "当前来源暂时不可用，请重试或换源" else "网络未连接，请检查网络后重试")
                             return
                         }
                         val msg = if (decodeFail) {
@@ -1092,7 +1093,7 @@ class PlayerActivity : EdgeSwipeBackActivity() {
                 }
             }
 
-        player?.let { ChildrenQuota.attach(this, it, intent.getBooleanExtra("children_daily_content", false) || ChildrenQuota.isChild(this, seriesName.ifEmpty { singleLabel })) }
+        player?.let { ChildrenQuota.attach(this, it, intent.getBooleanExtra("children_daily_content", false) || ChildrenQuota.isChild(this, seriesName.ifEmpty { singleLabel }), seriesTitle.ifEmpty { singleLabel }) }
         BackgroundPlayback.timerPlayer = player
         if (prefs.backgroundPlay) startBackgroundService()
 
@@ -1273,6 +1274,10 @@ class PlayerActivity : EdgeSwipeBackActivity() {
         if (p.playbackState != Player.STATE_READY || pendingIntroIndex != p.currentMediaItemIndex) return
         pendingIntroIndex = null
         applyAutoIntroSkip()
+        if (startAfterIntroIndex == p.currentMediaItemIndex) {
+            startAfterIntroIndex = null
+            p.play()
+        }
     }
 
     private fun applyAutoIntroSkip() {
@@ -1319,7 +1324,7 @@ class PlayerActivity : EdgeSwipeBackActivity() {
             return
         }
         val next = currentIndex + 1
-        switchEpisode(next)
+        switchEpisode(next, fromOutro = true)
         toast("已跳过片尾，播放第 ${next + 1} 集")
     }
 
@@ -1353,7 +1358,7 @@ class PlayerActivity : EdgeSwipeBackActivity() {
         fun playNext() {
             if (isFinishing || isDestroyed || currentUrl() != originalUrl) return
             if (currentIndex + 1 in urls.indices) {
-                switchEpisode(currentIndex + 1)
+                switchEpisode(currentIndex + 1, fromOutro = true)
             } else {
                 toast(if (recorded) "已记录片尾，当前没有下一集" else "当前没有下一集")
             }
@@ -3473,14 +3478,18 @@ class PlayerActivity : EdgeSwipeBackActivity() {
     }
 
     /** 切到指定集：先存当前进度，再按该集自己的续播点起播。 */
-    private fun switchEpisode(index: Int) {
+    private fun switchEpisode(index: Int, fromOutro: Boolean = false) {
         val p = player ?: return
         if (index !in urls.indices) return
         persistProgress()
         val target = urls[index]
         val resume = resumePositionOf(target, index)
         val threshold = prefs.resumeThresholdSeconds * 1000L
-        val startAt = if (resume > threshold) resume else 0L
+        val start = nextEpisodeStart(fromOutro, resume, threshold, prefs.skipIntroEnabled, prefs.introEndOf(skipKey()))
+        val startAt = start.position
+        val awaitIntro = start.awaitIntro
+        startAfterIntroIndex = if (awaitIntro) index else null
+        if (awaitIntro) p.pause()
 
         currentIndex = index
         hasError = false
@@ -3492,7 +3501,8 @@ class PlayerActivity : EdgeSwipeBackActivity() {
         bufferingText.visibility = View.GONE
         speedText.visibility = View.GONE
         p.seekTo(index, startAt)
-        p.play()
+        if (!awaitIntro) p.play()
+        else if (p.playbackState == Player.STATE_READY) handler.post { applyAutoIntroSkipWhenReady() }
         updateChrome()
         showProgress()
         toast(

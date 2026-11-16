@@ -9,3 +9,7 @@ internal fun safeOutroStart(legacyStart: Long, remaining: Long, referenceDuratio
     val start = currentDuration - remaining
     return start.takeIf { it > 0 && it < currentDuration - 5_000L }
 }
+
+internal data class NextEpisodeStart(val position: Long, val awaitIntro: Boolean)
+internal fun nextEpisodeStart(fromOutro: Boolean, resume: Long, threshold: Long, introEnabled: Boolean, introEnd: Long): NextEpisodeStart =
+    NextEpisodeStart(if (!fromOutro && resume > threshold) resume else 0L, fromOutro && introEnabled && introEnd > 0L)

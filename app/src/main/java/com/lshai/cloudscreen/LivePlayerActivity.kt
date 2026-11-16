@@ -45,6 +45,11 @@ class LivePlayerActivity : EdgeSwipeBackActivity() {
     private var lastSwitch = 0L
     private var digits = ""
     private var resumeWanted = true
+    private val bufferWatchdog = Runnable {
+        if (player?.playWhenReady == true && player?.playbackState == Player.STATE_BUFFERING) {
+            advanceLiveLine("接收信号超时")
+        }
+    }
     private val hideBanner = Runnable {
         banner.visibility = View.GONE
         controls.visibility = View.GONE
@@ -151,40 +156,50 @@ class LivePlayerActivity : EdgeSwipeBackActivity() {
             video.player = p
             p.addListener(object : Player.Listener {
                 override fun onPlaybackStateChanged(playbackState: Int) {
+                    handler.removeCallbacks(bufferWatchdog)
                     when (playbackState) {
                         Player.STATE_READY -> status.visibility = View.GONE
                         Player.STATE_BUFFERING -> {
                             status.text = "正在接收直播信号…"
                             status.visibility = View.VISIBLE
+                            if (p.playWhenReady) handler.postDelayed(bufferWatchdog, 15_000L)
                         }
-                        Player.STATE_ENDED -> {
-                            status.text = "直播信号已结束，可上下换台"
-                            status.visibility = View.VISIBLE
-                        }
+                        Player.STATE_ENDED -> advanceLiveLine("直播信号已结束")
                     }
                 }
+                override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+                    handler.removeCallbacks(bufferWatchdog)
+                    if (playWhenReady && p.playbackState == Player.STATE_BUFFERING) handler.postDelayed(bufferWatchdog, 15_000L)
+                }
                 override fun onPlayerError(error: PlaybackException) {
-                    val failedChannel = index
-                    val failedLine = lineIndex
-                    if (failedLine + 1 < channelLines[failedChannel].size) {
-                        status.text = "当前线路不可用，正在切换备用线路…"
-                        status.visibility = View.VISIBLE
-                        handler.post {
-                            if (index == failedChannel && lineIndex == failedLine && !isFinishing)
-                                tune(failedChannel, failedLine + 1)
-                        }
-                    } else {
-                        status.text = "当前频道暂时无法播放\n上下换台 · 确定选择频道或重试"
-                        status.visibility = View.VISIBLE
-                        showBanner()
-                    }
+                    handler.removeCallbacks(bufferWatchdog)
+                    advanceLiveLine("当前线路不可用")
                 }
             })
         }
         tune((savedInstanceState?.getInt("channel_index") ?: index).coerceIn(channels.indices))
     }
 
+    private fun advanceLiveLine(reason: String) {
+        if (channels.isEmpty() || isFinishing || isDestroyed) return
+        val channel = index
+        val line = lineIndex
+        val online = hasActiveNetwork(this)
+        val next = nextLiveLine(line, channelLines[channel].size, online)
+        if (next != null) {
+            status.text = "$reason，正在切换备用线路…"
+            status.visibility = View.VISIBLE
+            handler.post { if (index == channel && lineIndex == line && !isFinishing) tune(channel, next) }
+        } else {
+            player?.pause()
+            status.text = if (!online) "网络未连接，请检查网络\n确定选频道或重试" else "当前频道的备用线路均不可用\n上下换台 · 确定选频道或重试"
+            status.visibility = View.VISIBLE
+            showBanner()
+        }
+    }
+
     private fun tune(target: Int, line: Int = 0) {
+        handler.removeCallbacks(bufferWatchdog)
         index = target
         lineIndex = line.coerceIn(channelLines[index].indices)
         digits = ""
@@ -358,6 +373,7 @@ class LivePlayerActivity : EdgeSwipeBackActivity() {
 
     override fun onStop() {
         handler.removeCallbacks(commitDigits)
+        handler.removeCallbacks(bufferWatchdog)
         digits = ""
         resumeWanted = player?.playWhenReady == true
         player?.pause()
