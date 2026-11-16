@@ -100,6 +100,14 @@ internal fun sortedLiveChannels(channels: List<Channel>): List<Channel> {
 internal fun liveChannelKey(name: String): String {
     val original = name.trim().lowercase().replace(Regex("[\\s_—·-]"), "")
     if (original in setOf("cctv4k", "cctv8k", "央视cctv4k", "央视cctv8k")) return original
+    val cctv = Regex("^(?:(?:央视)?cctv|央视|中央)0?([0-9]{1,2})(?![0-9])").find(original)
+    if (cctv != null) {
+        val number = cctv.groupValues[1].toIntOrNull()
+        if (number != null && number in 1..17) {
+            val suffix = original.substring(cctv.range.last + 1)
+            return "cctv$number" + if (number == 5 && (suffix.startsWith("+") || suffix.startsWith("plus"))) "+" else ""
+        }
+    }
     val key = original.replace(Regex("(超高清|高清|标清|fhd|uhd|hd|4k|1080p|720p)+$"), "")
     return if (key in setOf("cctv1综合", "cctv01综合", "央视cctv1", "央视cctv1综合", "cctv01", "央视综合", "中央一台", "央视一套", "中央电视台综合频道")) "cctv1" else key
 }

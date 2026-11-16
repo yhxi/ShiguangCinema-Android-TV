@@ -222,6 +222,7 @@ class LivePlayerActivity : EdgeSwipeBackActivity() {
         showBanner()
         var group = "全部分组"
         var visible = channels.indices.toList()
+        var selectedChannel = index
         val favoriteStore = getSharedPreferences("live_channel_favorites", MODE_PRIVATE)
         val favorites = favoriteStore.getStringSet("channels", emptySet()).orEmpty().toMutableSet()
         fun channelKey(i: Int) = liveChannelKey(channels[i].name).ifBlank { channels[i].url }
@@ -240,7 +241,7 @@ class LivePlayerActivity : EdgeSwipeBackActivity() {
         val filters = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
         filters.addView(groupButton, LinearLayout.LayoutParams(-2, -2))
         filters.addView(search, LinearLayout.LayoutParams(0, -2, 1f))
-        val favoriteButton = android.widget.Button(this).apply { text = "收藏当前台" }
+        val favoriteButton = android.widget.Button(this).apply { text = "收藏选中台" }
         filters.addView(favoriteButton, LinearLayout.LayoutParams(-2, -2))
         content.addView(filters)
         content.addView(list, LinearLayout.LayoutParams(-1, minOf(dp(340), (resources.displayMetrics.heightPixels * 0.52f).toInt())))
@@ -252,8 +253,9 @@ class LivePlayerActivity : EdgeSwipeBackActivity() {
             }.sortedBy { if (channelKey(it) in favorites) 0 else 1 }
             list.adapter = android.widget.ArrayAdapter(this, android.R.layout.simple_list_item_single_choice,
                 visible.map { i -> "${if (channelKey(i) in favorites) "★ " else ""}${i + 1}  ${channels[i].name} · ${channels[i].group}" })
-            favoriteButton.text = if (channelKey(index) in favorites) "取消收藏当前台" else "收藏当前台"
-            val selected = visible.indexOf(index)
+            if (selectedChannel !in visible) selectedChannel = visible.firstOrNull() ?: index
+            favoriteButton.text = if (channelKey(selectedChannel) in favorites) "取消收藏选中台" else "收藏选中台"
+            val selected = visible.indexOf(selectedChannel)
             if (selected >= 0) { list.setItemChecked(selected, true); list.setSelection(selected) }
         }
         fun toggleFavorite(target: Int) {
@@ -262,7 +264,14 @@ class LivePlayerActivity : EdgeSwipeBackActivity() {
             favoriteStore.edit().putStringSet("channels", favorites.toSet()).apply()
             refresh()
         }
-        favoriteButton.setOnClickListener { toggleFavorite(index) }
+        favoriteButton.setOnClickListener { toggleFavorite(selectedChannel) }
+        list.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: View?, position: Int, id: Long) {
+                selectedChannel = visible.getOrNull(position) ?: return
+                favoriteButton.text = if (channelKey(selectedChannel) in favorites) "取消收藏选中台" else "收藏选中台"
+            }
+            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) = Unit
+        }
         list.setOnItemLongClickListener { _, _, position, _ ->
             visible.getOrNull(position)?.let { toggleFavorite(it) }
             true
@@ -288,6 +297,11 @@ class LivePlayerActivity : EdgeSwipeBackActivity() {
             .setView(content)
             .setNeutralButton("重试当前台") { _, _ -> tune(index) }
             .setNegativeButton("关闭", null).create().also { dialog ->
+                dialog.setOnKeyListener { _, key, event ->
+                    if (key == KeyEvent.KEYCODE_MENU && event.action == KeyEvent.ACTION_DOWN && list.hasFocus()) {
+                        toggleFavorite(selectedChannel); true
+                    } else false
+                }
                 dialog.setOnShowListener {
                     dialog.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN)
                     list.requestFocus()

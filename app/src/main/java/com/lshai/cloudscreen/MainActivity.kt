@@ -1476,6 +1476,7 @@ class MainActivity : EdgeSwipeBackActivity() {
 
     private fun ensureBuiltInLiveSources(serverDefaults: List<String>? = null) {
         if (serverDefaults != null) prefs.removeServerDefaultLiveSources(serverDefaults)
+        prefs.ensureBundledLiveSource()
         val urls = prefs.liveUrls()
         if (prefs.activeLiveUrl !in urls) {
             prefs.activeLiveUrl = urls.firstOrNull().orEmpty()
@@ -2346,59 +2347,38 @@ class MainActivity : EdgeSwipeBackActivity() {
     /* ------------------------------------------------------------- 清理缓存 */
 
     private fun showClearCache() {
-        fun mb(bytes: Long) = String.format(java.util.Locale.US, "%.1f MB", bytes / 1024.0 / 1024.0)
-        val imgs = if (::imageLoader.isInitialized) imageLoader.cacheSize() else 0
-        val posterDisk = if (::imageLoader.isInitialized) imageLoader.diskSizeBytes() else 0L
-        val hist = prefs.history().size
-        val search = prefs.searchHistory().size
-        val progressCount = prefs.progressCount()   // 注意别叫 progress：会遮住同名的方法
-        // 播放缓存占用要遍历几万个分片，先用上次算到的值垫着，后台算完再刷新文案
-        fun buildMsg(mediaDisk: Long?): String = buildString {
-            append("海报：内存 ").append(imgs).append(" 张 · 磁盘 ").append(mb(posterDisk)).append('\n')
-            append("播放缓存（磁盘）：")
-            append(if (mediaDisk == null) "计算中…" else mb(mediaDisk))
-            append(" / 上限 ").append(prefs.cacheLimitMb).append(" MB\n")
-            append("观看历史：").append(hist).append(" 条\n")
-            append("搜索记录：").append(search).append(" 条\n")
-            append("播放进度：").append(progressCount).append(" 条\n\n")
-            append("片源配置、直播源和服务器设置不会被清除。")
-            if (PlaybackCache.isInUse()) append("\n\n正在播放，播放缓存这次会跳过（退出播放后再清）。")
-        }
-        val knownMedia = PlaybackCache.knownSizeBytes().takeIf { it >= 0 }
-        val dialog = AlertDialog.Builder(this)
-            .setTitle("清理缓存")
-            .setMessage(buildMsg(knownMedia))
-            .setPositiveButton("清理") { _, _ ->
-                // 删几 GB 分片在老盒子上要好几秒，放后台做，界面给个"正在清理"
-                progress("正在清理…", "clear", cancellable = false)
-                scope.launch {
-                    // Stop old metadata lookups as well as image downloads before clearing.
-                    childrenPrefetchJob?.cancel()
-                    childrenCoverJobs.values.toList().forEach { it.cancel() }
-                    val n = withContext(Dispatchers.IO) { imageLoader.clearCache() }
-                    childrenPreloadedSignature = ""
-                    childrenCoverTried.clear()
-                    childrenBadCovers.clear()
-                    val mediaCleared = withContext(Dispatchers.IO) { PlaybackCache.clear(this@MainActivity) }
-                    prefs.clearHistory()
-                    prefs.clearSearchHistory()
-                    prefs.clearAllProgress()
-                    dismissProgress()
-                    toast(
-                        "已清理：海报 " + n + " 张 + " + mb(posterDisk) +
-                            "、历史 " + hist + " 条、搜索 " + search + " 条、进度 " + progressCount + " 条" +
-                            if (mediaCleared) "、播放缓存" else "（播放缓存占用中，未清）",
-                    )
-                    showSetup()
+        val options = arrayOf("清理播放缓存", "清理海报缓存", "删除搜索记录", "删除观看历史和播放进度")
+        AlertDialog.Builder(this).setTitle("缓存与记录管理")
+            .setItems(options) { _, which ->
+                if (which == 3) {
+                    AlertDialog.Builder(this).setTitle("删除观看历史和播放进度？")
+                        .setMessage("删除后将无法从历史继续播放，此操作不会删除片源或收藏。")
+                        .setPositiveButton("删除") { _, _ ->
+                            prefs.clearHistory(); prefs.clearAllProgress()
+                            toast("已删除观看历史和播放进度")
+                        }.setNegativeButton("取消", null).show()
+                } else if (which == 2) {
+                    AlertDialog.Builder(this).setTitle("删除搜索记录？")
+                        .setPositiveButton("删除") { _, _ -> prefs.clearSearchHistory(); toast("已删除搜索记录") }
+                        .setNegativeButton("取消", null).show()
+                } else {
+                    progress("正在清理…", "clear", cancellable = false)
+                    scope.launch {
+                        if (which == 0) {
+                            val cleared = withContext(Dispatchers.IO) { PlaybackCache.clear(this@MainActivity) }
+                            dismissProgress()
+                            toast(if (cleared) "已清理播放缓存" else "播放缓存正在使用，退出播放后再清理")
+                        } else {
+                            childrenPrefetchJob?.cancel()
+                            childrenCoverJobs.values.toList().forEach { it.cancel() }
+                            withContext(Dispatchers.IO) { imageLoader.clearCache() }
+                            childrenPreloadedSignature = ""
+                            childrenCoverTried.clear(); childrenBadCovers.clear()
+                            dismissProgress(); toast("已清理海报缓存")
+                        }
+                    }
                 }
-            }
-            .setNegativeButton("取消", null)
-            .create()
-        dialog.show()
-        scope.launch {
-            val bytes = PlaybackCache.sizeBytesAsync(this@MainActivity)
-            if (dialog.isShowing) dialog.setMessage(buildMsg(bytes))
-        }
+            }.setNegativeButton("取消", null).show()
     }
     /* ------------------------------------------------------------- 播放设置 */
 
@@ -5285,7 +5265,11 @@ class MainActivity : EdgeSwipeBackActivity() {
         }
         if (liveChannelSource == active && liveChannels.isNotEmpty()) { start(liveChannels); return }
         runApiK("live", "正在打开电视直播…", {
-            if (active.startsWith("local-live:")) prefs.localLiveChannels(active) else api.liveChannels(active)
+            when {
+                active == "builtin-live:cctv" -> assets.open("builtin_cctv.m3u").bufferedReader(Charsets.UTF_8).use { parseLocalLivePlaylist(it.readText()) }
+                active.startsWith("local-live:") -> prefs.localLiveChannels(active)
+                else -> api.liveChannels(active)
+            }
         }, { channels ->
             liveChannels = channels; liveChannelSource = active
             start(channels)
@@ -5319,7 +5303,11 @@ class MainActivity : EdgeSwipeBackActivity() {
         val active = prefs.activeLiveUrl.takeIf { it in urls } ?: urls.first()
         if (liveChannelSource != active) {
             runApiK("live", "正在加载频道…", {
-                if (active.startsWith("local-live:")) prefs.localLiveChannels(active) else api.liveChannels(active)
+                when {
+                active == "builtin-live:cctv" -> assets.open("builtin_cctv.m3u").bufferedReader(Charsets.UTF_8).use { parseLocalLivePlaylist(it.readText()) }
+                active.startsWith("local-live:") -> prefs.localLiveChannels(active)
+                else -> api.liveChannels(active)
+            }
             }, { list ->
                 liveChannels = list
                 liveChannelSource = active
@@ -5347,7 +5335,7 @@ class MainActivity : EdgeSwipeBackActivity() {
         val bar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         bar.addView(button("换源") { pickLiveSource() })
         bar.addView(button("导入直播源") { addLiveDialog() })
-        bar.addView(button("删除当前源") {
+        if (active != "builtin-live:cctv") bar.addView(button("删除当前源") {
             AlertDialog.Builder(this).setTitle("删除当前直播源？")
                 .setMessage(prefs.liveSourceLabel(active))
                 .setPositiveButton("删除") { _, _ ->
@@ -5516,6 +5504,7 @@ class MainActivity : EdgeSwipeBackActivity() {
 
     /** 继续观看：卡片形式（封面 + 片名 + 进度） */
     private fun showHistoryCards() {
+        var updateVisibleCover: ((String, String) -> Unit)? = null
         // 历史里缺封面的记录：用片名反查一次，拿到海报就写回（最多补 5 条）
         prefs.history().filter { it.cover.isEmpty() }.take(5).forEach { h ->
             scope.launch {
@@ -5530,7 +5519,7 @@ class MainActivity : EdgeSwipeBackActivity() {
                 if (cover.isNotEmpty()) {
                     prefs.updateHistoryCover(h.playUrl, cover)
                     withContext(kotlinx.coroutines.Dispatchers.Main) {
-                        if (currentScreen == "history") showHistoryCards()
+                        updateVisibleCover?.invoke(h.playUrl, cover)
                     }
                 }
             }
@@ -5619,6 +5608,15 @@ class MainActivity : EdgeSwipeBackActivity() {
                         } else false
                     }
                     return cell
+                }
+            }
+            updateVisibleCover = { url, cover ->
+                if (currentScreen == "history" && grid.isAttachedToWindow) {
+                    val position = items2.indexOfFirst { it.playUrl == url }
+                    if (position >= 0) {
+                        items2[position] = items2[position].copy(cover = cover)
+                        (grid.adapter as? BaseAdapter)?.notifyDataSetChanged()
+                    }
                 }
             }
             grid.setOnItemClickListener { _, _, pos, _ ->

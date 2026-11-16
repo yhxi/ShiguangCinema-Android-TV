@@ -261,7 +261,7 @@ class ImageLoader(private val context: Context, api: Api) {
         val bmp = try {
             BitmapFactory.decodeFile(f.absolutePath, opts)
         } catch (e: OutOfMemoryError) {
-            null
+            return null // A valid disk image must survive a transient low-memory condition.
         }
         if (bmp == null) {
             runCatching { f.delete(); smallMarker(url).delete(); diskSmall.remove(url) }

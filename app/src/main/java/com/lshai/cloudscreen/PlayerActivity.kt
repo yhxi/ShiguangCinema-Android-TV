@@ -224,6 +224,7 @@ class PlayerActivity : EdgeSwipeBackActivity() {
     private var outroSkipGraceUntil = 0L
     /** 标记片尾的这一集照常播完；只从后续集数开始自动跳。 */
     private var outroMarkedUrl: String? = null
+    private var skipOutroForUrl: String? = null
 
     // 手机左侧常驻锁按钮；锁定后透明覆盖层吃掉其余所有触摸。
     // 电视没有触屏，仍允许遥控器返回键解锁。
@@ -1301,7 +1302,7 @@ class PlayerActivity : EdgeSwipeBackActivity() {
     private fun checkOutroSkip() {
         if (!prefs.skipOutroEnabled || !prefs.autoNext) return
         if (nextCancelledFor == currentIndex) return
-        if (currentUrl() == outroMarkedUrl) return
+        if (currentUrl() == outroMarkedUrl || currentUrl() == skipOutroForUrl) return
         if (System.currentTimeMillis() < outroSkipGraceUntil) return
         val key = skipKey()
         if (key.isEmpty()) return
@@ -1812,6 +1813,8 @@ class PlayerActivity : EdgeSwipeBackActivity() {
             "画中画（缩成小窗继续播）",
             subtitleLabel(),
             "清晰度：${currentQualityLabel()}",
+            if (skipOutroForUrl == currentUrl()) "本集恢复自动跳片尾" else "本集暂不跳片尾",
+            "片头 / 片尾设置",
         )
         android.app.AlertDialog.Builder(this)
             .setTitle("更多操作")
@@ -1850,6 +1853,11 @@ class PlayerActivity : EdgeSwipeBackActivity() {
                     11 -> enterPip()
                     12 -> showSubtitleMenu()
                     13 -> showQualityMenu()
+                    14 -> {
+                        skipOutroForUrl = if (skipOutroForUrl == currentUrl()) null else currentUrl()
+                        toast(if (skipOutroForUrl == null) "本集恢复自动跳片尾" else "本集将正常播放片尾")
+                    }
+                    15 -> showSkipMarks()
                 }
             }
             .setNegativeButton("关闭", null)

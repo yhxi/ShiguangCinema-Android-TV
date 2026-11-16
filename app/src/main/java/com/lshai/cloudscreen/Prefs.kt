@@ -311,6 +311,18 @@ class Prefs(ctx: Context) {
         sp.edit().putBoolean(marker, true).apply()
     }
 
+    fun ensureBundledLiveSource() {
+        val id = "builtin-live:cctv"
+        val marker = scoped("bundled_cctv_v1_installed")
+        if (!sp.getBoolean(marker, false)) {
+            saveLiveUrls((listOf(id) + liveUrls()).distinct())
+            activeLiveUrl = id
+            sp.edit().putBoolean(marker, true).apply()
+        } else if (id !in liveUrls()) {
+            saveLiveUrls(listOf(id) + liveUrls())
+        }
+    }
+
     private fun localLiveFile(id: String): android.util.AtomicFile =
         android.util.AtomicFile(java.io.File(appContext.filesDir, "live-" + stableDigest(serverUrl + "|" + id) + ".json"))
 
@@ -361,8 +373,11 @@ class Prefs(ctx: Context) {
             sp.edit().remove(scoped(id)).remove(scoped("label:$id")).apply()
         }
     }
-    fun liveSourceLabel(id: String): String = if (id.startsWith("local-live:"))
-        sp.getString(scoped("label:$id"), "本地直播列表").orEmpty() else id
+    fun liveSourceLabel(id: String): String = when {
+        id == "builtin-live:cctv" -> "内置 · 三网央卫视"
+        id.startsWith("local-live:") -> sp.getString(scoped("label:$id"), "本地直播列表").orEmpty()
+        else -> id
+    }
 
     fun saveLiveUrls(list: List<String>) {
         sp.edit().putString(scoped("live_urls"), list.joinToString("\n")).apply()

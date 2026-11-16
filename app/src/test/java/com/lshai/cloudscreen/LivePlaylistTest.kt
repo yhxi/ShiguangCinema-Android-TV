@@ -53,6 +53,17 @@ class LivePlaylistTest {
         assertNotEquals(liveChannelKey("CCTV4K"), liveChannelKey("CCTV8K"))
         assertNotEquals(liveChannelKey("CCTV4K"), liveChannelKey("CCTV4"))
     }
+    @Test fun bundledCctvVariantsGroupIntoNumberedChannels() {
+        val file = listOf(java.io.File("src/main/assets/builtin_cctv.m3u"), java.io.File("app/src/main/assets/builtin_cctv.m3u")).first { it.isFile }
+        val ordered = sortedLiveChannels(parseLocalLivePlaylist(file.readText(Charsets.UTF_8)))
+        assertTrue(ordered.isNotEmpty())
+        assertTrue(isCctvOne(ordered[defaultLiveChannelIndex(ordered)].name))
+        val keys = ordered.map { liveChannelKey(it.name) }.distinct()
+        val numbered = keys.filter { it.matches(Regex("cctv(?:[1-9]|1[0-5])")) }
+        assertEquals((1..15).map { "cctv$it" }, numbered.take(15))
+        assertEquals(liveChannelKey("CCTV-2财经"), liveChannelKey("CCTV2高清"))
+        assertNotEquals(liveChannelKey("CCTV5+体育赛事"), liveChannelKey("CCTV5体育"))
+    }
     @Test fun quotedCommasHeadersAndUnsupportedLinesAreReported() {
         val report = inspectLocalLivePlaylist("#EXTM3U\n#EXTINF:-1 group-title=\"新闻,综合\",CCTV-1\n#EXTVLCOPT:http-user-agent=MyPlayer\n#EXTVLCOPT:http-referrer=https://example.com/\nhttps://example.com/one.m3u8\n#EXTINF:-1,第二台\n#KODIPROP:inputstream.adaptive.license_key=ignored\nrelative.m3u8\nhttps://example.com/two.m3u8")
         assertEquals("CCTV-1", report.channels[0].name)

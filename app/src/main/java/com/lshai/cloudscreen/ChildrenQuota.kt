@@ -309,6 +309,9 @@ internal object ChildrenQuota {
             setOnFocusChangeListener { view, focused ->
                 view.background = rounded(if (primary) 0xFF599F7D.toInt() else 0xFFE6F2EA.toInt(),
                     if (focused) 0xFF1E765A.toInt() else null)
+                if (focused) view.post {
+                    view.requestRectangleOnScreen(android.graphics.Rect(0, 0, view.width, view.height), false)
+                }
             }
             setOnClickListener { click() }
         }
