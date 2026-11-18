@@ -53,6 +53,21 @@ import androidx.media3.exoplayer.analytics.PlaybackStatsListener
 import androidx.media3.exoplayer.mediacodec.MediaCodecUtil
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.joinAll
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * 原生播放页（Media3 / ExoPlayer）。
@@ -88,8 +103,8 @@ class PlayerActivity : EdgeSwipeBackActivity() {
         const val EXTRA_VOD_ID = "vod_id"
         const val EXTRA_SOURCE_URL = "source_url"
         const val EXTRA_SOURCE_NAME = "source_name"
-        const val EXTRA_RETURN_TO_SOURCES = "return_to_sources"
-        const val EXTRA_RETURN_POSITION = "return_position"
+        const val EXTRA_HISTORY_EPISODE_INDEX = "history_episode_index"
+        const val EXTRA_EPISODE_NUMBERS = "episode_numbers"
         const val EXTRA_CHILD_TIMER = "child_timer_minutes"
         const val CMD_TOGGLE = "toggle"
         const val CMD_STOP = "stop"
@@ -151,14 +166,15 @@ class PlayerActivity : EdgeSwipeBackActivity() {
     private lateinit var speedActionBtn: TextView
     /** 手机底部一级菜单里的倍速按钮（和遥控器操作栏那个共用一份标签） */
     private var speedBarBtn: TextView? = null
-    private var introBarBtn: TextView? = null
-    private var outroBarBtn: TextView? = null
+    private val introButtons = mutableListOf<TextView>()
+    private val outroButtons = mutableListOf<TextView>()
     /** 暂停时浮在画面正中的播放按钮：点中间暂停之后，继续播就在原地 */
     private var centerPlay: ImageView? = null
     private lateinit var actionScroll: HorizontalScrollView
     private lateinit var prefs: Prefs
 
     private var urls: List<String> = emptyList()
+    private var episodeNumbers = IntArray(0)
 
     /**
      * 上一次 [buildMediaItems] 的结果：万集长剧重建一次要读几万次 SharedPreferences，
@@ -168,10 +184,17 @@ class PlayerActivity : EdgeSwipeBackActivity() {
 
     /** 这一集是否已经原地重试过一次：避免同一个坏源把重试变成死循环 */
     private var autoRetried = false
+    private val retryPlayback = Runnable {
+        hasError = false
+        player?.prepare()
+    }
+    private val sourceSwitchScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private var sourceSwitchJob: Job? = null
     private var pendingIntroIndex: Int? = null
     private var startAfterIntroIndex: Int? = null
     private val longBufferActions = Runnable {
-        if (player?.playbackState == Player.STATE_BUFFERING && player?.playWhenReady == true) {
+        if (sourceSwitchJob == null && player?.playbackState == Player.STATE_BUFFERING && player?.playWhenReady == true) {
+            stalledSourceUrl = currentUrl()
             showPlaybackErrorActions("缓冲时间较长，可以重试或换源")
         }
     }
@@ -221,11 +244,25 @@ class PlayerActivity : EdgeSwipeBackActivity() {
     private var nextCancelledFor = -1
     /** 全屏纯净模式：画面之外什么都不显示（点屏幕才临时唤出控制条） */
     private var pureMode = false
-    /** 刚标完片尾开始点的一段静默期：不然点完「记当前位置」立刻就被自动跳走 */
-    private var outroSkipGraceUntil = 0L
-    /** 标记片尾的这一集照常播完；只从后续集数开始自动跳。 */
-    private var outroMarkedUrl: String? = null
     private var skipOutroForUrl: String? = null
+    private var skipIntroOnTransitionTo: String? = null
+    private var seasonTitleCache: Pair<String, String>? = null
+    private var skipMarksCache: Pair<String, SkipMarks>? = null
+    private data class SkipUndo(
+        val key: String,
+        val previous: SkipMarks,
+        val isIntro: Boolean,
+        val wasEnabled: Boolean,
+        val manualOutro: Boolean,
+        val url: String,
+        val position: Long,
+        val wasPlaying: Boolean,
+        var advanced: Boolean = false,
+    )
+    private var skipUndo: SkipUndo? = null
+    private var undoSkipButton: TextView? = null
+    private var touchUndoSkipButton: TextView? = null
+    private var stalledSourceUrl: String? = null
 
     // 手机左侧常驻锁按钮；锁定后透明覆盖层吃掉其余所有触摸。
     // 电视没有触屏，仍允许遥控器返回键解锁。
@@ -350,10 +387,12 @@ class PlayerActivity : EdgeSwipeBackActivity() {
     /** 片尾倒计时：靠轮询播放位置实现，不依赖播放器自己的「播完」时机，切集不会重复触发 */
     private val nextTick = object : Runnable {
         override fun run() {
-            updateNextHint()
-            checkOutroSkip()
+            if (sourceSwitchJob == null) {
+                updateNextHint()
+                checkOutroSkip()
+                checkStopAtEpisodeEnd()
+            }
             checkSleepTimer()
-            checkStopAtEpisodeEnd()
             handler.postDelayed(this, 400)
         }
     }
@@ -413,6 +452,7 @@ class PlayerActivity : EdgeSwipeBackActivity() {
         }
         urls = intent.getStringArrayListExtra(EXTRA_URLS)?.toList().orEmpty()
         if (adoptedPlayer != null) urls = BackgroundPlayback.urls
+        episodeNumbers = intent.getIntArrayExtra(EXTRA_EPISODE_NUMBERS) ?: IntArray(0)
         currentIndex = intent.getIntExtra(EXTRA_INDEX, 0).coerceIn(0, (urls.size - 1).coerceAtLeast(0))
         adoptedPlayer?.let { currentIndex = it.currentMediaItemIndex.coerceIn(0, (urls.size - 1).coerceAtLeast(0)) }
         singleLabel = intent.getStringExtra(EXTRA_TITLE).orEmpty()
@@ -749,7 +789,8 @@ class PlayerActivity : EdgeSwipeBackActivity() {
                 })
             }
             touchBar.addView(playPauseIcon, LinearLayout.LayoutParams(dp(46), dp(43)))
-            introBarBtn = actionButton("片头") { markIntroHere() }.also {
+            actionButton("片头") { markIntroHere() }.also {
+                introButtons.add(it)
                 it.setOnLongClickListener { showSkipMarks(); true }
                 addTouchAction(it)
                 it.background = GradientDrawable().apply {
@@ -757,7 +798,8 @@ class PlayerActivity : EdgeSwipeBackActivity() {
                     cornerRadius = dp(20).toFloat()
                 }
             }
-            outroBarBtn = actionButton("片尾") { markOutroHere() }.also {
+            actionButton("片尾") { markOutroHere() }.also {
+                outroButtons.add(it)
                 it.setOnLongClickListener { showSkipMarks(); true }
                 addTouchAction(it)
                 it.background = GradientDrawable().apply {
@@ -778,10 +820,9 @@ class PlayerActivity : EdgeSwipeBackActivity() {
             speedBarBtn = actionButton(speedButtonLabel()) { showSpeedMenu() }
             addTouchAction(speedBarBtn!!)
             addTouchAction(actionButton("选集") { showEpisodePicker() })
-            addTouchAction(actionButton("换源") { backToSources() })
+            addTouchAction(actionButton("换源") { switchPlaybackSource() })
             addTouchAction(fullscreenButton())
             addTouchAction(actionButton("更多") { showMoreMenu() })
-            updateSkipButtons()
             val touchBarContainer: View = if (largeTouchLabels) HorizontalScrollView(this).apply {
                 isHorizontalScrollBarEnabled = false
                 isFocusable = false
@@ -808,9 +849,25 @@ class PlayerActivity : EdgeSwipeBackActivity() {
         actionBar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         // 选集放在第一位：按下键 → 焦点就落在这里，两下就能跳到任意一集
         actionBar.addView(actionButton("选集") { showEpisodePicker() })
-        actionBar.addView(actionButton("换源") { backToSources() })
+        actionBar.addView(actionButton("片头") { markIntroHere() }.also { introButtons.add(it) })
+        actionBar.addView(actionButton("片尾") { markOutroHere() }.also { outroButtons.add(it) })
+        undoSkipButton = actionButton("撤销标记") { undoSkipMark() }.also {
+            it.visibility = View.GONE
+            actionBar.addView(it)
+        }
+        if (!isTvDevice) {
+            touchUndoSkipButton = skipAction("撤销标记") { undoSkipMark() }.also {
+                it.visibility = View.GONE
+                root.addView(it, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.END).apply {
+                    rightMargin = dp(12)
+                    bottomMargin = dp(116)
+                })
+            }
+        }
+        actionBar.addView(actionButton("换源") { switchPlaybackSource() })
         actionBar.addView(actionButton("更多") { showMoreMenu() })
-        actionBar.addView(actionButton("跳过") { showSkipMarks() })
+        actionBar.addView(actionButton("跳过设置") { showSkipMarks() })
+        updateSkipButtons()
         actionBar.addView(actionButton("上集") {
             if (player?.hasPreviousMediaItem() == true) {
                 player?.seekToPreviousMediaItem()
@@ -950,6 +1007,8 @@ class PlayerActivity : EdgeSwipeBackActivity() {
 
                 exo.addListener((object : Player.Listener {
                     override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+                        handler.removeCallbacks(retryPlayback)
+                        if (sourceSwitchJob != null) return
                         currentIndex = exo.currentMediaItemIndex
                         currentVideoWidth = 0
                         currentVideoHeight = 0
@@ -970,17 +1029,20 @@ class PlayerActivity : EdgeSwipeBackActivity() {
                         speedText.visibility = View.GONE
                         updateChrome()
                         if (urls.size > 1 && reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) {
+                            rememberCurrentPlaybackSource()
                             toast("自动播放：第 ${currentIndex + 1} 集")
                         }
                         // 每一集（含起播、自动连播、手动切集）都过一遍片头跳过。
                         // 延迟给 setMediaItems 的起播位置落地，否则刚 seek 到续播点就被误判成"在片头"
-                        pendingIntroIndex = currentIndex
+                        pendingIntroIndex = if (skipIntroOnTransitionTo == currentUrl()) null else currentIndex
+                        skipIntroOnTransitionTo = null
                         if (exo.playbackState == Player.STATE_READY) handler.post { applyAutoIntroSkipWhenReady() }
                     }
 
                     override fun onPlaybackStateChanged(playbackState: Int) {
                         handler.removeCallbacks(longBufferActions)
                         if (playbackState == Player.STATE_READY) {
+                            stalledSourceUrl = null
                             hidePlaybackErrorActions()
                             handler.post { applyAutoIntroSkipWhenReady() }
                         } else if (playbackState == Player.STATE_BUFFERING && exo.playWhenReady) {
@@ -1003,7 +1065,8 @@ class PlayerActivity : EdgeSwipeBackActivity() {
                             handler.removeCallbacks(hideAfterBuffering)
                             handler.postDelayed(hideAfterBuffering, 3_000L)
                         }
-                        if (playbackState == Player.STATE_ENDED) {
+                        if (playbackState == Player.STATE_ENDED && sourceSwitchJob == null) {
+                            rememberCurrentPlaybackSource()
                             prefs.clearProgress(currentUrl())
                             // 跨源那份也要清，否则换源重看会从片尾开始
                             prefs.clearEpisodeProgress(skipKey(), currentIndex)
@@ -1023,6 +1086,7 @@ class PlayerActivity : EdgeSwipeBackActivity() {
                     }
 
                     override fun onPlayerError(error: PlaybackException) {
+                        if (sourceSwitchJob != null) return
                         val decodeFail = error.errorCodeName.contains("DECODER", true) ||
                             error.errorCodeName.contains("DECODING", true)
                         // 硬解挂了先别急着让用户换源：同一个片源换软解往往就能放。
@@ -1035,21 +1099,18 @@ class PlayerActivity : EdgeSwipeBackActivity() {
                             val pos = player?.currentPosition ?: 0L
                             if (pos > 3_000L) prefs.saveProgress(currentUrl(), pos)
                             toast("硬解失败，本剧已改用软解，正在重试…")
-                            handler.postDelayed({ recreate() }, 300)
+                            handler.postDelayed({ if (sourceSwitchJob == null && exo.playerError != null) recreate() }, 300)
                             return
                         }
                         // 非解码类错误多半是分片超时/源站抖动，换源成本比原地重试高得多：
-                        // 先自己重试一次，还不行再自动退回「选择播放源」，而不是把用户丢在错误画面上。
+                        // 先原地重试一次，再显示重试和换源操作。
                         if (!decodeFail) {
                             if (!autoRetried) {
                                 autoRetried = true
                                 toast("播放中断，正在重试…")
                                 baseText = "网络抖动，正在重试…"
                                 titleText.text = baseText
-                                handler.postDelayed({
-                                    hasError = false
-                                    player?.prepare()
-                                }, 1_000L)
+                                handler.postDelayed(retryPlayback, 1_000L)
                                 return
                             }
                             hasError = true
@@ -1234,7 +1295,6 @@ class PlayerActivity : EdgeSwipeBackActivity() {
     /** 换集/重播时重置：连播能力跟着当集状态走 */
     private fun resetAutoNextState() {
         nextCancelledFor = -1
-        outroSkipGraceUntil = 0L
         player?.pauseAtEndOfMediaItems = !prefs.autoNext
         hideNextHint()
     }
@@ -1248,6 +1308,28 @@ class PlayerActivity : EdgeSwipeBackActivity() {
     private fun skipKey(): String {
         val key = seriesTitle.trim().ifEmpty { seriesName.trim().ifEmpty { singleLabel.trim() } }
         return key
+    }
+
+    private fun seasonKey(): String {
+        val title = skipKey()
+        seasonTitleCache?.takeIf { it.first == title }?.let { return it.second }
+        return skipMarksSeasonKey(title).also { seasonTitleCache = title to it }
+    }
+
+    private fun activeSkipMarks(): SkipMarks {
+        val key = seasonKey()
+        skipMarksCache?.takeIf { it.first == key }?.let { return it.second }
+        return prefs.skipMarks(key, skipKey()).also { skipMarksCache = key to it }
+    }
+
+    private fun saveActiveSkipMarks(key: String, marks: SkipMarks) {
+        prefs.saveSkipMarks(key, marks)
+        skipMarksCache = key to marks
+        updateSkipButtons()
+    }
+
+    private fun rememberCurrentPlaybackSource() {
+        prefs.rememberPlaybackSource(seasonKey(), sourceUrl)
     }
 
     /**
@@ -1267,9 +1349,10 @@ class PlayerActivity : EdgeSwipeBackActivity() {
      * 起播 / 切集后自动跳片头。
      *
      * 只在「当前位置还在片头区间内」时才跳 —— 续播点已经在 20 分钟时不能被拽回片头。
-     * 延迟 600ms 执行：要给 setMediaItems(…, startPosition) 的 seek 留出落地时间。
+     * 播放器就绪后执行，确保续播定位和本集时长已经可用。
      */
     private fun applyAutoIntroSkipWhenReady() {
+        if (sourceSwitchJob != null) return
         val p = player ?: return
         if (p.playbackState != Player.STATE_READY || pendingIntroIndex != p.currentMediaItemIndex) return
         pendingIntroIndex = null
@@ -1282,17 +1365,12 @@ class PlayerActivity : EdgeSwipeBackActivity() {
 
     private fun applyAutoIntroSkip() {
         if (!prefs.skipIntroEnabled) return
-        val key = skipKey()
-        if (key.isEmpty()) return
-        val end = prefs.introEndOf(key)
-        if (end <= 0) return
         val p = player ?: return
         if (p.currentMediaItemIndex != currentIndex) return
+        val mark = activeSkipMarks().intro ?: return
+        val end = safeIntroEnd(mark, p.duration) ?: return
         val pos = p.currentPosition
-        // 余量 1.5 秒：手动往前拖一点重看片头结尾时不要再被弹走
-        if (pos >= end - 1_500) return
-        // 标记来自别的源（时长不同的版本）时可能超过本集总长，直接判为无效，免得一跳到底
-        if (p.duration > 0 && end >= p.duration - 1_000) return
+        if (pos >= end) return
         p.seekTo(currentIndex, end)
         toast("已跳过片头（${formatTime(end)} 处开始）")
     }
@@ -1301,22 +1379,16 @@ class PlayerActivity : EdgeSwipeBackActivity() {
      * 到达片尾开始点时直接切下一集。
      *
      * 放在 400ms 的 nextTick 里跑，而不是等 STATE_ENDED：片尾曲通常有几十秒，
-     * 等自然播完再切等于让用户白看这段；同时这也让「跳过片尾」和「自动连播」互不干扰 ——
-     * 用户按返回取消过连播的那一集，这里也不再自动跳。
+     * 「自动跳片尾」使用本剧的标记。「自动连播」控制本集自然播完后的行为。
      */
     private fun checkOutroSkip() {
-        if (!prefs.skipOutroEnabled || !prefs.autoNext) return
-        if (nextCancelledFor == currentIndex) return
-        if (currentUrl() == outroMarkedUrl || currentUrl() == skipOutroForUrl) return
-        if (System.currentTimeMillis() < outroSkipGraceUntil) return
-        val key = skipKey()
-        if (key.isEmpty()) return
+        if (!prefs.skipOutroEnabled || nextCancelledFor == currentIndex || stopAtEpisodeEnd) return
+        if (currentUrl() == skipOutroForUrl) return
         val p = player ?: return
         if (p.playbackState != Player.STATE_READY || !p.isPlaying) return
-        val start = safeOutroStart(prefs.outroStartOf(key), prefs.outroRemainingOf(key), prefs.outroDurationOf(key), p.duration) ?: return
+        val mark = activeSkipMarks().outro ?: return
+        val start = safeOutroStart(mark, p.duration) ?: return
         if (p.currentPosition < start) return
-        // 片尾点比总时长还靠后（换了个更短的源）时不跳，否则一进去就没了
-        if (p.duration > 0 && start > p.duration - 5_000) return
         if (currentIndex + 1 !in urls.indices) {
             // 列表只有一条时，很可能只是「还没回查到整季」，并不真的是最后一集。
             // 这里再补一次静默回查：拿到了列表，下一帧就会正常跳片尾。
@@ -1324,41 +1396,49 @@ class PlayerActivity : EdgeSwipeBackActivity() {
             return
         }
         val next = currentIndex + 1
+        rememberCurrentPlaybackSource()
         switchEpisode(next, fromOutro = true)
         toast("已跳过片尾，播放第 ${next + 1} 集")
     }
 
     private fun markIntroHere() {
-        val key = skipKey()
-        val pos = player?.currentPosition ?: 0L
-        if (key.isEmpty() || pos < 1_000L) {
+        val p = player ?: return
+        val key = seasonKey()
+        val pos = p.currentPosition
+        if (key.isEmpty() || pos <= 0L) {
             toast("播放到片头结束处，再点片头")
             return
         }
-        prefs.saveIntroEnd(key, pos)
+        val previous = activeSkipMarks()
+        captureSkipUndo(key, previous, p, isIntro = true)
+        saveActiveSkipMarks(key, previous.copy(intro = SkipPoint(pos, p.duration.coerceAtLeast(0L))))
         prefs.skipIntroEnabled = true
-        updateSkipButtons()
         toast("已记片头 ${formatTime(pos)}，本剧后续集数自动跳过")
     }
 
     private fun markOutroHere() {
         val p = player ?: return
-        val key = skipKey()
+        val key = seasonKey()
         val pos = p.currentPosition
-        // Record a usable outro point for subsequent episodes, but a manual skip is
-        // still allowed near the end (or before a usable point can be recorded).
-        val recorded = key.isNotEmpty() && pos >= 1_000L &&
-            (p.duration <= 0 || pos < p.duration - 5_000L)
-        if (recorded) {
-            prefs.saveOutroStart(key, pos, p.duration)
+        val recorded = key.isNotEmpty() && pos > 0L && (p.duration <= 0 || pos < p.duration)
+        val undo = if (recorded) {
+            val previous = activeSkipMarks()
+            captureSkipUndo(key, previous, p, isIntro = false, manualOutro = true).also {
+                saveActiveSkipMarks(key, previous.copy(outro = SkipPoint(pos, p.duration.coerceAtLeast(0L))))
+            }
+        } else null
+        if (undo != null) {
             prefs.skipOutroEnabled = true
-            updateSkipButtons()
         }
         val originalUrl = currentUrl()
         fun playNext() {
             if (isFinishing || isDestroyed || currentUrl() != originalUrl) return
+            if (undo != null && skipUndo !== undo) return
             if (currentIndex + 1 in urls.indices) {
+                undo?.advanced = true
+                rememberCurrentPlaybackSource()
                 switchEpisode(currentIndex + 1, fromOutro = true)
+                if (recorded) toast("已记片尾 ${formatTime(pos)}，后续集数自动跳过片尾")
             } else {
                 toast(if (recorded) "已记录片尾，当前没有下一集" else "当前没有下一集")
             }
@@ -1374,9 +1454,91 @@ class PlayerActivity : EdgeSwipeBackActivity() {
     }
 
     private fun updateSkipButtons() {
-        val key = skipKey()
-        introBarBtn?.setTextColor(if (prefs.introEndOf(key) > 0) 0xFFB7E981.toInt() else 0xFFE5E7EB.toInt())
-        outroBarBtn?.setTextColor(if (prefs.outroStartOf(key) > 0) 0xFFB7E981.toInt() else 0xFFE5E7EB.toInt())
+        val marks = activeSkipMarks()
+        val introColor = if (marks.intro != null) 0xFFB7E981.toInt() else 0xFFE5E7EB.toInt()
+        val outroColor = if (marks.outro != null) 0xFFB7E981.toInt() else 0xFFE5E7EB.toInt()
+        introButtons.forEach { it.setTextColor(introColor) }
+        outroButtons.forEach { it.setTextColor(outroColor) }
+    }
+
+    private val hideTouchUndo = Runnable { touchUndoSkipButton?.visibility = View.GONE }
+
+    private fun captureSkipUndo(
+        key: String, previous: SkipMarks, p: ExoPlayer, isIntro: Boolean, manualOutro: Boolean = false,
+    ): SkipUndo =
+        SkipUndo(key, previous, isIntro, if (isIntro) prefs.skipIntroEnabled else prefs.skipOutroEnabled, manualOutro,
+            currentUrl(), p.currentPosition, p.playWhenReady).also {
+            skipUndo = it
+            undoSkipButton?.visibility = View.VISIBLE
+            touchUndoSkipButton?.visibility = View.VISIBLE
+            handler.removeCallbacks(hideTouchUndo)
+            handler.postDelayed(hideTouchUndo, 8_000L)
+        }
+
+    private fun clearSkipUndo() {
+        skipUndo = null
+        undoSkipButton?.visibility = View.GONE
+        touchUndoSkipButton?.visibility = View.GONE
+    }
+
+    private fun undoSkipMark() {
+        val undo = skipUndo ?: return
+        val p = player ?: return
+        if (sourceSwitchJob != null || undo.key != seasonKey()) return
+        clearSkipUndo()
+        saveActiveSkipMarks(undo.key, undo.previous)
+        if (undo.isIntro) prefs.skipIntroEnabled = undo.wasEnabled
+        else prefs.skipOutroEnabled = undo.wasEnabled
+        if (undo.manualOutro) skipOutroForUrl = undo.url
+        if (undo.advanced) {
+            val index = urls.indexOf(undo.url)
+            if (index >= 0) {
+                persistProgress()
+                if (p.currentMediaItemIndex != index) skipIntroOnTransitionTo = undo.url
+                pendingIntroIndex = null
+                startAfterIntroIndex = null
+                resetAutoNextState()
+                p.seekTo(index, undo.position)
+                if (p.playbackState == Player.STATE_IDLE) p.prepare()
+                p.playWhenReady = undo.wasPlaying && !quotaDialogShown
+                showProgress()
+            }
+        }
+        toast("已恢复之前的标记")
+    }
+
+    private fun adjustSkipPoint(isIntro: Boolean) {
+        val p = player ?: return
+        val key = seasonKey()
+        val marks = activeSkipMarks()
+        val original = (if (isIntro) marks.intro else marks.outro) ?: return
+        var value = original
+        val time = hintLine(formatTime(value.position))
+        val actions = LinearLayout(this)
+        for (seconds in listOf(-5, -1, 1, 5)) {
+            val label = if (seconds > 0) "+$seconds 秒" else "$seconds 秒"
+            actions.addView(skipAction(label) {
+                value = value.adjusted(seconds * 1000L)
+                time.text = formatTime(value.position)
+            }, LinearLayout.LayoutParams(0, -2, 1f))
+        }
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(8), dp(16), dp(8))
+            addView(time)
+            addView(actions)
+        }
+        AlertDialog.Builder(this)
+            .setTitle(if (isIntro) "微调片头结束" else "微调片尾开始")
+            .setView(box)
+            .setNegativeButton("取消", null)
+            .setPositiveButton("保存") { _, _ ->
+                if (value != original && key == seasonKey()) {
+                    captureSkipUndo(key, marks, p, isIntro)
+                    saveActiveSkipMarks(key, if (isIntro) marks.copy(intro = value) else marks.copy(outro = value))
+                }
+            }
+            .show()
     }
 
     /**
@@ -1395,8 +1557,9 @@ class PlayerActivity : EdgeSwipeBackActivity() {
         val p = player
         val pos = p?.currentPosition ?: 0L
         val duration = p?.duration ?: 0L
-        val intro = prefs.introEndOf(key)
-        val outro = prefs.outroStartOf(key)
+        val marks = activeSkipMarks()
+        val intro = marks.intro?.position ?: 0L
+        val outro = marks.outro?.position ?: 0L
 
         lateinit var dlg: AlertDialog
         val box = LinearLayout(this).apply {
@@ -1412,23 +1575,23 @@ class PlayerActivity : EdgeSwipeBackActivity() {
         })
         box.addView(hintLine("片头结束：" + if (intro > 0) formatTime(intro) else "未设置"))
         box.addView(skipAction("记当前位置为片头结束") {
-            prefs.saveIntroEnd(key, pos)
-            updateSkipButtons()
-            toast("片头结束已记为 ${formatTime(pos)}")
+            dlg.dismiss()
+            markIntroHere()
         })
         if (intro > 0) {
+            box.addView(skipAction("微调片头") { dlg.dismiss(); adjustSkipPoint(isIntro = true) })
             box.addView(skipAction("试跳片头（跳到 ${formatTime(intro)}）") {
                 player?.seekTo(currentIndex, intro)
                 dlg.dismiss()
             })
         }
         box.addView(hintLine("片尾开始：" + if (outro > 0) formatTime(outro) else "未设置"))
-        box.addView(skipAction("记当前位置为片尾开始") {
-            prefs.saveOutroStart(key, pos, duration)
-            outroMarkedUrl = currentUrl()
-            updateSkipButtons()
-            toast("片尾开始已记为 ${formatTime(pos)}，之后到这就会自动下一集")
+        box.addView(skipAction("记片尾开始并播放下一集") {
+            dlg.dismiss()
+            markOutroHere()
         })
+        if (outro > 0) box.addView(skipAction("微调片尾") { dlg.dismiss(); adjustSkipPoint(isIntro = false) })
+        if (skipUndo != null) box.addView(skipAction("撤销最近一次标记") { dlg.dismiss(); undoSkipMark() })
         box.addView(skipAction(
             "自动跳片头：" + (if (prefs.skipIntroEnabled) "开" else "关"),
         ) {
@@ -1443,8 +1606,8 @@ class PlayerActivity : EdgeSwipeBackActivity() {
         })
         if (intro > 0 || outro > 0) {
             box.addView(skipAction("清除本剧的片头片尾记录") {
-                prefs.clearSkipMarks(key)
-                updateSkipButtons()
+                clearSkipUndo()
+                saveActiveSkipMarks(seasonKey(), SkipMarks())
                 toast("已清除")
             })
         }
@@ -1485,6 +1648,7 @@ class PlayerActivity : EdgeSwipeBackActivity() {
         if (!::titleText.isInitialized) return
         if (locked) {
             // 锁屏期间任何操作层都不许自己冒出来
+            touchUndoSkipButton?.visibility = View.GONE
             titleText.visibility = View.GONE
             backButton?.visibility = View.GONE
             topCastButton?.visibility = View.GONE
@@ -1915,6 +2079,7 @@ class PlayerActivity : EdgeSwipeBackActivity() {
         if (sleepUntil <= 0L) return
         if (SystemClock.elapsedRealtime() < sleepUntil) return
         sleepUntil = 0L
+        sourceSwitchJob?.cancel()
         player?.pause()
         toast("定时关闭时间到，已暂停播放")
         showProgress()
@@ -2057,7 +2222,7 @@ class PlayerActivity : EdgeSwipeBackActivity() {
             player?.prepare(); player?.playWhenReady = true
             updateChrome()
         })
-        val changeSource = actionButton("换源") { hidePlaybackErrorActions(); backToSources() }
+        val changeSource = actionButton("换源") { switchPlaybackSource() }
         actions.addView(changeSource)
         actions.addView(actionButton("返回") { hidePlaybackErrorActions(); persistProgress(); finish() })
         panel.addView(actions)
@@ -2498,8 +2663,7 @@ class PlayerActivity : EdgeSwipeBackActivity() {
      * 每一条都按「自己的播放地址」去找已保存的外挂字幕 —— 同一部剧每集的字幕文件不同，
      * 所以不能只给当前这一条挂，否则选集/自动连播换集之后字幕就没了。
      */
-    private fun buildMediaItems(): List<MediaItem> {
-        val src = urls
+    private fun buildMediaItems(src: List<String> = urls): List<MediaItem> {
         mediaItemsCache?.let { (key, items) -> if (key == src) return items }
         val built = src.map { mediaItemOf(it) }
         mediaItemsCache = src to built
@@ -2787,6 +2951,7 @@ class PlayerActivity : EdgeSwipeBackActivity() {
      * 也绝不弹「要不要换源」那种窗 —— 用户没点选集，不该被打断。
      */
     private fun silentResolveEpisodes() {
+        if (sourceSwitchJob != null) return
         if (urls.size > 1) return
         if (resolvingEpisodes) return
         if (autoResolveAttempts >= 2) return
@@ -2886,12 +3051,13 @@ class PlayerActivity : EdgeSwipeBackActivity() {
                 if (i >= 0) {
                     runOnUiThread {
                         resolvingEpisodes = false
-                        adoptSeriesList(eps, i, vodId, conf, keepPosition = true, inPlace = silent)
-                        onDone(true)
+                        val stillCurrent = !isFinishing && !isDestroyed && sourceSwitchJob == null && currentUrl() == playing
+                        if (stillCurrent) adoptSeriesList(eps, i, vodId, conf, keepPosition = true, inPlace = silent)
+                        onDone(stillCurrent)
                         if (pendingEpisodeCallbacks.isNotEmpty()) {
                             val waiting = pendingEpisodeCallbacks.toList()
                             pendingEpisodeCallbacks.clear()
-                            waiting.forEach { it(true) }
+                            waiting.forEach { it(stillCurrent) }
                         }
                     }
                     return@Thread
@@ -2942,6 +3108,7 @@ class PlayerActivity : EdgeSwipeBackActivity() {
                 val loose = near
                 var ok = false
                 when {
+                    isFinishing || isDestroyed || sourceSwitchJob != null || currentUrl() != playing -> onDone(false)
                     exact != null -> {
                         adoptSeriesList(
                             exact.episodes, exact.current, exact.cand.vodId, exact.cand.conf,
@@ -3018,7 +3185,7 @@ class PlayerActivity : EdgeSwipeBackActivity() {
             if (eps == cached.urls) return@Thread
             runOnUiThread {
                 val p = player ?: return@runOnUiThread
-                if (isFinishing || isDestroyed) return@runOnUiThread
+                if (isFinishing || isDestroyed || sourceSwitchJob != null) return@runOnUiThread
                 val cur = urls
                 // 老列表必须整体是新列表的前缀：否则集号可能错位，宁可不追加
                 if (eps.size > cur.size && eps.take(cur.size) == cur) {
@@ -3053,6 +3220,7 @@ class PlayerActivity : EdgeSwipeBackActivity() {
         val splice = inPlace && keepPosition && urls.size == 1 &&
             list.getOrNull(idx) == urls.firstOrNull() && p.mediaItemCount == 1
         urls = list
+        episodeNumbers = IntArray(0)
         currentIndex = idx
         if (newVodId.isNotEmpty()) vodId = newVodId
         if (conf.url.isNotEmpty()) {
@@ -3485,7 +3653,7 @@ class PlayerActivity : EdgeSwipeBackActivity() {
         val target = urls[index]
         val resume = resumePositionOf(target, index)
         val threshold = prefs.resumeThresholdSeconds * 1000L
-        val start = nextEpisodeStart(fromOutro, resume, threshold, prefs.skipIntroEnabled, prefs.introEndOf(skipKey()))
+        val start = nextEpisodeStart(fromOutro, resume, threshold, prefs.skipIntroEnabled, activeSkipMarks().intro?.position ?: 0L)
         val startAt = start.position
         val awaitIntro = start.awaitIntro
         startAfterIntroIndex = if (awaitIntro) index else null
@@ -3556,16 +3724,19 @@ class PlayerActivity : EdgeSwipeBackActivity() {
     private fun labelFor(index: Int): String {
         // 只有一个地址：显示传进来的原始标题（历史记录里那句"海贼王 · 第 1135/1180 集"）
         if (urls.size <= 1) return singleLabel.ifEmpty { seriesTitle }.ifEmpty { "正在播放" }
+        val episode = episodeNumbers.getOrNull(index) ?: 0
+        if (episode > 0 && episode != index + 1) return "$seriesTitle · 第 $episode 集"
         return "$seriesTitle · 第 ${index + 1}/${urls.size} 集"
     }
 
-    private fun persistProgress() {
+    private fun persistProgress(force: Boolean = false) {
+        if (sourceSwitchJob != null) return
         val p = player ?: return
         lastPersistAt = SystemClock.uptimeMillis()
-        if (p.isPlaying || p.playbackState == Player.STATE_READY) {
+        if (force || p.isPlaying || p.playbackState == Player.STATE_READY) {
             val url = currentUrl()
             if (url.isEmpty()) return
-            val position = p.currentPosition
+            val position = p.currentPosition.coerceAtLeast(0L)
             val entry = if (position > 5_000L) HistoryEntry(
                 title = labelFor(currentIndex),
                 playUrl = url,
@@ -3738,25 +3909,238 @@ class PlayerActivity : EdgeSwipeBackActivity() {
         finish()
     }
 
-    /**
-     * 带着「回到来源选择」的结果关掉播放页。
-     * 只有显式换源或片源恢复流程才使用这里；普通返回直接回首页。
-     */
-    private fun backToSources() {
-        if (isFinishing || isDestroyed) return
-        player?.pause()
-        persistProgress()
-        setResult(RESULT_OK, Intent().apply {
-            putExtra(EXTRA_RETURN_TO_SOURCES, true)
-            putExtra(EXTRA_INDEX, currentIndex)
-            putExtra(EXTRA_RETURN_POSITION, player?.currentPosition ?: 0L)
-            putExtra(EXTRA_SERIES_NAME, seriesTitle)
-            putExtra(EXTRA_VOD_ID, vodId)
-            putExtra(EXTRA_SOURCE_URL, sourceUrl)
-            putExtra(EXTRA_SOURCE_NAME, sourceName)
-            putExtra(EXTRA_COVER, coverUrl)
-        })
-        finish()
+    private data class PlaybackAlternative(
+        val source: SourceConfig,
+        val vodId: String,
+        val detail: Detail,
+        val index: Int,
+    )
+
+    private fun findPlaybackAlternative(
+        api: Api,
+        source: SourceConfig,
+        title: String,
+        episode: Int,
+        playing: String,
+    ): PlaybackAlternative? {
+        val titleKey = sourceTitleKey(title)
+        val keyword = sourceSearchKeyword(title).ifEmpty { title }
+        fun matches(items: List<SearchItem>) = items.filter { sourceTitleKey(it.name) == titleKey }
+        val directMatches = if (DirectCms.shouldTryDirect(source)) {
+            matches(runCatching { DirectCms.search(source, keyword) }.getOrDefault(emptyList()))
+        } else emptyList()
+        val hits = directMatches.ifEmpty { matches(api.search(keyword, listOf(source), 8_000).items) }
+        for (hit in hits.distinctBy { it.vodId }) {
+            if (SearchConnections.currentCancelled()) return null
+            val detail = runCatching { detailOf(hit.vodId, source, api) }.getOrNull() ?: continue
+            if (detail.info.title.isNotBlank() && sourceTitleKey(detail.info.title) != titleKey) continue
+            val index = matchingSourceEpisode(detail, episode) ?: continue
+            val url = detail.episodes.getOrNull(index) ?: continue
+            if (url != playing && (url.startsWith("https://", true) || url.startsWith("http://", true))) {
+                return PlaybackAlternative(source, hit.vodId, detail, index)
+            }
+        }
+        return null
+    }
+
+    private suspend fun awaitAlternativePlayback(p: ExoPlayer, position: Long): Boolean =
+        withTimeoutOrNull(12_000L) {
+            while (p.playerError == null && p.playbackState == Player.STATE_BUFFERING) delay(100L)
+            if (p.playbackState != Player.STATE_READY || p.isCurrentMediaItemLive) return@withTimeoutOrNull false
+            if (position > 0 && (!p.isCurrentMediaItemSeekable ||
+                    (p.duration != C.TIME_UNSET && p.duration <= position))) return@withTimeoutOrNull false
+            val start = p.currentPosition
+            if (kotlin.math.abs(start - position) > 250L) return@withTimeoutOrNull false
+            p.play()
+            while (p.playerError == null && p.playWhenReady && p.playbackState != Player.STATE_ENDED) {
+                if (p.isPlaying && p.currentPosition > start + 100L) return@withTimeoutOrNull true
+                delay(100L)
+            }
+            false
+        } == true
+
+    private fun switchPlaybackSource() {
+        val p = player ?: return
+        if (sourceSwitchJob != null || isFinishing || isDestroyed) return
+        val title = seriesName.ifEmpty { parseSeriesName(singleLabel) }
+        val playing = currentUrl()
+        val index = currentIndex
+        val originalUrls = urls
+        val originalHistoryUrl = intent.getStringArrayListExtra(EXTRA_URLS)?.singleOrNull()
+        val historyEpisode = parseEpisodeNumber(singleLabel.substringAfterLast('·', ""))
+        val episode = episodeNumbers.getOrNull(index)?.takeIf { it > 0 }
+            ?: historyEpisode.takeIf { it > 0 && playing == originalHistoryUrl }
+            ?: (index + 1).takeIf { urls.size > 1 }
+            ?: (intent.getIntExtra(EXTRA_HISTORY_EPISODE_INDEX, -1) + 1).coerceAtLeast(1)
+        val sources = prefs.sources().filter { it.enabled && !it.isAdult && it.url != sourceUrl }.distinctBy { it.url }
+        if (title.isBlank() || playing.isBlank() || p.isCurrentMediaItemLive || sources.isEmpty()) {
+            toast("没有可切换的其他播放源")
+            return
+        }
+        if (!hasActiveNetwork(this)) {
+            toast("网络未连接，暂时无法换源")
+            return
+        }
+
+        val position = p.currentPosition.coerceAtLeast(0L)
+        val season = seasonKey()
+        val originalDuration = p.duration
+        if (p.playerError != null || stalledSourceUrl == playing) {
+            prefs.recordPlaybackSourceFailure(season, sourceUrl)
+        }
+        val preferred = prefs.preferredPlaybackSource(season)
+        val now = System.currentTimeMillis()
+        val ranked = sources.groupBy {
+            sourcePriority(it.url, preferred, prefs.playbackSourceFailedAt(season, it.url), now)
+        }
+        val wasPlaying = p.playWhenReady
+        val originalPauseAtEnd = p.pauseAtEndOfMediaItems
+        val sleepDeadline = sleepUntil
+        persistProgress(force = true)
+        handler.removeCallbacks(retryPlayback)
+        handler.removeCallbacks(longBufferActions)
+        hidePlaybackErrorActions()
+        hideNextHint()
+        p.pause()
+
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("正在换源")
+            .setMessage("正在查找同一集的其他来源，将从 ${formatTime(position)} 继续播放。")
+            .setNegativeButton("取消", null)
+            .create()
+        dialog.setOnDismissListener { sourceSwitchJob?.cancel() }
+        val requestConnections = SearchConnections()
+        val server = prefs.serverUrl.ifEmpty { BuildConfig.DEFAULT_URL }
+        val cookie = prefs.cookie
+        val candidates = Channel<PlaybackAlternative>(sources.size)
+        val cooledCandidates = Channel<PlaybackAlternative>(sources.size)
+        val preferredCandidate = CompletableDeferred<PlaybackAlternative?>()
+        val concurrency = Semaphore(4)
+        sourceSwitchJob = sourceSwitchScope.launch(start = CoroutineStart.LAZY) {
+            fun discovery(sources: List<SourceConfig>, channel: Channel<PlaybackAlternative>): List<Job> {
+                val workers = sources.map { source -> launch {
+                    concurrency.withPermit {
+                        val alternative = withContext(Dispatchers.IO) { runCatching {
+                            requestConnections.run {
+                                val api = Api(server).apply { restoreCookie(cookie) }
+                                findPlaybackAlternative(api, source, title, episode, playing)
+                            }
+                        }.getOrNull() }
+                        if (source.url == preferred && channel === candidates) preferredCandidate.complete(alternative)
+                        if (alternative != null) channel.send(alternative)
+                    }
+                } }
+                launch { workers.joinAll(); channel.close() }
+                return workers
+            }
+            val favorites = ranked[SourcePriority.PREFERRED].orEmpty()
+            val workers = discovery(favorites + ranked[SourcePriority.NORMAL].orEmpty(), candidates) +
+                discovery(ranked[SourcePriority.RECENT_FAILURE].orEmpty(), cooledCandidates)
+
+            val tested = mutableSetOf(playing)
+            var attempted = false
+            var switched = false
+            try {
+                val replacement = withTimeoutOrNull(45_000L) {
+                    suspend fun tryAlternative(alternative: PlaybackAlternative): Boolean {
+                        if (quotaDialogShown || !tested.add(alternative.detail.episodes[alternative.index])) return false
+                        dialog.setMessage("正在尝试「${alternative.source.name}」，续播位置 ${formatTime(position)}。")
+                        attempted = true
+                        p.pauseAtEndOfMediaItems = true
+                        p.setMediaItems(buildMediaItems(alternative.detail.episodes), alternative.index, position)
+                        p.prepare()
+                        if (!awaitAlternativePlayback(p, position)) {
+                            p.pause()
+                            if (!quotaDialogShown && hasActiveNetwork(this@PlayerActivity)) {
+                                prefs.recordPlaybackSourceFailure(season, alternative.source.url)
+                            }
+                            return false
+                        }
+                        return true
+                    }
+                    val first = if (favorites.isEmpty()) null else withTimeoutOrNull(2_500L) { preferredCandidate.await() }
+                    if (first != null && tryAlternative(first)) return@withTimeoutOrNull first
+                    for (tier in listOf(candidates, cooledCandidates)) {
+                        for (alternative in tier) {
+                            if (tryAlternative(alternative)) return@withTimeoutOrNull alternative
+                        }
+                    }
+                    null
+                }
+                if (replacement == null) {
+                    toast("暂无能从 ${formatTime(position)} 续播的其他来源")
+                } else {
+                    val marks = activeSkipMarks()
+                    val dated = SkipMarks(
+                        marks.intro?.withReferenceDuration(originalDuration),
+                        marks.outro?.withReferenceDuration(originalDuration),
+                    )
+                    if (dated != marks) saveActiveSkipMarks(season, dated)
+                    val differentCut = listOfNotNull(dated.intro, dated.outro).any {
+                        !matchingSkipDuration(it.duration, p.duration)
+                    }
+                    clearSkipUndo()
+                    urls = replacement.detail.episodes
+                    episodeNumbers = replacement.detail.episodeLabels.map(::sourceEpisodeNumber).toIntArray()
+                    currentIndex = replacement.index
+                    vodId = replacement.vodId
+                    sourceUrl = replacement.source.url
+                    sourceName = replacement.source.name
+                    seriesTitle = title
+                    seriesName = title
+                    rememberCurrentPlaybackSource()
+                    if (originalUrls.size > 1) singleLabel = "$title · 第 $episode 集"
+                    intent.putStringArrayListExtra(EXTRA_URLS, ArrayList(urls))
+                        .putExtra(EXTRA_INDEX, currentIndex)
+                        .putExtra(EXTRA_TITLE, singleLabel)
+                        .putExtra(EXTRA_VOD_ID, vodId)
+                        .putExtra(EXTRA_SOURCE_URL, sourceUrl)
+                        .putExtra(EXTRA_SOURCE_NAME, sourceName)
+                        .putExtra(EXTRA_SERIES_NAME, seriesName)
+                        .putExtra(EXTRA_EPISODE_NUMBERS, episodeNumbers)
+                    loadSubtitleForCurrent()
+                    switched = true
+                    val message = "已切换到「$sourceName」，从 ${formatTime(position)} 继续播放"
+                    toast(if (differentCut) "$message\n时长差异较大，已暂停套用不匹配的标记" else message)
+                }
+            } finally {
+                requestConnections.cancel()
+                workers.forEach { it.cancel() }
+                sourceSwitchJob = null
+                dialog.setOnDismissListener(null)
+                dialog.dismiss()
+                if (isFinishing || isDestroyed) {
+                    if (attempted) p.stop()
+                } else {
+                    pendingIntroIndex = null
+                    startAfterIntroIndex = null
+                    if (switched) {
+                        autoRetried = false
+                        if (nextCancelledFor == index) nextCancelledFor = currentIndex
+                        hasError = false
+                        persistProgress()
+                    } else {
+                        if (attempted) {
+                            p.setMediaItems(buildMediaItems(originalUrls), index, position)
+                            p.prepare()
+                        }
+                        val timerExpired = sleepDeadline > 0 && SystemClock.elapsedRealtime() >= sleepDeadline
+                        p.playWhenReady = wasPlaying && !quotaDialogShown && !timerExpired
+                        if (p.playerError != null || p.playbackState == Player.STATE_BUFFERING) {
+                            showPlaybackErrorActions("当前来源暂时不可用，可以重试或换源")
+                        }
+                    }
+                    p.pauseAtEndOfMediaItems = originalPauseAtEnd
+                    baseText = labelFor(currentIndex)
+                    titleText.text = baseText
+                    titleText.setTextColor(0xFFCBD5E1.toInt())
+                    updateChrome()
+                    updateBackgroundSnapshot()
+                }
+            }
+        }
+        dialog.show()
+        sourceSwitchJob?.start()
     }
 
     private var quotaDialogShown = false
@@ -3765,6 +4149,7 @@ class PlayerActivity : EdgeSwipeBackActivity() {
             val child = intent.getBooleanExtra("children_daily_content", false) || ChildrenQuota.isChild(this@PlayerActivity, seriesName.ifEmpty { singleLabel })
             if (child && ChildrenQuota.remaining(this@PlayerActivity) <= 0L && !quotaDialogShown) {
                 quotaDialogShown = true
+                sourceSwitchJob?.cancel()
                 persistProgress()
                 ChildrenQuota.locked(this@PlayerActivity, onClose = { finish() }) { quotaDialogShown = false; if (ChildrenQuota.remaining(this@PlayerActivity) > 0) player?.play() }
             }
@@ -3783,6 +4168,7 @@ class PlayerActivity : EdgeSwipeBackActivity() {
 
     override fun onStop() {
         super.onStop()
+        sourceSwitchJob?.cancel()
         handler.removeCallbacks(quotaWatch)
         handler.removeCallbacks(nextTick)
         hideNextHint()
@@ -3799,6 +4185,7 @@ class PlayerActivity : EdgeSwipeBackActivity() {
     }
 
     override fun onDestroy() {
+        sourceSwitchScope.cancel()
         if (Build.VERSION.SDK_INT >= 33) {
             backGestureCallback?.let { onBackInvokedDispatcher.unregisterOnBackInvokedCallback(it) }
             backGestureCallback = null
@@ -3813,6 +4200,8 @@ class PlayerActivity : EdgeSwipeBackActivity() {
         handler.removeCallbacks(speedTick)
         handler.removeCallbacks(showBufferingUi)
         handler.removeCallbacks(longBufferActions)
+        handler.removeCallbacks(hideTouchUndo)
+        handler.removeCallbacks(retryPlayback)
         handler.removeCallbacks(hideActions)
         handler.removeCallbacks(clearPendingSeek)
         handler.removeCallbacks(nextTick)

@@ -768,14 +768,6 @@ class Prefs(ctx: Context) {
 
     /* --------------------------------------------------------- 片头 / 片尾 */
 
-    /**
-     * 片头片尾跳过。
-     *
-     * 采集站给的 m3u8 没有章节信息，任何"自动识别片头"都是在猜，长期不可靠。
-     * 所以这里用「用户标一次，整部剧复用」：在某一集里把当前位置记成片头结束/片尾开始，
-     * 之后同一部剧的每一集都按这个秒数跳（动漫/美剧每集结构基本一致）。
-     * 键用剧名，换源不影响 —— 不同源的正片时长差异通常只有几秒。
-     */
     var skipIntroEnabled: Boolean
         get() = sp.getBoolean("skip_intro_on", true)
         set(v) = sp.edit().putBoolean("skip_intro_on", v).apply()
@@ -784,35 +776,67 @@ class Prefs(ctx: Context) {
         get() = sp.getBoolean("skip_outro_on", true)
         set(v) = sp.edit().putBoolean("skip_outro_on", v).apply()
 
-    fun introEndOf(key: String): Long =
-        if (key.isEmpty()) 0L else sp.getLong(stableKey("intro_end:", key), 0L)
-
-    fun saveIntroEnd(key: String, ms: Long) {
-        if (key.isEmpty()) return
-        sp.edit().putLong(stableKey("intro_end:", key), ms.coerceAtLeast(0L)).apply()
+    internal fun skipMarks(key: String, legacyTitle: String): SkipMarks {
+        if (key.isEmpty()) return SkipMarks()
+        val saved = sp.getString(stableKey("skip_marks:", key), null)
+        if (saved != null) {
+            val data = runCatching { JSONObject(saved) }.getOrNull() ?: return SkipMarks()
+            fun point(name: String): SkipPoint? {
+                val value = data.optJSONObject(name) ?: return null
+                val position = value.optLong("position")
+                return position.takeIf { it > 0L }?.let { SkipPoint(it, value.optLong("duration")) }
+            }
+            return SkipMarks(point("intro"), point("outro"))
+        }
+        // Preserve older marks under their original title until this season is saved.
+        val intro = sp.getLong(stableKey("intro_end:", legacyTitle), 0L)
+        val outro = sp.getLong(stableKey("outro_start:", legacyTitle), 0L)
+        val duration = sp.getLong(stableKey("outro_duration:", legacyTitle), 0L)
+        val remaining = sp.getLong(stableKey("outro_remaining:", legacyTitle), 0L)
+        val migrated = SkipMarks(
+            intro.takeIf { it > 0L }?.let { SkipPoint(it) },
+            outro.takeIf { it > 0L }?.let {
+                SkipPoint(it, if (remaining > 0L && duration - remaining == it) duration else 0L)
+            },
+        )
+        if (migrated != SkipMarks()) saveSkipMarks(key, migrated)
+        return migrated
     }
 
-    fun outroStartOf(key: String): Long =
-        if (key.isEmpty()) 0L else sp.getLong(stableKey("outro_start:", key), 0L)
-
-    fun outroRemainingOf(key: String): Long = if (key.isEmpty()) 0L else sp.getLong(stableKey("outro_remaining:", key), 0L)
-    fun outroDurationOf(key: String): Long = if (key.isEmpty()) 0L else sp.getLong(stableKey("outro_duration:", key), 0L)
-
-    fun saveOutroStart(key: String, ms: Long, duration: Long = 0L) {
+    internal fun saveSkipMarks(key: String, marks: SkipMarks) {
         if (key.isEmpty()) return
-        sp.edit().putLong(stableKey("outro_start:", key), ms.coerceAtLeast(0L))
-            .putLong(stableKey("outro_remaining:", key), if (duration > ms) duration - ms else 0L)
-            .putLong(stableKey("outro_duration:", key), duration.coerceAtLeast(0L)).apply()
+        fun encode(mark: SkipPoint) = JSONObject()
+            .put("position", mark.position).put("duration", mark.duration)
+        val data = JSONObject()
+        marks.intro?.let { data.put("intro", encode(it)) }
+        marks.outro?.let { data.put("outro", encode(it)) }
+        sp.edit().putString(stableKey("skip_marks:", key), data.toString()).apply()
     }
 
-    fun clearSkipMarks(key: String) {
-        if (key.isEmpty()) return
-        sp.edit()
-            .remove(stableKey("intro_end:", key))
-            .remove(stableKey("outro_start:", key))
-            .remove(stableKey("outro_remaining:", key))
-            .remove(stableKey("outro_duration:", key))
-            .apply()
+    internal fun preferredPlaybackSource(title: String): String =
+        sp.getString(stableKey("playable_source:", "$serverUrl|$title"), "").orEmpty()
+
+    internal fun playbackSourceFailedAt(title: String, source: String): Long =
+        sp.getLong(stableKey("playback_source_failed:", "$serverUrl|$title|$source"), 0L)
+
+    internal fun recordPlaybackSourceFailure(title: String, source: String) {
+        if (title.isEmpty() || source.isEmpty()) return
+        sp.edit().putLong(stableKey("playback_source_failed:", "$serverUrl|$title|$source"), System.currentTimeMillis()).apply()
+    }
+
+    internal fun rememberPlaybackSource(title: String, source: String) {
+        if (title.isEmpty() || source.isEmpty()) return
+        if (preferredPlaybackSource(title) == source && playbackSourceFailedAt(title, source) == 0L) return
+        sp.edit().putString(stableKey("playable_source:", "$serverUrl|$title"), source)
+            .remove(stableKey("playback_source_failed:", "$serverUrl|$title|$source")).apply()
+    }
+
+    internal fun cachedArtworkUrl(title: String): String =
+        sp.getString(stableKey("last_artwork:", "$serverUrl|$title"), "").orEmpty()
+
+    internal fun rememberArtworkUrl(title: String, url: String) {
+        if (title.isBlank() || url.isBlank() || cachedArtworkUrl(title) == url) return
+        sp.edit().putString(stableKey("last_artwork:", "$serverUrl|$title"), url).apply()
     }
 
     /* ------------------------------------------------------- 首页推荐缓存 */

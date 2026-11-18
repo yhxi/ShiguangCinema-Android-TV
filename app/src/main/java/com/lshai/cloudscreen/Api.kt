@@ -86,7 +86,7 @@ data class VideoInfo(
     val actor: String,
 )
 
-data class Detail(val episodes: List<String>, val info: VideoInfo)
+data class Detail(val episodes: List<String>, val info: VideoInfo, val episodeLabels: List<String> = emptyList())
 
 data class DoubanItem(val title: String, val cover: String, val rating: String)
 
@@ -257,10 +257,15 @@ class Api(baseUrl: String) {
         val root = JSONObject(readBody(open(path, readTimeoutMs = 30000)))
         if (root.has("error")) throw IllegalStateException(root.optString("error"))
         val eps = root.optJSONArray("episodes") ?: JSONArray()
+        val labels = root.optJSONArray("episodes_titles")
         val urls = ArrayList<String>(eps.length())
+        val episodeLabels = ArrayList<String>(eps.length())
         for (i in 0 until eps.length()) {
             val v = eps.optString(i, "")
-            if (v.isNotEmpty()) urls.add(v)
+            if (v.isNotEmpty()) {
+                urls.add(v)
+                episodeLabels.add(labels?.optString(i).orEmpty())
+            }
         }
         val vi = root.optJSONObject("videoInfo") ?: JSONObject()
         val info = VideoInfo(
@@ -272,7 +277,7 @@ class Api(baseUrl: String) {
             area = vi.optString("area", ""),
             actor = vi.optString("actor", ""),
         )
-        return Detail(urls, info)
+        return Detail(urls, info, episodeLabels)
     }
 
     /** 首页推荐。字段名在服务端可能是 list/subjects、cover/pic/img，这里做容错。 */

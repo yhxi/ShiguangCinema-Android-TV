@@ -91,10 +91,10 @@ object DirectCms {
         val root = getSourceJson(src, buildUrl(src.url, null, vodId))
         val item = root.optJSONArray("list")?.optJSONObject(0)
             ?: throw IllegalStateException("详情为空")
-        val urls = parsePlayUrls(item.optString("vod_play_url", ""))
-        if (urls.isEmpty()) throw IllegalStateException("没有播放地址")
+        val episodes = parsePlayEntries(item.optString("vod_play_url", ""))
+        if (episodes.isEmpty()) throw IllegalStateException("没有播放地址")
         return Detail(
-            episodes = urls,
+            episodes = episodes.map { it.second },
             info = VideoInfo(
                 title = item.optString("vod_name", ""),
                 cover = item.optString("vod_pic", ""),
@@ -104,6 +104,7 @@ object DirectCms {
                 area = item.optString("vod_area", ""),
                 actor = item.optString("vod_actor", ""),
             ),
+            episodeLabels = episodes.map { it.first },
         )
     }
 
@@ -112,14 +113,18 @@ object DirectCms {
      *   第01集$https://x/1.m3u8#第02集$https://x/2.m3u8
      * 多线路时线路之间用 `$$$` 分隔（与 vod_play_from 一一对应），只取第一条线路。
      */
-    fun parsePlayUrls(raw: String): List<String> {
+    fun parsePlayUrls(raw: String): List<String> = parsePlayEntries(raw).map { it.second }
+
+    private fun parsePlayEntries(raw: String): List<Pair<String, String>> {
         if (raw.isBlank()) return emptyList()
         val firstLine = raw.split("$$$").firstOrNull().orEmpty()
         if (firstLine.isBlank()) return emptyList()
-        val out = ArrayList<String>()
+        val out = ArrayList<Pair<String, String>>()
         for (part in firstLine.split("#")) {
             val url = part.substringAfter('$', "").trim()
-            if (url.startsWith("http://") || url.startsWith("https://")) out.add(url)
+            if (url.startsWith("http://") || url.startsWith("https://")) {
+                out.add(part.substringBefore('$').trim() to url)
+            }
         }
         return out
     }

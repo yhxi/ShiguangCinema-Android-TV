@@ -3,8 +3,14 @@ package com.lshai.cloudscreen
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.ColorFilter
+import android.graphics.LinearGradient
+import android.graphics.Outline
 import android.graphics.Paint
 import android.graphics.Path
+import android.graphics.PixelFormat
+import android.graphics.Shader
+import android.graphics.drawable.Drawable
 import android.view.View
 
 /** Friendly built-in illustration shown while a real poster is unavailable. */
@@ -47,4 +53,49 @@ internal class ChildrenArtworkView(context: Context) : View(context) {
             canvas.drawText(name, w * .5f, h * .93f, label)
         }
     }
+}
+
+internal class HomePosterArtwork(
+    private val title: String,
+    private val radius: Float,
+    private val banner: Boolean = false,
+) : Drawable() {
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val label = android.text.TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0xFFFFF4E0.toInt()
+        typeface = android.graphics.Typeface.create("sans-serif-medium", android.graphics.Typeface.NORMAL)
+        textAlign = Paint.Align.CENTER
+    }
+    private val colors = intArrayOf(0xFF246F65.toInt(), 0xFF535882.toInt(), 0xFF875943.toInt(), 0xFF664B72.toInt())
+    private val tint = colors[(title.hashCode() and Int.MAX_VALUE) % colors.size]
+
+    override fun draw(canvas: Canvas) {
+        val w = bounds.width().toFloat()
+        val h = bounds.height().toFloat()
+        if (w <= 0 || h <= 0) return
+        canvas.save()
+        canvas.translate(bounds.left.toFloat(), bounds.top.toFloat())
+        paint.shader = LinearGradient(0f, h, w, 0f, 0xFF122D2B.toInt(), tint, Shader.TileMode.CLAMP)
+        canvas.drawRect(0f, 0f, w, h, paint)
+        paint.shader = null
+        paint.color = 0x55FFE6B8
+        val horizon = if (banner) .76f else .5f
+        canvas.drawCircle(w * horizon, h * .38f, h * .145f, paint)
+        paint.color = 0x557FD7C3
+        canvas.drawOval(w * .08f, h * .48f, w * 1.17f, h * 1.26f, paint)
+        paint.color = 0x77102B28
+        canvas.drawOval(-w * .28f, h * .61f, w * .91f, h * 1.22f, paint)
+        if (!banner && title.isNotBlank()) {
+            label.textSize = minOf(w * .14f, h * .105f)
+            val text = android.text.TextUtils.ellipsize(title, label, w * .83f, android.text.TextUtils.TruncateAt.END)
+            canvas.drawText(text.toString(), w * .5f, h * .87f, label)
+        }
+        canvas.restore()
+    }
+
+    override fun getOutline(outline: Outline) = outline.setRoundRect(bounds, radius)
+    override fun setAlpha(alpha: Int) = Unit
+    override fun setColorFilter(colorFilter: ColorFilter?) = Unit
+    @Suppress("DEPRECATION")
+    override fun getOpacity(): Int = PixelFormat.OPAQUE
 }

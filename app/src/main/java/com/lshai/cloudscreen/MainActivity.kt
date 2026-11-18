@@ -144,7 +144,8 @@ class MainActivity : EdgeSwipeBackActivity() {
     private var homeMaintenanceJob: Job? = null
     private var favoriteCheckJob: Job? = null
     private var hotSearchJob: Job? = null
-    private val homeHistoryCoverViews = mutableMapOf<String, Triple<ImageView, Int, Int>>()
+    private data class HistoryArtwork(val view: ImageView, val width: Int, val height: Int, val title: String)
+    private val homeHistoryCoverViews = mutableMapOf<String, HistoryArtwork>()
     private var recommendTag = "最新"
     private var isLoadingMore = false
     private var noMoreRecommend = false
@@ -174,10 +175,6 @@ class MainActivity : EdgeSwipeBackActivity() {
     /** 搜索结果短时缓存：key = 关键词 + 源集合，value = (写入时间, 结果) */
     private val searchCache = HashMap<String, Pair<Long, List<SearchItem>>>()
     private var lastSearchKeyword = ""
-    private var pendingSourceEpisode = -1
-    private var pendingSourcePosition = 0L
-    private var pendingSourceUrl = ""
-    private var pendingSourceTitle = ""
     private var searchInProgress = false
     /**
      * 本次搜索的编号。取消搜索、或又发起一次新搜索时自增，
@@ -241,7 +238,7 @@ class MainActivity : EdgeSwipeBackActivity() {
     // 电视上最致命的问题就是「看不出焦点在哪」。统一用高对比度方案：
     // 聚焦 = 亮蓝填充 + 深色文字 + 4dp 亮色描边 + 轻微放大。
     private val cinemaTheme: Boolean get() = isTvDevice && currentScreen !in listOf("children", "children_more", "children_empty", "children_locked") &&
-        !(childrenSearchOrigin != null && currentScreen in listOf("results", "detail", "playbacksources"))
+        !(childrenSearchOrigin != null && currentScreen in listOf("results", "detail"))
     private val ACCENT get() = if (cinemaTheme) 0xFF7DD8BD.toInt() else 0xFF0F766E.toInt()
     private val BRIGHT get() = if (cinemaTheme) 0xFF9DE5D0.toInt() else 0xFF0F766E.toInt()
     private val INK get() = if (cinemaTheme) 0xFFF4F0E5.toInt() else 0xFF173B35.toInt()
@@ -637,7 +634,6 @@ class MainActivity : EdgeSwipeBackActivity() {
                 if (section == null) showRecommend()
                 else if (section < 0) showChildren() else showChildrenMore(section)
             }
-            "playbacksources" -> { cancelJob("playbacksources"); showRecommend() }
             "serversettings" -> showSetup()
             "detail" -> if (childrenSearchOrigin != null && lastResults.isNotEmpty()) showResultsFromDetail() else showRecommend()
             "live", "setup", "history" -> showRecommend()
@@ -1729,14 +1725,9 @@ class MainActivity : EdgeSwipeBackActivity() {
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == REQ_PLAYER) {
-            if (resultCode == RESULT_OK && data?.getBooleanExtra(PlayerActivity.EXTRA_RETURN_TO_SOURCES, false) == true) {
-                showPlaybackSources(data)
-            } else {
-                childrenSearchOrigin = null
-                cancelJob("playbacksources")
-                refreshHomeAfterPlayback = false
-                showRecommend()
-            }
+            childrenSearchOrigin = null
+            refreshHomeAfterPlayback = false
+            showRecommend()
             return
         }
         if (requestCode == REQ_PICK_LIVE) {
@@ -4768,130 +4759,6 @@ class MainActivity : EdgeSwipeBackActivity() {
 
     /* --------------------------------------------------------------- 详情页 */
 
-    /** 从播放器返回时展示这部视频的来源，并补查其他已启用片源。 */
-    private fun showPlaybackSources(result: Intent) {
-        pendingSourceEpisode = result.getIntExtra(PlayerActivity.EXTRA_INDEX, -1)
-        pendingSourcePosition = result.getLongExtra(PlayerActivity.EXTRA_RETURN_POSITION, 0L)
-        pendingSourceUrl = result.getStringExtra(PlayerActivity.EXTRA_SOURCE_URL).orEmpty()
-        val title = seriesNameOf(result.getStringExtra(PlayerActivity.EXTRA_SERIES_NAME).orEmpty())
-        pendingSourceTitle = title
-        if (title.isEmpty()) { showRecommend(); return }
-        val sourceUrl = result.getStringExtra(PlayerActivity.EXTRA_SOURCE_URL).orEmpty()
-        val sourceName = result.getStringExtra(PlayerActivity.EXTRA_SOURCE_NAME).orEmpty()
-        val vodId = result.getStringExtra(PlayerActivity.EXTRA_VOD_ID).orEmpty()
-        if (currentScreen == "live" && sourceUrl.isEmpty() && vodId.isEmpty()) {
-            showLive()
-            return
-        }
-        val cover = result.getStringExtra(PlayerActivity.EXTRA_COVER).orEmpty()
-        val current = sourceUrl.takeIf { it.isNotEmpty() }?.let {
-            SearchItem(sourceName, vodId, title, cover, "", "", "", it)
-        }
-        val normalized = sourceTitleKey(title)
-        fun isSameTitle(item: SearchItem) = sourceTitleKey(item.name) == normalized
-        val known = lastResults.filter(::isSameTitle)
-        val initial = (listOfNotNull(current) + known).filter { it.sourceUrl.isNotEmpty() }
-            .distinctBy { it.sourceUrl }
-
-        var sourceRows: LinearLayout? = null
-        var sourceStatus: TextView? = null
-        var sourceScroll: ScrollView? = null
-        fun render(items: List<SearchItem>, status: String) {
-            if (currentScreen != "playbacksources") return
-            val col = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                setPadding(pagePad(40), dp(20), pagePad(40), dp(20))
-            }
-            col.addView(topBar())
-            col.addView(titleText("《$title》 · 选择播放源", 21f))
-            val statusView = hintText(status).apply { setPadding(0, dp(8), 0, dp(12)) }
-            val oldFocus = currentFocus?.tag as? String
-            val oldScroll = sourceScroll?.scrollY ?: 0
-            val rows = sourceRows ?: LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-            val oldButtons = (0 until rows.childCount).mapNotNull { rows.getChildAt(it) as? Button }.associateBy { it.tag as? String }
-            rows.removeAllViews()
-            col.addView(statusView)
-            items.forEach { item ->
-                val name = item.sourceName.ifEmpty {
-                    item.sourceUrl.substringAfter("://").substringBefore('/').ifEmpty { "未知来源" }
-                }
-                val isCurrent = item.sourceUrl == sourceUrl
-                val tested = prefs.sourceTest(item.sourceUrl)
-                val health = when {
-                    tested == null -> "未测速"
-                    tested.first -> "上次测速 ${tested.second} ms"
-                    else -> "上次测速失败"
-                }
-                val count = detailCache[item.vodId + "|" + item.sourceUrl]?.second?.episodes?.size
-                val label = (if (isCurrent) "● 当前 · " else "") + name + " · " + health + (count?.let { " · $it 集" } ?: "")
-                if (item.vodId.isNotEmpty()) {
-                    val sourceButton = oldButtons[item.sourceUrl] ?: button(label, primary = isCurrent) { }
-                    sourceButton.text = label
-                    sourceButton.tag = item.sourceUrl
-                    sourceButton.setOnClickListener { cancelJob("playbacksources"); openDetail(item) }
-                    rows.addView(sourceButton.apply {
-                        layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(52))
-                    })
-                } else {
-                    rows.addView(hintText("$label（当前来源暂无详情）"))
-                }
-            }
-            if (items.isEmpty()) rows.addView(hintText("暂无可选择的来源，请稍后重试。"))
-            if (sourceRows != null) {
-                sourceStatus?.text = status
-                sourceScroll?.post {
-                    sourceScroll?.scrollTo(0, oldScroll)
-                    if (isTvDevice && oldFocus != null) (0 until rows.childCount).map { rows.getChildAt(it) }.firstOrNull { it.tag == oldFocus }?.requestFocus()
-                }
-                return
-            }
-            sourceRows = rows
-            sourceStatus = statusView
-            val scroller = ScrollView(this).apply { addView(rows) }
-            sourceScroll = scroller
-            col.addView(scroller, LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f,
-            ))
-            setScreen(col)
-        }
-
-        currentScreen = "playbacksources"
-        lastResults = initial
-        render(initial, "正在查找本片的其他来源…")
-        val enabledSources = prefs.sources().filter { it.enabled }
-        if (enabledSources.isEmpty()) {
-            render(initial, "已知来源 ${initial.size} 个；当前没有启用的片源。")
-            return
-        }
-        cancelJob("playbacksources")
-        jobs["playbacksources"] = scope.launch {
-            try {
-                val found = withContext(Dispatchers.IO) {
-                    // 用户离开这个页面（job 被取消）就立刻停止等待剩下的源
-                    val job = coroutineContext[Job]
-                    val connections = SearchConnections()
-                    try {
-                        directThenServerSearch(sourceSearchKeyword(title), enabledSources, requests = connections,
-                            shouldContinue = { job?.isActive != false })
-                    } finally {
-                        connections.cancel()
-                    }
-                }
-                if (currentScreen != "playbacksources") return@launch
-                val matches = found.items.filter(::isSameTitle)
-                val merged = (initial.map { item ->
-                    if (item.vodId.isEmpty()) matches.firstOrNull { it.sourceUrl == item.sourceUrl } ?: item else item
-                } + matches).filter { it.sourceUrl.isNotEmpty() }.distinctBy { it.sourceUrl }
-                lastResults = merged
-                render(merged, "找到 ${merged.size} 个来源，选择一个查看集数。")
-            } catch (e: kotlinx.coroutines.CancellationException) {
-                throw e
-            } catch (_: Exception) {
-                render(initial, "其他来源暂时查找失败，下面是已知来源。")
-            }
-        }
-    }
-
     /**
      * 打开详情。
      *
@@ -5071,22 +4938,8 @@ class MainActivity : EdgeSwipeBackActivity() {
                 vodId = item.vodId,
                 sourceUrl = item.sourceUrl,
                 sourceName = item.sourceName,
+                episodeNumbers = detail.episodeLabels.map(::sourceEpisodeNumber).toIntArray(),
             )
-        }
-
-        val transferIndex = pendingSourceEpisode
-        if (pendingSourceUrl.isNotEmpty() && pendingSourceUrl != item.sourceUrl && transferIndex >= 0 &&
-            sourceTitleKey(pendingSourceTitle) == sourceTitleKey(item.name)) {
-            pendingSourceEpisode = -1
-            pendingSourceUrl = ""
-            if (transferIndex < detail.episodes.size) {
-                AlertDialog.Builder(this).setTitle("继续观看第 ${transferIndex + 1} 集？")
-                    .setMessage("不同来源的集数和时长可能不一致，请确认对应集数。")
-                    .setPositiveButton("继续观看") { _, _ ->
-                        if (pendingSourcePosition > 5_000L) prefs.saveProgress(detail.episodes[transferIndex], pendingSourcePosition)
-                        startEpisode(transferIndex)
-                    }.setNegativeButton("手动选集", null).show()
-            } else toast("新来源集数不足，请手动选集")
         }
 
         // 续播：全项目以前从来没读过 progressOf()，进详情页永远从第 1 集开始，
@@ -5218,6 +5071,7 @@ class MainActivity : EdgeSwipeBackActivity() {
             vodId = h.vodId,
             sourceUrl = h.sourceUrl,
             sourceName = h.sourceName,
+            historyEpisodeIndex = h.episodeIndex,
         )
     }
 
@@ -5231,12 +5085,19 @@ class MainActivity : EdgeSwipeBackActivity() {
         vodId: String = "",
         sourceUrl: String = "",
         sourceName: String = "",
+        episodeNumbers: IntArray = IntArray(0),
+        historyEpisodeIndex: Int = -1,
     ) {
         if (urls.isEmpty()) return
         val child = currentScreen == "children" || currentScreen == "children_more" || childrenSearchOrigin != null || ChildrenQuota.isChild(this, seriesName.ifEmpty { title })
         if (child) {
             ChildrenQuota.mark(this, seriesName.ifEmpty { title })
-            if (ChildrenQuota.remaining(this) <= 0L) { ChildrenQuota.locked(this) { playFromList(urls, index, title, cover, seriesName, vodId, sourceUrl, sourceName) }; return }
+            if (ChildrenQuota.remaining(this) <= 0L) {
+                ChildrenQuota.locked(this) {
+                    playFromList(urls, index, title, cover, seriesName, vodId, sourceUrl, sourceName, episodeNumbers, historyEpisodeIndex)
+                }
+                return
+            }
         }
         refreshHomeAfterPlayback = true
         startActivityForResult(Intent(this, PlayerActivity::class.java).apply {
@@ -5250,6 +5111,8 @@ class MainActivity : EdgeSwipeBackActivity() {
             putExtra(PlayerActivity.EXTRA_VOD_ID, vodId)
             putExtra(PlayerActivity.EXTRA_SOURCE_URL, sourceUrl)
             putExtra(PlayerActivity.EXTRA_SOURCE_NAME, sourceName)
+            putExtra(PlayerActivity.EXTRA_EPISODE_NUMBERS, episodeNumbers)
+            putExtra(PlayerActivity.EXTRA_HISTORY_EPISODE_INDEX, historyEpisodeIndex)
             if (child) {
                 putExtra(PlayerActivity.EXTRA_CHILD_TIMER, prefs.childrenTimerMinutes)
             }
@@ -6041,11 +5904,8 @@ class MainActivity : EdgeSwipeBackActivity() {
 
     /** 只替换对应卡片的海报，不为一张图片重建整页。 */
     private fun updateHomeHistoryCover(playUrl: String, cover: String) {
-        val (view, width, height) = homeHistoryCoverViews[playUrl] ?: return
-        view.tag = cover
-        imageLoader.load(cover, width, height, onPreview = { bmp -> if (view.tag == cover) view.setImageBitmap(bmp) }) { bmp ->
-            if (view.tag == cover && bmp != null) view.setImageBitmap(bmp)
-        }
+        val (view, width, height, title) = homeHistoryCoverViews[playUrl] ?: return
+        loadHomeArtwork(view, title, cover, width, height)
     }
 
     /** Compact recent items: two on phones, three on TV; full history stays available. */
@@ -6123,8 +5983,8 @@ class MainActivity : EdgeSwipeBackActivity() {
             }, FrameLayout.LayoutParams(-1, -1))
             val image = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
             poster.addView(image, FrameLayout.LayoutParams(-1, -1))
-            homeHistoryCoverViews[h.playUrl] = Triple(image, coverWidth, coverHeight)
-            if (h.cover.isNotBlank()) updateHomeHistoryCover(h.playUrl, h.cover)
+            homeHistoryCoverViews[h.playUrl] = HistoryArtwork(image, coverWidth, coverHeight, historyTitle(h))
+            updateHomeHistoryCover(h.playUrl, h.cover)
             card.addView(poster, LinearLayout.LayoutParams(coverWidth, coverHeight).apply { gravity = Gravity.CENTER_VERTICAL })
             val detail = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
@@ -6212,8 +6072,8 @@ class MainActivity : EdgeSwipeBackActivity() {
             title.ellipsize = android.text.TextUtils.TruncateAt.END
             val episode = Regex("第\\s*(\\d+)").find(h.title)?.groupValues?.getOrNull(1)
             metadata.text = listOfNotNull(episode?.let { "第 $it 集" }, historyProgressLabel(h)).joinToString(" · ")
-            homeHistoryCoverViews[h.playUrl] = Triple(poster, metrics[0], metrics[1])
-            if (h.cover.isNotBlank()) updateHomeHistoryCover(h.playUrl, h.cover)
+            homeHistoryCoverViews[h.playUrl] = HistoryArtwork(poster, metrics[0], metrics[1], historyTitle(h))
+            updateHomeHistoryCover(h.playUrl, h.cover)
             val progress = android.widget.ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
                 max = 1000
                 progress = if (h.durationMs > 0) ((h.positionMs.toDouble() / h.durationMs).coerceIn(0.0, 1.0) * 1000).toInt() else 0
@@ -6307,10 +6167,8 @@ class MainActivity : EdgeSwipeBackActivity() {
             }, FrameLayout.LayoutParams(-1, -1))
             val coverView = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
             card.addView(coverView, FrameLayout.LayoutParams(-1, -1))
-            homeHistoryCoverViews[h.playUrl] = Triple(coverView, cardWidth, cardHeight)
-            if (h.cover.isNotBlank()) {
-                updateHomeHistoryCover(h.playUrl, h.cover)
-            }
+            homeHistoryCoverViews[h.playUrl] = HistoryArtwork(coverView, cardWidth, cardHeight, historyTitle(h))
+            updateHomeHistoryCover(h.playUrl, h.cover)
             val overlay = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
                 gravity = Gravity.BOTTOM
@@ -6767,10 +6625,10 @@ class MainActivity : EdgeSwipeBackActivity() {
         }
     }
 
-    private fun setChildrenBitmap(image: ImageView, bitmap: android.graphics.Bitmap) {
-        image.setBackgroundColor(0xFFD9F1E7.toInt())
+    private fun setChildrenBitmap(image: ImageView, bitmap: android.graphics.Bitmap, url: String) {
         image.scaleType = ImageView.ScaleType.CENTER_CROP
         image.setImageBitmap(bitmap)
+        (image.tag as? String)?.let { prefs.rememberArtworkUrl(it, url) }
     }
 
     private fun retryChildrenCover(title: String, image: ImageView, width: Int, height: Int) {
@@ -6789,11 +6647,18 @@ class MainActivity : EdgeSwipeBackActivity() {
         val pinned = childrenPinnedCovers[title]
         val cached = pinned ?: childrenCovers[title]
         if (cached != null) {
-            if (image != null) imageLoader.load(cached, width, height, onCancelled = {
+            if (image != null) imageLoader.load(cached, width, height, onPreview = { bmp ->
+                if (image.tag == title && signature == childrenCoverSignature &&
+                    (childrenPinnedCovers[title] ?: childrenCovers[title]) == cached) {
+                    setChildrenBitmap(image, bmp, cached)
+                    updateChildrenCoverStatus(image, null)
+                }
+            }, onCancelled = {
                 if (image.tag == title) updateChildrenCoverStatus(image, "可重试")
             }) { bmp ->
-                if (image.tag != title || signature != childrenCoverSignature) return@load
-                if (bmp != null) { setChildrenBitmap(image, bmp); updateChildrenCoverStatus(image, null) }
+                if (image.tag != title || signature != childrenCoverSignature ||
+                    (childrenPinnedCovers[title] ?: childrenCovers[title]) != cached) return@load
+                if (bmp != null) { setChildrenBitmap(image, bmp, cached); updateChildrenCoverStatus(image, null) }
                 else if (pinned != null && cached == pinned) {
                     // 手动指定的封面失效：不自动换源重试（绝不能覆盖用户的选择），
                     // 留「可重试」角标，长按卡片可以重新挑一张
@@ -6858,7 +6723,7 @@ class MainActivity : EdgeSwipeBackActivity() {
                                             waiting.forEach { ref ->
                                                 val target = ref.get()
                                                 if (target != null && target.tag == title) {
-                                                    setChildrenBitmap(target, bitmap)
+                                                    setChildrenBitmap(target, bitmap, candidate)
                                                     updateChildrenCoverStatus(target, null)
                                                 }
                                             }
@@ -6940,8 +6805,9 @@ class MainActivity : EdgeSwipeBackActivity() {
                             if (target.tag == title) imageLoader.load(chosen, width, height, onCancelled = {
                                 if (target.tag == title) updateChildrenCoverStatus(target, "可重试")
                             }) { bmp ->
-                                if (target.tag == title && bmp != null) {
-                                    setChildrenBitmap(target, bmp)
+                                if (target.tag == title && bmp != null && signature == childrenCoverSignature &&
+                                    (childrenPinnedCovers[title] ?: childrenCovers[title]) == chosen) {
+                                    setChildrenBitmap(target, bmp, chosen)
                                     updateChildrenCoverStatus(target, null)
                                 }
                             }
@@ -6973,10 +6839,21 @@ class MainActivity : EdgeSwipeBackActivity() {
     }
 
     private fun bindChildrenCover(image: ImageView, title: String, width: Int, height: Int) {
-        image.setBackgroundColor(Color.TRANSPARENT)
+        if (image.tag != title) image.setImageDrawable(null)
         image.tag = title
-        image.setImageDrawable(null)
-        updateChildrenCoverStatus(image, "加载中")
+        val current = childrenPinnedCovers[title] ?: childrenCovers[title]
+        val previous = prefs.cachedArtworkUrl(title)
+        if (image.drawable == null && previous.isNotBlank() && previous != current) {
+            val signature = childrenCoverSignature
+            imageLoader.load(previous, width, height, needed = {
+                image.tag == title && signature == childrenCoverSignature
+            }) { bmp ->
+                if (bmp != null && image.tag == title && signature == childrenCoverSignature && image.drawable == null) {
+                    setChildrenBitmap(image, bmp, previous)
+                    updateChildrenCoverStatus(image, null)
+                }
+            }
+        }
         queueChildrenCover(title, width, height, image)
     }
 
@@ -7363,9 +7240,11 @@ class MainActivity : EdgeSwipeBackActivity() {
         }
     }
 
-    /** Rotate three real recommendations; never replace the existing feed or history. */
+    /** Rotate up to three recommendations, favoring titles with artwork. */
     private fun addCinemaFeature(parent: LinearLayout) {
-        val items = recommendItems.filter { it.title.isNotBlank() && it.cover.isNotBlank() }.shuffled().take(3)
+        val items = recommendItems.filter { it.title.isNotBlank() }.shuffled()
+            .sortedBy { it.cover.isBlank() && prefs.cachedArtworkUrl(it.title).isBlank() }
+            .take(3)
         if (items.isEmpty()) return
         var selected = 0
         val height = dp(if (isTvDevice) 190 else 132)
@@ -7423,13 +7302,7 @@ class MainActivity : EdgeSwipeBackActivity() {
                 shape = GradientDrawable.OVAL
                 setColor(if (i == selected) 0xFF83DEC0.toInt() else 0x889AC5B2.toInt())
             }
-            image.tag = item.cover
-            image.setImageDrawable(null)
-            imageLoader.load(item.cover, resources.displayMetrics.widthPixels, height,
-                needed = { feature.isAttachedToWindow && image.tag == item.cover },
-                onPreview = { if (image.tag == item.cover) image.setImageBitmap(it) }) {
-                if (image.tag == item.cover && it != null) image.setImageBitmap(it)
-            }
+            loadHomeArtwork(image, item.title, item.cover, resources.displayMetrics.widthPixels, height, banner = true)
         }
         feature.setOnClickListener { doSearch(items[selected].title) }
         feature.setOnKeyListener { _, code, event ->
@@ -7977,6 +7850,34 @@ class MainActivity : EdgeSwipeBackActivity() {
         return active
     }
 
+    private fun loadHomeArtwork(image: ImageView, title: String, cover: String, width: Int, height: Int, banner: Boolean = false) {
+        val previousTitle = image.tag as? String
+        if (previousTitle != title) {
+            image.setImageDrawable(null)
+            image.background = HomePosterArtwork(title, dp(14).toFloat(), banner)
+        }
+        image.tag = title
+        val subscription = posterSubscription(image)
+        val requestApi = api
+        val cached = prefs.cachedArtworkUrl(title)
+        val first = cover.ifBlank { cached }
+        fun show(url: String, bitmap: android.graphics.Bitmap) {
+            if (!subscription.get() || requestApi !== api) return
+            image.setImageBitmap(bitmap)
+            prefs.rememberArtworkUrl(title, url)
+        }
+        imageLoader.load(first, width, height, needed = subscription::get, onPreview = { show(first, it) }) { bmp ->
+            if (!subscription.get() || requestApi !== api) return@load
+            if (bmp != null) {
+                show(first, bmp)
+            } else if (cached.isNotBlank() && cached != first && image.drawable == null) {
+                imageLoader.load(cached, width, height, needed = subscription::get, onPreview = { show(cached, it) }) {
+                    if (it != null) show(cached, it)
+                }
+            }
+        }
+    }
+
     private fun bindRecommendCell(cell: LinearLayout, position: Int) {
         val item = recommendItems.getOrNull(position) ?: return
         val metrics = recommendCellMetrics()
@@ -7987,12 +7888,7 @@ class MainActivity : EdgeSwipeBackActivity() {
         val rating = cell.getChildAt(2) as TextView
         label.text = item.title
         rating.text = if (item.rating.isEmpty()) "新剧 · 热播" else "★ ${item.rating}  ·  热播"
-        val previousCover = img.tag as? String
-        img.tag = item.cover
-        if (previousCover != item.cover) img.setImageDrawable(null)
-        imageLoader.load(item.cover, posterWidth, posterHeight, needed = posterSubscription(img)::get, onPreview = { bmp -> if (img.tag == item.cover) img.setImageBitmap(bmp) }) { bmp ->
-            if (img.tag == item.cover) img.setImageBitmap(bmp)
-        }
+        loadHomeArtwork(img, item.title, item.cover, posterWidth, posterHeight)
         cell.setOnClickListener { doSearch(item.title) }
     }
 
