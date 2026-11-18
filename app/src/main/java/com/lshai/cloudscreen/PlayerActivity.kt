@@ -4015,9 +4015,9 @@ class PlayerActivity : EdgeSwipeBackActivity() {
         val candidates = Channel<PlaybackAlternative>(sources.size)
         val cooledCandidates = Channel<PlaybackAlternative>(sources.size)
         val preferredCandidate = CompletableDeferred<PlaybackAlternative?>()
-        val concurrency = Semaphore(4)
         sourceSwitchJob = sourceSwitchScope.launch(start = CoroutineStart.LAZY) {
-            fun discovery(sources: List<SourceConfig>, channel: Channel<PlaybackAlternative>): List<Job> {
+            fun discovery(sources: List<SourceConfig>, channel: Channel<PlaybackAlternative>, slots: Int): List<Job> {
+                val concurrency = Semaphore(slots)
                 val workers = sources.map { source -> launch {
                     concurrency.withPermit {
                         val alternative = withContext(Dispatchers.IO) { runCatching {
@@ -4034,8 +4034,13 @@ class PlayerActivity : EdgeSwipeBackActivity() {
                 return workers
             }
             val favorites = ranked[SourcePriority.PREFERRED].orEmpty()
-            val workers = discovery(favorites + ranked[SourcePriority.NORMAL].orEmpty(), candidates) +
-                discovery(ranked[SourcePriority.RECENT_FAILURE].orEmpty(), cooledCandidates)
+            val regularSources = favorites + ranked[SourcePriority.NORMAL].orEmpty()
+            val backupSources = ranked[SourcePriority.RECENT_FAILURE].orEmpty()
+            val regularSlots = if (backupSources.isEmpty()) 4 else 3
+            val backupSlots = if (regularSources.isEmpty()) 4 else 1
+            val priorityUntil = SystemClock.elapsedRealtime() + 2_500L
+            val workers = discovery(regularSources, candidates, regularSlots) +
+                discovery(backupSources, cooledCandidates, backupSlots)
 
             val tested = mutableSetOf(playing)
             var attempted = false
@@ -4060,12 +4065,8 @@ class PlayerActivity : EdgeSwipeBackActivity() {
                     }
                     val first = if (favorites.isEmpty()) null else withTimeoutOrNull(2_500L) { preferredCandidate.await() }
                     if (first != null && tryAlternative(first)) return@withTimeoutOrNull first
-                    for (tier in listOf(candidates, cooledCandidates)) {
-                        for (alternative in tier) {
-                            if (tryAlternative(alternative)) return@withTimeoutOrNull alternative
-                        }
-                    }
-                    null
+                    firstPlayableSource(candidates, cooledCandidates,
+                        (priorityUntil - SystemClock.elapsedRealtime()).coerceAtLeast(0L), ::tryAlternative)
                 }
                 if (replacement == null) {
                     toast("暂无能从 ${formatTime(position)} 续播的其他来源")

@@ -1,5 +1,8 @@
 package com.lshai.cloudscreen
 
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
@@ -37,5 +40,31 @@ class SourceSwitchTest {
         assertEquals(SourcePriority.NORMAL, sourcePriority("b", "a", 0L, now))
         assertEquals(SourcePriority.RECENT_FAILURE, sourcePriority("a", "a", now - 5_000L, now))
         assertEquals(SourcePriority.PREFERRED, sourcePriority("a", "a", now - 600_000L, now))
+    }
+
+    @Test
+    fun readyBackupDoesNotWaitForAnOpenRegularQueue() = runBlocking {
+        val regular = Channel<String>()
+        val backup = Channel<String>(1).apply { trySend("ready") }
+        assertEquals("ready", withTimeout(1_000L) {
+            firstPlayableSource(regular, backup, 20L) { true }
+        })
+        regular.cancel()
+        backup.cancel()
+    }
+
+    @Test
+    fun failedRegularCandidateAndClosedQueueStillAllowBackup() = runBlocking {
+        val regular = Channel<String>(1).apply { trySend("fails"); close() }
+        val backup = Channel<String>(1).apply { trySend("plays"); close() }
+        val tried = mutableListOf<String>()
+        val winner = withTimeout(1_000L) {
+            firstPlayableSource(regular, backup, 20L) {
+                tried.add(it)
+                it == "plays"
+            }
+        }
+        assertEquals(listOf("fails", "plays"), tried)
+        assertEquals("plays", winner)
     }
 }

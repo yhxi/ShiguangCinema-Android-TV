@@ -13,6 +13,10 @@ import android.graphics.drawable.InsetDrawable
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.Uri
 import android.provider.Settings
 import android.text.InputType
@@ -140,7 +144,9 @@ class MainActivity : EdgeSwipeBackActivity() {
     private var mediaType = "tv"
     private var recommendPage = 0
     private var recommendRequested = false
-    private val coverLookupAttempted = mutableSetOf<String>()
+    private val historyCoverAttemptAt = mutableMapOf<String, Long>()
+    private var homeCoverNetworkCallback: ConnectivityManager.NetworkCallback? = null
+    private var validatedCoverNetwork: Network? = null
     private var homeMaintenanceJob: Job? = null
     private var favoriteCheckJob: Job? = null
     private var hotSearchJob: Job? = null
@@ -421,6 +427,7 @@ class MainActivity : EdgeSwipeBackActivity() {
     override fun onDestroy() {
         if (Build.VERSION.SDK_INT >= 33) systemBackCallback?.let { onBackInvokedDispatcher.unregisterOnBackInvokedCallback(it) }
         cancelUpdateDownload(showMessage = false)
+        stopHomeCoverNetworkWatch()
         homeMaintenanceJob?.cancel()
         favoriteCheckJob?.cancel()
         hotSearchJob?.cancel()
@@ -463,6 +470,7 @@ class MainActivity : EdgeSwipeBackActivity() {
         recommendRetryJob?.cancel()
         recommendRetryJob = null
         quotaVisible = false
+        stopHomeCoverNetworkWatch()
         quotaHandler.removeCallbacks(quotaTick)
         uiMonitor?.stop()
         homeMaintenanceJob?.cancel()
@@ -519,6 +527,8 @@ class MainActivity : EdgeSwipeBackActivity() {
             showRecommend()
         }
         refreshHomeAfterPlayback = false
+        startHomeCoverNetworkWatch()
+        if (currentScreen == "recommend") scheduleHomeMaintenance()
     }
 
     private fun startUiMonitor() {
@@ -5871,41 +5881,109 @@ class MainActivity : EdgeSwipeBackActivity() {
         }
     }
 
-    /** 旧版记录可能没存封面；每次最多三条，逐条补查，不与用户操作并发抢带宽。 */
+    private fun startHomeCoverNetworkWatch() {
+        val manager = getSystemService(ConnectivityManager::class.java) ?: return
+        val active = manager.activeNetwork
+        if (active != null && manager.getNetworkCapabilities(active)?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true) {
+            if (validatedCoverNetwork != active) historyCoverAttemptAt.clear()
+            validatedCoverNetwork = active
+        } else {
+            validatedCoverNetwork = null
+        }
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
+                val observer = this
+                scope.launch {
+                    if (homeCoverNetworkCallback !== observer ||
+                        (Build.VERSION.SDK_INT < 24 && network != manager.activeNetwork)) return@launch
+                    if (capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) {
+                        if (validatedCoverNetwork != network) {
+                            validatedCoverNetwork = network
+                            historyCoverAttemptAt.clear()
+                            if (quotaVisible && currentScreen == "recommend") scheduleHomeMaintenance()
+                        }
+                    } else if (validatedCoverNetwork == network) {
+                        validatedCoverNetwork = null
+                    }
+                }
+            }
+
+            override fun onLost(network: Network) {
+                val observer = this
+                scope.launch {
+                    if (homeCoverNetworkCallback === observer && validatedCoverNetwork == network) {
+                        validatedCoverNetwork = null
+                    }
+                }
+            }
+        }
+        homeCoverNetworkCallback = callback
+        runCatching {
+            if (Build.VERSION.SDK_INT >= 24) manager.registerDefaultNetworkCallback(callback)
+            else manager.registerNetworkCallback(
+                NetworkRequest.Builder().addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET).build(), callback,
+            )
+        }.onFailure { homeCoverNetworkCallback = null }
+    }
+
+    private fun stopHomeCoverNetworkWatch() {
+        val callback = homeCoverNetworkCallback ?: return
+        homeCoverNetworkCallback = null
+        runCatching { getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(callback) }
+    }
+
+    /** Revisit at most three visible placeholders and leave the artwork in place until a poster loads. */
     private suspend fun fillMissingHistoryCovers() {
+        if (!quotaVisible || !hasActiveNetwork(this)) return
         val sources = prefs.sources().filter { it.enabled }
-        for (entry in prefs.history().filter { it.cover.isBlank() }.take(3)) {
-            if (currentScreen != "recommend") break
-            val title = historyTitle(entry)
-            if (title.isEmpty() || entry.playUrl in coverLookupAttempted) continue
-            val localCover = recommendItems.firstOrNull { it.title.trim() == title }?.cover.orEmpty()
-            if (localCover.isNotEmpty()) {
-                coverLookupAttempted.add(entry.playUrl)
-                prefs.updateHistoryCover(entry.playUrl, localCover)
-                updateHomeHistoryCover(entry.playUrl, localCover)
-                continue
-            }
-            if (sources.isEmpty()) continue
-            val cover = withContext(Dispatchers.IO) {
+        val requestApi = api
+        val now = android.os.SystemClock.elapsedRealtime()
+        val visibleBounds = android.graphics.Rect()
+        fun stillMissing(artwork: HistoryArtwork): Boolean =
+            artwork.view.drawable == null && artwork.view.isShown && artwork.view.getGlobalVisibleRect(visibleBounds)
+        val history = prefs.history().associateBy { it.playUrl }
+        historyCoverAttemptAt.keys.retainAll(history.keys)
+        val candidates = homeHistoryCoverViews.entries.filter { (url, artwork) ->
+            artwork.title.isNotBlank() && stillMissing(artwork) &&
+                (historyCoverAttemptAt[url]?.let { now - it >= 30_000L } ?: true)
+        }.take(3)
+        for ((url, artwork) in candidates) {
+            if (!quotaVisible || currentScreen != "recommend" || requestApi !== api) break
+            val entry = history[url] ?: continue
+            if (!stillMissing(artwork) || homeHistoryCoverViews[url] !== artwork) continue
+            historyCoverAttemptAt[url] = android.os.SystemClock.elapsedRealtime()
+            val titleKey = sourceTitleKey(artwork.title)
+            val local = recommendItems.firstOrNull { sourceTitleKey(it.title) == titleKey && it.cover.isNotBlank() }?.cover.orEmpty()
+            // Retry a known image immediately while looking for an exact-title replacement.
+            updateHomeHistoryCover(url, entry.cover.ifBlank { local }, saveWhenLoaded = true)
+            if (sources.isEmpty() || titleKey.isEmpty()) continue
+            val alternatives = withContext(Dispatchers.IO) {
                 runCatching {
-                    val found = api.search(title, sources).items
-                    found.firstOrNull { it.name.trim() == title }?.pic
-                        ?: found.firstOrNull()?.pic.orEmpty()
-                }.getOrDefault("")
+                    requestApi.search(artwork.title, sources, readTimeoutMs = 6_000).items
+                        .asSequence().filter { sourceTitleKey(it.name) == titleKey }
+                        .map { it.pic }.filter { it.isNotBlank() }.distinct().take(3).toList()
+                }.getOrDefault(emptyList())
             }
-            coverLookupAttempted.add(entry.playUrl)
-            if (cover.isNotEmpty()) {
-                prefs.updateHistoryCover(entry.playUrl, cover)
-                if (currentScreen == "recommend") updateHomeHistoryCover(entry.playUrl, cover)
+            if (requestApi === api && currentScreen == "recommend" && homeHistoryCoverViews[url] === artwork && stillMissing(artwork)) {
+                val replacements = (listOf(local) + alternatives).filter { it.isNotBlank() && it != entry.cover }.distinct()
+                if (replacements.isNotEmpty()) {
+                    updateHomeHistoryCover(url, replacements.first(), replacements.drop(1), saveWhenLoaded = true)
+                }
             }
             delay(250)
         }
     }
 
     /** 只替换对应卡片的海报，不为一张图片重建整页。 */
-    private fun updateHomeHistoryCover(playUrl: String, cover: String) {
+    private fun updateHomeHistoryCover(playUrl: String, cover: String, alternatives: List<String> = emptyList(), saveWhenLoaded: Boolean = false) {
         val (view, width, height, title) = homeHistoryCoverViews[playUrl] ?: return
-        loadHomeArtwork(view, title, cover, width, height)
+        var stored = false
+        loadHomeArtwork(view, title, cover, width, height, alternatives = alternatives) { loadedUrl ->
+            if (saveWhenLoaded && !stored && homeHistoryCoverViews[playUrl]?.view === view) {
+                stored = true
+                prefs.updateHistoryCover(playUrl, loadedUrl)
+            }
+        }
     }
 
     /** Compact recent items: two on phones, three on TV; full history stays available. */
@@ -7850,7 +7928,10 @@ class MainActivity : EdgeSwipeBackActivity() {
         return active
     }
 
-    private fun loadHomeArtwork(image: ImageView, title: String, cover: String, width: Int, height: Int, banner: Boolean = false) {
+    private fun loadHomeArtwork(
+        image: ImageView, title: String, cover: String, width: Int, height: Int, banner: Boolean = false,
+        alternatives: List<String> = emptyList(), onArtworkReady: (String) -> Unit = {},
+    ) {
         val previousTitle = image.tag as? String
         if (previousTitle != title) {
             image.setImageDrawable(null)
@@ -7860,22 +7941,22 @@ class MainActivity : EdgeSwipeBackActivity() {
         val subscription = posterSubscription(image)
         val requestApi = api
         val cached = prefs.cachedArtworkUrl(title)
-        val first = cover.ifBlank { cached }
+        val urls = (listOf(cover, cached) + alternatives).filter { it.isNotBlank() }.distinct()
         fun show(url: String, bitmap: android.graphics.Bitmap) {
             if (!subscription.get() || requestApi !== api) return
             image.setImageBitmap(bitmap)
             prefs.rememberArtworkUrl(title, url)
+            onArtworkReady(url)
         }
-        imageLoader.load(first, width, height, needed = subscription::get, onPreview = { show(first, it) }) { bmp ->
-            if (!subscription.get() || requestApi !== api) return@load
-            if (bmp != null) {
-                show(first, bmp)
-            } else if (cached.isNotBlank() && cached != first && image.drawable == null) {
-                imageLoader.load(cached, width, height, needed = subscription::get, onPreview = { show(cached, it) }) {
-                    if (it != null) show(cached, it)
-                }
+        fun tryCover(index: Int) {
+            val url = urls.getOrNull(index) ?: return
+            imageLoader.load(url, width, height, needed = subscription::get, onPreview = { show(url, it) }) { bmp ->
+                if (!subscription.get() || requestApi !== api) return@load
+                if (bmp != null) show(url, bmp)
+                else if (image.drawable == null) tryCover(index + 1)
             }
         }
+        tryCover(0)
     }
 
     private fun bindRecommendCell(cell: LinearLayout, position: Int) {
