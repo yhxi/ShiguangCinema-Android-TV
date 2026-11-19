@@ -90,7 +90,7 @@ data class Detail(val episodes: List<String>, val info: VideoInfo, val episodeLa
 
 data class DoubanItem(val title: String, val cover: String, val rating: String)
 
-data class SearchResult(val items: List<SearchItem>, val failures: Int)
+data class SearchResult(val items: List<SearchItem>, val failures: Int, val failedSourceUrls: Set<String> = emptySet())
 
 data class Channel(val name: String, val url: String, val group: String, val logo: String, val headers: Map<String, String> = emptyMap())
 

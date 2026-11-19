@@ -49,6 +49,7 @@ import androidx.media3.common.VideoSize
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.analytics.AnalyticsListener
 import androidx.media3.exoplayer.analytics.PlaybackStatsListener
 import androidx.media3.exoplayer.mediacodec.MediaCodecUtil
 import androidx.media3.ui.AspectRatioFrameLayout
@@ -904,7 +905,7 @@ class PlayerActivity : EdgeSwipeBackActivity() {
         actionBar.addView(fullscreenButton())
         actionBar.addView(actionButton("锁屏") { lockScreen() })
         actionBar.addView(actionButton("音轨/字幕") { showTrackMenu() })
-        actionBar.addView(actionButton("退出") { exitToHome() })
+        actionBar.addView(actionButton("退出") { exitPlayback() })
 
         actionScroll = HorizontalScrollView(this).apply {
             isFocusable = false
@@ -1002,6 +1003,13 @@ class PlayerActivity : EdgeSwipeBackActivity() {
             .also { exo ->
                 playerView.player = exo
                 exo.addAnalyticsListener(statsListener)
+                exo.addAnalyticsListener(object : AnalyticsListener {
+                    override fun onRenderedFirstFrame(eventTime: AnalyticsListener.EventTime, output: Any, renderTimeMs: Long) {
+                        if (sourceSwitchJob == null || eventTime.windowIndex !in 0 until eventTime.timeline.windowCount) return
+                        switchFirstFrameUrl = eventTime.timeline.getWindow(eventTime.windowIndex, androidx.media3.common.Timeline.Window())
+                            .mediaItem.localConfiguration?.uri?.toString()
+                    }
+                })
                 exo.setPlaybackSpeed(prefs.playbackSpeed)
                 exo.pauseAtEndOfMediaItems = !prefs.autoNext
 
@@ -1989,7 +1997,7 @@ class PlayerActivity : EdgeSwipeBackActivity() {
             .setTitle("更多操作")
             .setItems(items) { _, which ->
                 when (which) {
-                    0 -> exitToHome()
+                    0 -> exitPlayback()
                     1 -> {
                         player?.let {
                             it.seekTo(currentIndex, it.currentPosition)
@@ -3898,10 +3906,10 @@ class PlayerActivity : EdgeSwipeBackActivity() {
             if (isTvDevice) unlockScreen() else lockHint()
             return
         }
-        exitToHome()
+        exitPlayback()
     }
 
-    private fun exitToHome() {
+    private fun exitPlayback() {
         if (isFinishing || isDestroyed) return
         player?.pause()
         persistProgress()
@@ -3943,8 +3951,10 @@ class PlayerActivity : EdgeSwipeBackActivity() {
         return null
     }
 
-    private suspend fun awaitAlternativePlayback(p: ExoPlayer, position: Long): Boolean =
-        withTimeoutOrNull(12_000L) {
+    private var switchFirstFrameUrl: String? = null
+
+    private suspend fun awaitAlternativePlayback(p: ExoPlayer, url: String, position: Long): Boolean =
+        withTimeoutOrNull(7_000L) {
             while (p.playerError == null && p.playbackState == Player.STATE_BUFFERING) delay(100L)
             if (p.playbackState != Player.STATE_READY || p.isCurrentMediaItemLive) return@withTimeoutOrNull false
             if (position > 0 && (!p.isCurrentMediaItemSeekable ||
@@ -3953,7 +3963,11 @@ class PlayerActivity : EdgeSwipeBackActivity() {
             if (kotlin.math.abs(start - position) > 250L) return@withTimeoutOrNull false
             p.play()
             while (p.playerError == null && p.playWhenReady && p.playbackState != Player.STATE_ENDED) {
-                if (p.isPlaying && p.currentPosition > start + 100L) return@withTimeoutOrNull true
+                val audioOnly = !p.currentTracks.containsType(C.TRACK_TYPE_VIDEO) &&
+                    p.currentTracks.isTypeSelected(C.TRACK_TYPE_AUDIO)
+                if (p.isPlaying && p.currentPosition > start + 100L && (switchFirstFrameUrl == url || audioOnly)) {
+                    return@withTimeoutOrNull true
+                }
                 delay(100L)
             }
             false
@@ -4038,7 +4052,8 @@ class PlayerActivity : EdgeSwipeBackActivity() {
             val backupSources = ranked[SourcePriority.RECENT_FAILURE].orEmpty()
             val regularSlots = if (backupSources.isEmpty()) 4 else 3
             val backupSlots = if (regularSources.isEmpty()) 4 else 1
-            val priorityUntil = SystemClock.elapsedRealtime() + 2_500L
+            val preferredWaitMs = 1_200L
+            val priorityUntil = SystemClock.elapsedRealtime() + preferredWaitMs
             val workers = discovery(regularSources, candidates, regularSlots) +
                 discovery(backupSources, cooledCandidates, backupSlots)
 
@@ -4046,15 +4061,17 @@ class PlayerActivity : EdgeSwipeBackActivity() {
             var attempted = false
             var switched = false
             try {
-                val replacement = withTimeoutOrNull(45_000L) {
+                val replacement = withTimeoutOrNull(24_000L) {
                     suspend fun tryAlternative(alternative: PlaybackAlternative): Boolean {
-                        if (quotaDialogShown || !tested.add(alternative.detail.episodes[alternative.index])) return false
+                        val url = alternative.detail.episodes[alternative.index]
+                        if (quotaDialogShown || !tested.add(url)) return false
                         dialog.setMessage("正在尝试「${alternative.source.name}」，续播位置 ${formatTime(position)}。")
                         attempted = true
                         p.pauseAtEndOfMediaItems = true
+                        switchFirstFrameUrl = null
                         p.setMediaItems(buildMediaItems(alternative.detail.episodes), alternative.index, position)
                         p.prepare()
-                        if (!awaitAlternativePlayback(p, position)) {
+                        if (!awaitAlternativePlayback(p, url, position)) {
                             p.pause()
                             if (!quotaDialogShown && hasActiveNetwork(this@PlayerActivity)) {
                                 prefs.recordPlaybackSourceFailure(season, alternative.source.url)
@@ -4063,7 +4080,7 @@ class PlayerActivity : EdgeSwipeBackActivity() {
                         }
                         return true
                     }
-                    val first = if (favorites.isEmpty()) null else withTimeoutOrNull(2_500L) { preferredCandidate.await() }
+                    val first = if (favorites.isEmpty()) null else withTimeoutOrNull(preferredWaitMs) { preferredCandidate.await() }
                     if (first != null && tryAlternative(first)) return@withTimeoutOrNull first
                     firstPlayableSource(candidates, cooledCandidates,
                         (priorityUntil - SystemClock.elapsedRealtime()).coerceAtLeast(0L), ::tryAlternative)

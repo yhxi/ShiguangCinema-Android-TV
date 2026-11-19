@@ -76,6 +76,10 @@ class Prefs(ctx: Context) {
         }
     }
 
+    internal fun awaitPendingPlaybackWrites() {
+        playbackWriter.submit {}.get()
+    }
+
     /** Migrate the old 32-bit key lazily, preserving its value type. */
     private fun stableKey(prefix: String, value: String): String {
         val digest = stableDigest(value)
@@ -971,6 +975,81 @@ class Prefs(ctx: Context) {
         set(v) = sp.edit().putLong("last_update_check", v).apply()
     /** 播放进度存在 pos:<hash> 键里，这里统计并整体清掉 */
     fun progressCount(): Int = sp.all.keys.count { it.startsWith("pos:") }
+
+    private val backupLongKey = Regex("(pos|ep|intro_end|outro_start|outro_duration|outro_remaining):(?:v2:[0-9a-f]{64}|-?[0-9]{1,10})")
+    private val backupMarksKey = Regex("skip_marks:(?:v2:[0-9a-f]{64}|-?[0-9]{1,10})")
+
+    fun exportViewingBackup(): String = synchronized(playbackLock) {
+        val playback = JSONObject()
+        sp.all.forEach { (key, value) ->
+            when {
+                backupLongKey.matches(key) && value is Long -> playback.put(key, value)
+                backupMarksKey.matches(key) && value is String -> playback.put(key, JSONObject(value))
+            }
+        }
+        JSONObject()
+            .put("format", "shiguang-cinema-viewing-backup")
+            .put("version", 1)
+            .put("history", JSONArray(history().map(::historyJson)))
+            .put("favorites", JSONArray(favorites().map(::favoriteJson)))
+            .put("sources", JSONArray(sources().map(SourceConfig::toJson)))
+            .put("playback", playback)
+            .toString()
+    }
+
+    /** Merge a backup into the active server's VOD sources and the local viewing library. */
+    fun restoreViewingBackup(text: String) = synchronized(playbackLock) {
+        val backup = JSONObject(text)
+        require(backup.optString("format") == "shiguang-cinema-viewing-backup" && backup.optInt("version") == 1) {
+            "备份格式或版本不受支持"
+        }
+        fun objects(name: String): List<JSONObject> {
+            val list = backup.getJSONArray(name)
+            return List(list.length()) { list.getJSONObject(it) }
+        }
+        val importedHistory = objects("history").onEach {
+            require(it.optString("playUrl").isNotBlank()) { "备份中的观看记录缺少播放地址" }
+        }
+        val importedFavorites = objects("favorites").onEach {
+            require(it.optString("title").isNotBlank()) { "备份中的收藏缺少片名" }
+        }
+        val importedSources = objects("sources").map {
+            requireNotNull(SourceConfig.fromJson(it)) { "备份中的点播片源缺少地址" }
+        }
+        val savedPlayback = backup.getJSONObject("playback")
+        val playbackValues = savedPlayback.keys().asSequence().associateWith { key ->
+            val value = savedPlayback.get(key)
+            when {
+                backupLongKey.matches(key) && (value is Int || value is Long) && (value as Number).toLong() >= 0 ->
+                    value.toLong()
+                backupMarksKey.matches(key) && value is JSONObject -> value.toString()
+                else -> throw IllegalArgumentException("备份中存在无效的播放记录")
+            }
+        }
+
+        val mergedHistory = (history().map(::historyJson) + importedHistory)
+            .sortedByDescending { it.optLong("updatedAt") }
+            .distinctBy {
+                val title = it.optString("seriesTitle").ifBlank { it.optString("title").substringBefore(" · 第").substringBefore("·第") }
+                normalizeSeries(title).ifBlank { it.optString("playUrl") }
+            }.take(20)
+        val mergedFavorites = (favorites().map(::favoriteJson) + importedFavorites).distinctBy { it.optString("title") }
+        val mergedSources = (importedSources + sources()).distinctBy { it.url }
+        val editor = sp.edit()
+            .putString("history", JSONArray(mergedHistory).toString())
+            .putString("favorites", JSONArray(mergedFavorites).toString())
+            .putString(scoped("sources"), JSONArray(mergedSources.map(SourceConfig::toJson)).toString())
+        val localValues = sp.all
+        playbackValues.forEach { (key, value) ->
+            if (key !in localValues) {
+                when (value) {
+                    is Long -> editor.putLong(key, value)
+                    is String -> editor.putString(key, value)
+                }
+            }
+        }
+        editor.apply()
+    }
 
     fun clearAllProgress() = synchronized(playbackLock) {
         playbackRevision++

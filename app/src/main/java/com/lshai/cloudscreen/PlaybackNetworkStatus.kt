@@ -11,3 +11,6 @@ internal fun hasActiveNetwork(context: Context): Boolean = try {
 
 internal fun nextLiveLine(currentLine: Int, lineCount: Int, online: Boolean): Int? =
     if (online && currentLine >= 0 && currentLine + 1 < lineCount) currentLine + 1 else null
+
+internal fun preferredLiveLineOrder(lineCount: Int, preferredIndex: Int): List<Int> =
+    (0 until lineCount).sortedBy { it != preferredIndex }

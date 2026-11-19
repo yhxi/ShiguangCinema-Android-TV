@@ -4,6 +4,14 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class RecoveryLogicTest {
+    @Test fun liveLinePreferenceKeepsEveryFallbackInOriginalOrder() {
+        val order = preferredLiveLineOrder(4, 2)
+        assertEquals(listOf(2, 0, 1, 3), order)
+        assertEquals(0, order[nextLiveLine(0, order.size, online = true)!!])
+        assertNull(nextLiveLine(order.lastIndex, order.size, online = true))
+        assertEquals(listOf(0, 1, 2, 3), preferredLiveLineOrder(4, -1))
+    }
+
     @Test fun defersCacheRecreationUntilAllPlayersClose() {
         val state = PlaybackCacheState()
         state.opened(); state.opened()

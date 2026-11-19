@@ -23,7 +23,9 @@ import androidx.media3.common.AudioAttributes
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.Timeline
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.analytics.AnalyticsListener
 import androidx.media3.ui.PlayerView
 import org.json.JSONArray
 import java.io.File
@@ -37,6 +39,10 @@ class LivePlayerActivity : EdgeSwipeBackActivity() {
     private var channels = emptyList<Channel>()
     private var channelLines = emptyList<List<Channel>>()
     private var lineIndex = 0
+    private var lineOrder = emptyList<Int>()
+    private var lineAttempt = 0
+    private var tuneGeneration = 0
+    private val successfulLines by lazy { getSharedPreferences("live_successful_lines", Context.MODE_PRIVATE) }
     private var index = 0
     private lateinit var banner: TextView
     private lateinit var status: TextView
@@ -140,7 +146,7 @@ class LivePlayerActivity : EdgeSwipeBackActivity() {
         action("上一台") { change(-1) }
         action("选频道") { showChannels() }
         action("下一台") { change(1) }
-        action("返回首页") { finish() }
+        action("退出直播") { finish() }
         root.addView(controls, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
             bottomMargin = dp(24)
         })
@@ -154,6 +160,17 @@ class LivePlayerActivity : EdgeSwipeBackActivity() {
             p.setAudioAttributes(AudioAttributes.DEFAULT, true)
             p.setHandleAudioBecomingNoisy(true)
             video.player = p
+            p.addAnalyticsListener(object : AnalyticsListener {
+                override fun onRenderedFirstFrame(eventTime: AnalyticsListener.EventTime, output: Any, renderTimeMs: Long) {
+                    if (eventTime.windowIndex !in 0 until eventTime.timeline.windowCount) return
+                    val rendered = eventTime.timeline.getWindow(eventTime.windowIndex, Timeline.Window()).mediaItem
+                    if (rendered.mediaId == tuneGeneration.toString()) {
+                        val line = channelLines[index][lineIndex]
+                        successfulLines.edit().putString(channelPreferenceKey(index), lineFingerprint(line)).apply()
+                        status.visibility = View.GONE
+                    }
+                }
+            })
             p.addListener(object : Player.Listener {
                 override fun onPlaybackStateChanged(playbackState: Int) {
                     handler.removeCallbacks(bufferWatchdog)
@@ -183,13 +200,19 @@ class LivePlayerActivity : EdgeSwipeBackActivity() {
     private fun advanceLiveLine(reason: String) {
         if (channels.isEmpty() || isFinishing || isDestroyed) return
         val channel = index
-        val line = lineIndex
+        val generation = tuneGeneration
         val online = hasActiveNetwork(this)
-        val next = nextLiveLine(line, channelLines[channel].size, online)
+        if (online) {
+            val key = channelPreferenceKey(channel)
+            if (successfulLines.getString(key, null) == lineFingerprint(channelLines[channel][lineIndex])) {
+                successfulLines.edit().remove(key).apply()
+            }
+        }
+        val next = nextLiveLine(lineAttempt, lineOrder.size, online)
         if (next != null) {
             status.text = "$reason，正在切换备用线路…"
             status.visibility = View.VISIBLE
-            handler.post { if (index == channel && lineIndex == line && !isFinishing) tune(channel, next) }
+            handler.post { if (tuneGeneration == generation && !isFinishing && !isDestroyed) tune(channel, next) }
         } else {
             player?.pause()
             status.text = if (!online) "网络未连接，请检查网络\n确定选频道或重试" else "当前频道的备用线路均不可用\n上下换台 · 确定选频道或重试"
@@ -198,10 +221,26 @@ class LivePlayerActivity : EdgeSwipeBackActivity() {
         }
     }
 
-    private fun tune(target: Int, line: Int = 0) {
+    private fun channelPreferenceKey(target: Int): String {
+        val channel = channels[target]
+        return stableDigest(liveChannelKey(channel.name).ifBlank { channel.url })
+    }
+
+    private fun lineFingerprint(line: Channel): String =
+        stableDigest(line.url + "\n" + line.headers.toSortedMap().entries.joinToString("\n"))
+
+    private fun tune(target: Int, attempt: Int? = null) {
         handler.removeCallbacks(bufferWatchdog)
         index = target
-        lineIndex = line.coerceIn(channelLines[index].indices)
+        tuneGeneration++
+        if (attempt == null) {
+            val preferred = successfulLines.getString(channelPreferenceKey(target), null)
+            val lines = channelLines[target]
+            val first = lines.indexOfFirst { preferred != null && lineFingerprint(it) == preferred }
+            lineOrder = preferredLiveLineOrder(lines.size, first)
+        }
+        lineAttempt = attempt ?: 0
+        lineIndex = lineOrder[lineAttempt]
         digits = ""
         handler.removeCallbacks(commitDigits)
         status.text = "正在打开 ${channels[index].name}…"
@@ -209,7 +248,7 @@ class LivePlayerActivity : EdgeSwipeBackActivity() {
         val line = channelLines[index][lineIndex]
         httpFactory.setDefaultRequestProperties(line.headers)
         player?.apply {
-            setMediaItem(MediaItem.fromUri(line.url))
+            setMediaItem(MediaItem.Builder().setUri(line.url).setMediaId(tuneGeneration.toString()).build())
             prepare()
             play()
         }

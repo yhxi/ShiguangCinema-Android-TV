@@ -7,6 +7,7 @@ import android.content.ClipData
 import android.content.res.Configuration
 import android.content.Intent
 import android.graphics.Color
+import android.graphics.Rect
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.InsetDrawable
@@ -115,7 +116,12 @@ class MainActivity : EdgeSwipeBackActivity() {
     private var updateProgressDialog: AlertDialog? = null
     private var updateProgressBar: ProgressBar? = null
     private var updateProgressText: TextView? = null
-    private var refreshHomeAfterPlayback = false
+    private var playbackOrigin: String? = null
+    private var playbackReturnFocus: View? = null
+    private var homeHistoryReturnTitle: String? = null
+    private var refreshHistoryAfterPlayback: (() -> Unit)? = null
+    private var detailOrigin = "recommend"
+    private var resultReturnState: android.os.Parcelable? = null
 
     /**
      * 按用途分槽的请求登记表。
@@ -232,6 +238,9 @@ class MainActivity : EdgeSwipeBackActivity() {
     /** 设置页是否展开「服务器连接」区块。已连接时默认收起（低频操作不占首屏） */
     private var setupShowFields = false
     private val REQ_PICK_LIVE = 1004
+    private val REQ_EXPORT_BACKUP = 1005
+    private val REQ_IMPORT_BACKUP = 1006
+    private val viewingBackupLimit = 8 * 1024 * 1024
     private val REQ_PICK_JSON = 1001
     private val REQ_STORAGE = 1002
     private val REQ_PLAYER = 1003
@@ -521,12 +530,6 @@ class MainActivity : EdgeSwipeBackActivity() {
             recommendItems = emptyList(); recommendRequested = false
             if (currentScreen == "recommend") showRecommend()
         }
-        // 只在从播放器返回时重建首页；首次 onResume 和从系统界面返回无需白画一遍。
-        if (refreshHomeAfterPlayback && ::root.isInitialized &&
-            currentScreen == "recommend" && recommendItems.isNotEmpty()) {
-            showRecommend()
-        }
-        refreshHomeAfterPlayback = false
         startHomeCoverNetworkWatch()
         if (currentScreen == "recommend") scheduleHomeMaintenance()
     }
@@ -645,7 +648,7 @@ class MainActivity : EdgeSwipeBackActivity() {
                 else if (section < 0) showChildren() else showChildrenMore(section)
             }
             "serversettings" -> showSetup()
-            "detail" -> if (childrenSearchOrigin != null && lastResults.isNotEmpty()) showResultsFromDetail() else showRecommend()
+            "detail" -> returnFromDetail()
             "live", "setup", "history" -> showRecommend()
             "live_import" -> showLive()
             "sources" -> returnFromSources()
@@ -750,6 +753,7 @@ class MainActivity : EdgeSwipeBackActivity() {
             homeMaintenanceJob?.cancel()
             homeHistoryCoverViews.clear()
         }
+        if (currentScreen != "history") refreshHistoryAfterPlayback = null
         if (currentScreen != "recommend" && currentScreen != "favorites") favoriteCheckJob?.cancel()
         if (currentScreen != "home") hotSearchJob?.cancel()
         root.removeAllViews()
@@ -766,6 +770,8 @@ class MainActivity : EdgeSwipeBackActivity() {
         if (currentScreen != "results") {
             resultsGrid = null
             resultsTitle = null
+            searchStatusView = null
+            retryFailedButton = null
         }
         if (lastRenderedScreen != null && lastRenderedScreen != currentScreen && !prefs.smoothUi) {
             // 用 withLayer() 让动画走硬件层，老盒子上比逐帧重绘稳
@@ -1735,9 +1741,58 @@ class MainActivity : EdgeSwipeBackActivity() {
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == REQ_PLAYER) {
-            childrenSearchOrigin = null
-            refreshHomeAfterPlayback = false
-            showRecommend()
+            val origin = playbackOrigin
+            val focus = playbackReturnFocus
+            val historyTitle = homeHistoryReturnTitle
+            playbackOrigin = null
+            playbackReturnFocus = null
+            homeHistoryReturnTitle = null
+            if (origin == currentScreen) {
+                val originView = root.getChildAt(0)
+                scope.launch {
+                    if (historyTitle != null || origin == "history") {
+                        withContext(Dispatchers.IO) { prefs.awaitPendingPlaybackWrites() }
+                    }
+                    if (currentScreen != origin || root.getChildAt(0) !== originView) return@launch
+                    if (origin == "recommend" && historyTitle != null) {
+                        showRecommend(historyFocusTitle = historyTitle)
+                        return@launch
+                    }
+                    if (origin == "history") refreshHistoryAfterPlayback?.invoke()
+                    focus?.post { if (focus.isAttachedToWindow && isTvDevice) focus.requestFocus() }
+                }
+            }
+            return
+        }
+        if (requestCode == REQ_EXPORT_BACKUP || requestCode == REQ_IMPORT_BACKUP) {
+            if (resultCode != RESULT_OK) return
+            val uri = data?.data ?: return
+            val backupKey = "viewing-backup"
+            val backupError: (Exception) -> Unit = { error ->
+                AlertDialog.Builder(this).setTitle("备份操作失败")
+                    .setMessage(error.message ?: "无法读写备份文件")
+                    .setPositiveButton("关闭", null).show()
+            }
+            if (requestCode == REQ_EXPORT_BACKUP) {
+                progress("导出备份…", backupKey, cancellable = false)
+                runApi(null, {
+                    val bytes = prefs.exportViewingBackup().toByteArray(Charsets.UTF_8)
+                    require(bytes.size <= viewingBackupLimit) { "备份超过 8 MB" }
+                    val output = contentResolver.openOutputStream(uri, "wt") ?: throw IOException("无法写入备份文件")
+                    output.use { it.write(bytes) }
+                }, { toast("观看备份已保存") }, quiet = true, onError = backupError, key = backupKey)
+            } else {
+                progress("恢复备份…", backupKey, cancellable = false)
+                runApi(null, {
+                    val input = contentResolver.openInputStream(uri) ?: throw IOException("无法读取备份文件")
+                    val text = input.use { readBounded(it, viewingBackupLimit) }.toString(Charsets.UTF_8)
+                    prefs.restoreViewingBackup(text)
+                }, {
+                    searchCache.clear()
+                    detailCache.clear()
+                    toast("已合并观看备份")
+                }, quiet = true, onError = backupError, key = backupKey)
+            }
             return
         }
         if (requestCode == REQ_PICK_LIVE) {
@@ -2629,6 +2684,7 @@ class MainActivity : EdgeSwipeBackActivity() {
         }
         row("setup", "切换服务端", "选择预设服务端，输入密码连接") { showServerSettings() }
         section("维护工具")
+        row("history", "观看备份", "迁移历史、收藏、点播片源、续播进度和片头片尾标记") { showViewingBackup() }
         row("history", "清理缓存", "管理本地缓存占用") { showClearCache() }
         row("search", "网络诊断", "检测连接和片源响应") {
             startActivity(Intent(this, NetDiagActivity::class.java))
@@ -2641,6 +2697,27 @@ class MainActivity : EdgeSwipeBackActivity() {
             isVerticalScrollBarEnabled = false
             addView(col)
         })
+    }
+
+    private fun showViewingBackup() {
+        AlertDialog.Builder(this).setTitle("观看备份")
+            .setMessage("备份包含观看历史、收藏、当前服务端的点播片源、进度和跳过标记。文件含播放和片源地址，请妥善保存。服务器登录密码和会话不会导出。恢复时合并到本机和当前服务端的本地点播配置。")
+            .setPositiveButton("导出备份") { _, _ -> pickViewingBackup(export = true) }
+            .setNeutralButton("恢复备份") { _, _ -> pickViewingBackup(export = false) }
+            .setNegativeButton("取消", null).show()
+    }
+
+    private fun pickViewingBackup(export: Boolean) {
+        val intent = Intent(if (export) Intent.ACTION_CREATE_DOCUMENT else Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = if (export) "application/json" else "*/*"
+            if (export) putExtra(Intent.EXTRA_TITLE, "ShiguangCinema-backup.json")
+        }
+        try {
+            startActivityForResult(intent, if (export) REQ_EXPORT_BACKUP else REQ_IMPORT_BACKUP)
+        } catch (_: android.content.ActivityNotFoundException) {
+            toast("设备缺少系统文件选择器，无法选择备份文件")
+        }
     }
 
     /** 服务器设置：只负责地址与密码，其他入口都在设置摘要页 */
@@ -3805,6 +3882,12 @@ class MainActivity : EdgeSwipeBackActivity() {
     /* ------------------------------------------------- 搜索结果（卡片网格） */
 
     private var resultGroups: List<Pair<String, List<SearchItem>>> = emptyList()
+    private var searchStatusView: TextView? = null
+    private var retryFailedButton: View? = null
+    private var searchSourceCount = 0
+    private var searchCompletedCount = 0
+    private var searchFailedUrls = emptySet<String>()
+    private var searchRetryKeyword = ""
     private data class SearchSourceCompletion(
         val source: SourceConfig,
         val result: SearchResult?,
@@ -3814,11 +3897,18 @@ class MainActivity : EdgeSwipeBackActivity() {
     /** 一批搜索进度：已合并的结果 + 进度计数，用来边搜边显示 */
     private data class SearchProgress(
         val items: List<SearchItem>,
-        val failures: Int,
         val done: Int,
-        val total: Int,
-        val retrying: Int = 0,
     )
+
+    private fun updateSearchStatus() {
+        searchStatusView?.text = when {
+            searchInProgress -> "已完成 $searchCompletedCount / $searchSourceCount 个片源"
+            searchFailedUrls.isNotEmpty() -> "$searchSourceCount 个片源中 ${searchFailedUrls.size} 个无响应"
+            resultGroups.isEmpty() -> "没有找到匹配作品"
+            else -> "已查询 $searchSourceCount 个片源"
+        }
+        retryFailedButton?.visibility = if (!searchInProgress && searchFailedUrls.isNotEmpty()) View.VISIBLE else View.GONE
+    }
 
     /**
      * 搜索结果按网页版的样子展示：封面 + 标题 + 类型/年份/备注 + 来源数。
@@ -3829,7 +3919,7 @@ class MainActivity : EdgeSwipeBackActivity() {
      *   用户正在往下翻的时候会被拽回第一条 —— 电视上尤其难受。
      *   （已经在结果页上的增量刷新走 [updateResultsInPlace]，不会重建整页。）
      */
-    private fun showResults(keepSelection: Boolean = false) {
+    private fun showResults(keepSelection: Boolean = false, fromDetail: Boolean = false) {
         currentScreen = "results"
         val prevGrid = resultsGrid
         // 只有「上一版结果页还挂在窗口上」才值得沿用选中项，否则索引会指到别的列表
@@ -3845,7 +3935,7 @@ class MainActivity : EdgeSwipeBackActivity() {
         } else {
             null
         }
-        val visibleCount = applyResultsData()
+        val visibleCount = applyResultsData(preserveOrder = fromDetail)
 
         val col = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -3872,6 +3962,12 @@ class MainActivity : EdgeSwipeBackActivity() {
         })
         bar.addView(button("重新搜索") { showHome() })
         col.addView(hScroll(bar))
+        val statusRow = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+        searchStatusView = hintText("").also { statusRow.addView(it, LinearLayout.LayoutParams(0, -2, 1f)) }
+        retryFailedButton = button("重试失败源") { doSearch(lastSearchKeyword, retryFailed = true) }
+            .also { statusRow.addView(it) }
+        col.addView(statusRow)
+        updateSearchStatus()
         if (sourceFilter.isNotEmpty()) {
             col.addView(hintText("当前只看：$sourceFilter（$(${resultGroups.size}) 部）"))
         }
@@ -3910,7 +4006,15 @@ class MainActivity : EdgeSwipeBackActivity() {
             ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
 
         resultsGrid = grid
-        setScreen(col, focusFirst = !gridHadFocus && prevFocusLabel == null)
+        setScreen(col, focusFirst = !gridHadFocus && prevFocusLabel == null && !(fromDetail && isTvDevice))
+        if (fromDetail) {
+            val saved = resultReturnState
+            resultReturnState = null
+            val position = resultGroups.indexOfFirst { it.first == selectedResultTitle }
+            if (isTvDevice) grid.requestFocus()
+            if (saved != null && (!isTvDevice || position >= 0)) grid.onRestoreInstanceState(saved)
+            else if (position >= 0) grid.setSelection(position)
+        }
         if (prevFocusLabel != null) {
             // 布局完成后再找，此时新工具条才真正建好
             col.post { findButtonByText(col, prevFocusLabel)?.requestFocus() }
@@ -3971,6 +4075,7 @@ class MainActivity : EdgeSwipeBackActivity() {
             if (position != null) grid.setSelection(position)
         }
         resultsTitle?.text = "${resultGroups.size} 部 · $visibleCount 条结果"
+        updateSearchStatus()
         return true
     }
 
@@ -4501,9 +4606,9 @@ class MainActivity : EdgeSwipeBackActivity() {
         }
     }
 
-    private fun doSearch(keyword: String) {
+    private fun doSearch(keyword: String, retryFailed: Boolean = false) {
         if (currentScreen == "children") childrenOverviewScrollY = childrenOverviewScroll?.scrollY ?: childrenOverviewScrollY
-        childrenSearchOrigin = when (currentScreen) {
+        if (!retryFailed) childrenSearchOrigin = when (currentScreen) {
             "children" -> -1
             "children_more" -> childrenSectionIndex
             else -> null
@@ -4514,7 +4619,7 @@ class MainActivity : EdgeSwipeBackActivity() {
         val kw = keyword.trim()
         if (kw.isEmpty()) { toast("请输入片名"); return }
         // 只搜「已启用」的源：停用的源不该再被请求，也不该出现在缓存键里
-        val enabledSources = prefs.sources().filter { it.enabled }
+        val enabledSources = prefs.sources().filter { it.enabled }.distinctBy { it.url }
         if (enabledSources.isEmpty()) {
             lastSearchKeyword = kw
             if (childrenSearchOrigin != null) showChildrenEmpty(kw, "当前没有启用的片源。")
@@ -4522,7 +4627,21 @@ class MainActivity : EdgeSwipeBackActivity() {
             return
         }
         // 全部启用源一起搜索；优先展示已完成源的结果，慢源在后台继续补齐。
-        val sources = enabledSources
+        val sources = if (retryFailed) enabledSources.filter { it.url in searchFailedUrls } else enabledSources
+        if (sources.isEmpty()) {
+            toast("失败片源已停用")
+            return
+        }
+        val previousItems = if (retryFailed) lastResults else emptyList()
+        val previousFailures = if (retryFailed) searchFailedUrls - sources.map { it.url }.toSet() else emptySet()
+        val effectiveKeyword = if (retryFailed) searchRetryKeyword.ifBlank { kw } else kw
+        if (!retryFailed) {
+            searchSourceCount = sources.size
+            searchFailedUrls = emptySet()
+            searchRetryKeyword = kw
+        }
+        val alreadyCompleted = searchSourceCount - sources.size
+        searchCompletedCount = alreadyCompleted
         searchConnections?.cancel()
         val requestConnections = SearchConnections().also { searchConnections = it }
         val token = ++searchToken
@@ -4537,7 +4656,11 @@ class MainActivity : EdgeSwipeBackActivity() {
         homeSuppressSuggest = true
         if (currentScreen == "home") refreshSearchBody()
         searchInProgress = true
-        sourceFilter = ""
+        if (!retryFailed) sourceFilter = ""
+        if (retryFailed) {
+            if (retryFailedButton?.hasFocus() == true) resultsGrid?.requestFocus()
+            updateSearchStatus()
+        }
         // 记下发起搜索时所在的界面世代：只有「还停在这个页面」或「本次搜索已经画出的结果页」
         // 才允许改界面，用户中途去了别处就不再回跳（哪怕后来又回到同一个页面）。
         searchOriginEpoch = screenEpoch
@@ -4545,11 +4668,12 @@ class MainActivity : EdgeSwipeBackActivity() {
         // 搜一次要服务端把每个采集站都问一遍，十几秒很正常。
         // 刚搜过的关键词（3 分钟内、源的集合没变）直接复用结果 —— 看完一部点返回再搜同一部是常见动作。
         val cacheKey = prefs.serverUrl + "|" + kw + "|" + sources.joinToString(",") { it.url }
-        searchCache[cacheKey]?.let { (at, items) ->
+        searchCache[cacheKey]?.takeUnless { retryFailed }?.let { (at, items) ->
             if (System.currentTimeMillis() - at < SEARCH_CACHE_MS) {
                 prefs.addSearchHistory(kw)
                 lastResults = items
                 searchInProgress = false
+                searchCompletedCount = searchSourceCount
                 if (items.isEmpty() && childrenSearchOrigin != null) showChildrenEmpty(kw, "") else showResults()
                 return
             }
@@ -4561,12 +4685,14 @@ class MainActivity : EdgeSwipeBackActivity() {
             // 回调来自工作线程，回到主线程再动界面
             scope.launch {
                 if (token != searchToken) return@launch
-                if (progress.items.isEmpty()) return@launch
                 if (screenEpoch != searchOriginEpoch && screenEpoch != searchResultsEpoch) return@launch
+                searchCompletedCount = alreadyCompleted + progress.done
+                updateSearchStatus()
+                if (progress.items.isEmpty()) return@launch
                 val now = android.os.SystemClock.elapsedRealtime()
                 if (now - lastRenderAt < PARTIAL_RENDER_INTERVAL_MS) return@launch
                 lastRenderAt = now
-                lastResults = progress.items
+                lastResults = (previousItems + progress.items).distinctBy { it.sourceUrl to it.vodId }
                 searchInProgress = true
                 // 已经在结果页上就只刷数据；还没进结果页（首批结果）才建整页
                 if (!updateResultsInPlace()) showResults(keepSelection = true)
@@ -4576,26 +4702,29 @@ class MainActivity : EdgeSwipeBackActivity() {
         }
         runApiK("search", null, {
             val first = directThenServerSearch(
-                kw, sources, requests = requestConnections, shouldContinue = { token == searchToken }, onPartial = onPartial,
+                effectiveKeyword, sources, requests = requestConnections, shouldContinue = { token == searchToken }, onPartial = onPartial,
             )
             // 兜底：豆瓣条目常带「（2023）」「：副标题」这类噪声，采集站匹配不到时再试一次干净片名
-            if (first.items.isNotEmpty()) {
-                first
+            if (retryFailed || first.items.isNotEmpty()) {
+                effectiveKeyword to first
             } else {
                 val cleaned = cleanKeyword(kw)
                 if (cleaned.isNotEmpty() && cleaned != kw) {
-                    directThenServerSearch(
+                    cleaned to directThenServerSearch(
                         cleaned, sources, requests = requestConnections, shouldContinue = { token == searchToken }, onPartial = onPartial,
                     )
                 } else {
-                    first
+                    kw to first
                 }
             }
-        }, { result ->
+        }, { (queriedKeyword, result) ->
             if (token != searchToken) return@runApiK
             searchInProgress = false
             prefs.addSearchHistory(kw)
-            if (shouldCacheSearchResult(result.items.size, result.failures)) {
+            searchRetryKeyword = queriedKeyword
+            searchFailedUrls = previousFailures + result.failedSourceUrls
+            searchCompletedCount = searchSourceCount
+            if (!retryFailed && searchFailedUrls.isEmpty() && shouldCacheSearchResult(result.items.size, result.failures)) {
                 searchCache[cacheKey] = System.currentTimeMillis() to result.items
             }
             if (searchCache.size > 20) {
@@ -4603,30 +4732,23 @@ class MainActivity : EdgeSwipeBackActivity() {
                 searchCache.entries.sortedBy { it.value.first }.take(searchCache.size - 20)
                     .forEach { searchCache.remove(it.key) }
             }
-            lastResults = result.items
+            lastResults = (previousItems + result.items).distinctBy { it.sourceUrl to it.vodId }
             // 用户已经离开搜索/结果页（去了设置、详情、推荐…）：结果留着，但不要把人拽回来
             if (screenEpoch != searchOriginEpoch && screenEpoch != searchResultsEpoch) return@runApiK
-            val failedNote = if (result.failures > 0) "（${result.failures} 个源无响应）" else ""
-            if (result.items.isEmpty()) {
-                if (childrenSearchOrigin != null) showChildrenEmpty(kw, failedNote)
-                else {
-                    showHome(clearKeyword = false)
-                    val message = if (result.failures >= sources.size) "片源暂时无响应，请检查网络或片源。"
-                        else if (result.failures > 0) "暂未找到结果；部分片源无响应。"
-                        else "没有找到匹配的作品，可以换个片名再试。"
-                    AlertDialog.Builder(this).setTitle("搜索未找到结果").setMessage(message)
-                        .setPositiveButton("重试") { _, _ -> doSearch(kw) }
-                        .setNeutralButton("片源管理") { _, _ -> showSources() }
-                        .setNegativeButton("返回", null).show()
-                }
+            if (lastResults.isEmpty() && searchFailedUrls.isEmpty() && childrenSearchOrigin != null) {
+                showChildrenEmpty(kw, "")
             } else {
                 // 已经停在结果页就原地收尾，不重建整页（会打断滚动与焦点）
                 if (!updateResultsInPlace()) showResults()
             }
-        }, onError = {
+        }, quiet = true, onError = {
             if (token != searchToken) return@runApiK
             searchInProgress = false
-            if (currentScreen == "results") showResults()
+            searchFailedUrls = previousFailures + sources.map { it.url }
+            lastResults = previousItems
+            if (screenEpoch == searchOriginEpoch || screenEpoch == searchResultsEpoch) {
+                if (!updateResultsInPlace()) showResults()
+            }
         })
     }
 
@@ -4655,10 +4777,9 @@ class MainActivity : EdgeSwipeBackActivity() {
         val items = ArrayList<SearchItem>()
         val failed = ArrayList<SourceConfig>()
         var done = 0
-        var failures = 0
-        fun snapshot() = SearchResult(items.distinctBy { it.sourceUrl + "|" + it.vodId }, failures)
-        fun emit(retrying: Int = 0) =
-            onPartial(SearchProgress(snapshot().items, failures, done, total, retrying))
+        val failedUrls = mutableSetOf<String>()
+        fun snapshot() = SearchResult(items.distinctBy { it.sourceUrl + "|" + it.vodId }, failedUrls.size, failedUrls.toSet())
+        fun emit() = onPartial(SearchProgress(snapshot().items, done))
 
         // 完成的任务都往同一个队列里放，主循环只管按「谁先完成谁先算」取，
         // 这样两个线程池的结果能合并成一条时间线。
@@ -4700,19 +4821,13 @@ class MainActivity : EdgeSwipeBackActivity() {
             for (i in 0 until total) {
                 if (!shouldContinue()) return snapshot()
                 val completion = awaitCompletion() ?: return snapshot()
-                done++
                 val result = completion.result
-                if (result == null) {
-                    // 直连失败留到下面回退服务端；服务端自己也失败才算真的失败
-                    if (completion.direct) failed.add(completion.source) else failures++
+                if (completion.direct && (result == null || result.items.isEmpty())) {
+                    failed.add(completion.source)
                 } else {
-                    failures += result.failures
-                    if (result.items.isNotEmpty()) {
-                        items.addAll(result.items)
-                    } else if (completion.direct) {
-                        // 直连「成功但没结果」多半是采集站对直连限流/降级，交给服务端再问一次
-                        failed.add(completion.source)
-                    }
+                    done++
+                    if (result == null || result.failures > 0) failedUrls.add(completion.source.url)
+                    if (result != null) items.addAll(result.items)
                 }
                 emit()
             }
@@ -4729,13 +4844,10 @@ class MainActivity : EdgeSwipeBackActivity() {
                     if (!shouldContinue()) return snapshot()
                     val completion = awaitCompletion() ?: return snapshot()
                     val result = completion.result
-                    if (result == null) {
-                        failures++
-                    } else {
-                        failures += result.failures
-                        if (result.items.isNotEmpty()) items.addAll(result.items)
-                    }
-                    emit(retrying = pending - i - 1)
+                    done++
+                    if (result == null || result.failures > 0) failedUrls.add(completion.source.url)
+                    if (result != null) items.addAll(result.items)
+                    emit()
                 }
             }
             return snapshot()
@@ -4777,7 +4889,11 @@ class MainActivity : EdgeSwipeBackActivity() {
      * 现在失败时把同片名的其他源列出来让用户点。
      */
     private fun openDetail(item: SearchItem) {
-        if (currentScreen == "results") selectedResultTitle = item.name
+        if (currentScreen != "detail") detailOrigin = currentScreen
+        if (currentScreen == "results") {
+            selectedResultTitle = item.name
+            resultReturnState = resultsGrid?.onSaveInstanceState()
+        }
         // 详情页返回列表、再点进同一部剧（或者来回换源比较）是常见动作，
         // 而每开一次都要一次跨境请求（1~2 秒）。5 分钟内的同一部剧直接复用。
         val cacheKey = item.vodId + "|" + item.sourceUrl
@@ -4839,8 +4955,8 @@ class MainActivity : EdgeSwipeBackActivity() {
         }
         // 详情页以前只有 BACK 键能回去，遥控器用户进来就「出不去」了
         col.addView(topBar())
-        if (childrenSearchOrigin != null && lastResults.isNotEmpty()) {
-            col.addView(button("← 返回搜索结果") { showResultsFromDetail() })
+        if (detailOrigin == "results") {
+            col.addView(button("← 返回搜索结果") { returnFromDetail() })
         }
         // 手机只在封面旁放标题和摘要；长文本放到下方，避免把选集列表挤出屏幕。
         val header = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
@@ -5082,6 +5198,7 @@ class MainActivity : EdgeSwipeBackActivity() {
             sourceUrl = h.sourceUrl,
             sourceName = h.sourceName,
             historyEpisodeIndex = h.episodeIndex,
+            historyReturnTitle = historyTitle(h),
         )
     }
 
@@ -5097,6 +5214,7 @@ class MainActivity : EdgeSwipeBackActivity() {
         sourceName: String = "",
         episodeNumbers: IntArray = IntArray(0),
         historyEpisodeIndex: Int = -1,
+        historyReturnTitle: String? = null,
     ) {
         if (urls.isEmpty()) return
         val child = currentScreen == "children" || currentScreen == "children_more" || childrenSearchOrigin != null || ChildrenQuota.isChild(this, seriesName.ifEmpty { title })
@@ -5104,12 +5222,14 @@ class MainActivity : EdgeSwipeBackActivity() {
             ChildrenQuota.mark(this, seriesName.ifEmpty { title })
             if (ChildrenQuota.remaining(this) <= 0L) {
                 ChildrenQuota.locked(this) {
-                    playFromList(urls, index, title, cover, seriesName, vodId, sourceUrl, sourceName, episodeNumbers, historyEpisodeIndex)
+                    playFromList(urls, index, title, cover, seriesName, vodId, sourceUrl, sourceName, episodeNumbers, historyEpisodeIndex, historyReturnTitle)
                 }
                 return
             }
         }
-        refreshHomeAfterPlayback = true
+        playbackOrigin = currentScreen
+        playbackReturnFocus = root.findFocus()
+        homeHistoryReturnTitle = historyReturnTitle.takeIf { currentScreen == "recommend" }
         startActivityForResult(Intent(this, PlayerActivity::class.java).apply {
             putStringArrayListExtra(PlayerActivity.EXTRA_URLS, ArrayList(urls))
             putExtra(PlayerActivity.EXTRA_INDEX, index.coerceIn(0, urls.size - 1))
@@ -5233,6 +5353,8 @@ class MainActivity : EdgeSwipeBackActivity() {
             file.writeText(json.toString(), Charsets.UTF_8)
             file.name
         }, { name ->
+            playbackOrigin = currentScreen
+            playbackReturnFocus = root.findFocus()
             startActivityForResult(Intent(this, LivePlayerActivity::class.java).apply {
                 putExtra("playlist_file", name)
                 putExtra("channel_index", index)
@@ -5582,6 +5704,15 @@ class MainActivity : EdgeSwipeBackActivity() {
                         (grid.adapter as? BaseAdapter)?.notifyDataSetChanged()
                     }
                 }
+            }
+            refreshHistoryAfterPlayback = {
+                val updated = prefs.history().associateBy { normalizeSeries(it.seriesTitle.ifEmpty { historyTitle(it) }) }
+                for (i in items2.indices) {
+                    val previous = items2[i]
+                    val key = normalizeSeries(previous.seriesTitle.ifEmpty { historyTitle(previous) })
+                    updated[key]?.let { items2[i] = it }
+                }
+                (grid.adapter as? BaseAdapter)?.notifyDataSetChanged()
             }
             grid.setOnItemClickListener { _, _, pos, _ ->
                 items2.getOrNull(pos)?.let { playFromHistory(it) }
@@ -6106,6 +6237,7 @@ class MainActivity : EdgeSwipeBackActivity() {
                 setPadding(0, dp(7), 0, 0)
             })
             card.addView(detail, LinearLayout.LayoutParams(0, contentHeight, 1f))
+            card.tag = "history:${historyTitle(h)}"
             card.contentDescription = "${historyTitle(h)}，继续播放，长按管理"
             if (!isTvDevice) {
                 card.addView(TextView(this).apply {
@@ -6384,13 +6516,14 @@ class MainActivity : EdgeSwipeBackActivity() {
         if (section == null || section < 0) showChildren() else showChildrenMore(section)
     }
 
-    private fun showResultsFromDetail() {
-        val title = selectedResultTitle
-        showResults()
-        val position = resultGroups.indexOfFirst { it.first == title }
-        resultsGrid?.post {
-            if (position >= 0) resultsGrid?.setSelection(position)
-            resultsGrid?.requestFocus()
+    private fun returnFromDetail() {
+        when (detailOrigin) {
+            "results" -> showResults(fromDetail = true)
+            "history" -> showHistoryCards()
+            "favorites" -> showFavorites()
+            "children" -> showChildren()
+            "children_more" -> showChildrenMore(childrenSectionIndex)
+            else -> showRecommend()
         }
     }
 
@@ -7033,7 +7166,11 @@ class MainActivity : EdgeSwipeBackActivity() {
         }
         col.addView(childrenHeader("儿童乐园") { showRecommend() })
         col.addView(button("${ChildrenQuota.label(this)} · 家长设置 / 加时") {
-            ChildrenQuota.parent(this) { showChildren() }
+            ChildrenQuota.parent(this) {
+                if (currentScreen == "children") {
+                    quotaLabelView?.text = "${ChildrenQuota.label(this)} · 家长设置 / 加时"
+                }
+            }
         }.also { quotaLabelView = it })
         var firstCard: View? = null
         val focusViews = mutableMapOf<String, View>()
@@ -7411,7 +7548,7 @@ class MainActivity : EdgeSwipeBackActivity() {
         parent.addView(feature, LinearLayout.LayoutParams(-1, height).apply { topMargin = dp(if (isTvDevice) 14 else 8); bottomMargin = dp(4) })
     }
 
-    private fun showRecommend() {
+    private fun showRecommend(historyFocusTitle: String? = null) {
         currentScreen = "recommend"
         scheduleRecommendRetry()
         childrenSearchOrigin = null
@@ -7581,7 +7718,7 @@ class MainActivity : EdgeSwipeBackActivity() {
             col.addView(hintText("正在整理最新热门推荐…"))
         }
 
-        showRecommendFeed(col)
+        showRecommendFeed(col, historyFocusTitle)
     }
 
     /**
@@ -7592,14 +7729,15 @@ class MainActivity : EdgeSwipeBackActivity() {
      *   · 只渲染可见行，滚到两三百条也不会把全部行都 measure 一遍；
      *   · 触底自动续加载用 LayoutManager 的可见位置判断，不再靠算 content.height。
      */
-    private fun showRecommendFeed(header: LinearLayout) {
+    private fun showRecommendFeed(header: LinearLayout, historyFocusTitle: String?) {
         // 手机端没有 GridView，清掉引用免得 loadRecommend 去同步一个不存在的高度
         homeGrid = null
         homeScroll = null
         val columns = if (isTvDevice) 6 else 2
         val restorePosition = homeRvPosition
         val restoreOffset = homeRvOffset
-        val restoreTitle = homeFocusedTitle
+        val historyFocus = historyFocusTitle?.let { header.findViewWithTag<View>("history:$it") }?.takeIf { isTvDevice }
+        val restoreTitle = homeFocusedTitle.takeIf { historyFocus == null }
         val restoreTitlePosition = restoreTitle?.let { title -> recommendItems.indexOfFirst { it.title == title } + 1 } ?: 0
         homeLastHeaderFocus = null
         val rv = RecyclerView(this).apply {
@@ -7674,6 +7812,15 @@ class MainActivity : EdgeSwipeBackActivity() {
                 }
             }
         }
+        if (historyFocus != null) rv.addOnLayoutChangeListener(object : View.OnLayoutChangeListener {
+            override fun onLayoutChange(v: View, left: Int, top: Int, right: Int, bottom: Int, oldLeft: Int, oldTop: Int, oldRight: Int, oldBottom: Int) {
+                rv.removeOnLayoutChangeListener(this)
+                if (historyFocus.isAttachedToWindow && currentScreen == "recommend") {
+                    historyFocus.requestFocus()
+                    historyFocus.requestRectangleOnScreen(Rect(0, 0, historyFocus.width, historyFocus.height), true)
+                }
+            }
+        })
         scheduleHomeMaintenance()
     }
 
