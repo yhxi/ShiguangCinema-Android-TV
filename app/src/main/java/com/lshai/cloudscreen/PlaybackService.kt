@@ -24,6 +24,9 @@ internal object BackgroundPlayback {
     var token = ""
     var returnIntent: Intent? = null
     var urls: List<String> = emptyList()
+    var episodeIndexes = IntArray(0)
+    var year = ""
+    var typeName = ""
     var title = ""
     var series = ""
     var vodId = ""
@@ -65,13 +68,15 @@ internal object BackgroundPlayback {
         val index = p.currentMediaItemIndex
         val url = urls.getOrNull(index) ?: return
         val position = p.currentPosition
+        val episode = episodeIndexes.getOrElse(index) { -1 }
         val entry = if (position > 5000) HistoryEntry(
-            title = if (urls.size > 1) "$series · 第 ${index + 1}/${urls.size} 集" else title,
+            title = if (urls.size > 1 && episode >= 0) "$series · 第 ${episode + 1} 集" else title,
             playUrl = url, positionMs = position, durationMs = p.duration.coerceAtLeast(0),
             updatedAt = System.currentTimeMillis(), cover = cover, seriesTitle = series,
-            vodId = vodId, sourceUrl = sourceUrl, sourceName = sourceName, episodeIndex = index,
+            vodId = vodId, sourceUrl = sourceUrl, sourceName = sourceName, episodeIndex = episode,
+            year = year, typeName = typeName,
         ) else null
-        Prefs(context).savePlaybackSnapshot(url, series, index, position, entry)
+        Prefs(context).savePlaybackSnapshot(url, workProgressSeries(series, year), episode, position, entry)
     }
 }
 

@@ -2,8 +2,21 @@ package com.lshai.cloudscreen
 
 import org.junit.Assert.*
 import org.junit.Test
+import org.json.JSONObject
 
 class RecoveryLogicTest {
+    @Test fun viewingBackupSelectsNewestRecordAndKeepsRemakesSeparate() {
+        fun entry(url: String, year: String, position: Long, updated: Long) = JSONObject()
+            .put("playUrl", url).put("seriesTitle", "同名作品").put("year", year)
+            .put("positionMs", position).put("updatedAt", updated)
+        val local = entry("https://a.example/12", "2000", 720_000, 100)
+        val imported = entry("https://a.example/12", "2000", 2_520_000, 200)
+        val remake = entry("https://a.example/remake", "2020", 90_000, 50)
+        assertEquals(listOf(imported, remake), mergeViewingHistory(listOf(local, remake), listOf(imported)))
+        assertEquals(2_520_000L, mergeViewingHistory(listOf(local), listOf(imported)).single().getLong("positionMs"))
+        assertEquals(listOf(imported), mergeViewingHistory(listOf(imported), listOf(local)))
+    }
+
     @Test fun liveLinePreferenceKeepsEveryFallbackInOriginalOrder() {
         val order = preferredLiveLineOrder(4, 2)
         assertEquals(listOf(2, 0, 1, 3), order)

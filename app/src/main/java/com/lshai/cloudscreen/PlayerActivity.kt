@@ -105,6 +105,9 @@ class PlayerActivity : EdgeSwipeBackActivity() {
         const val EXTRA_SOURCE_URL = "source_url"
         const val EXTRA_SOURCE_NAME = "source_name"
         const val EXTRA_HISTORY_EPISODE_INDEX = "history_episode_index"
+        const val EXTRA_FROM_HISTORY = "from_history"
+        const val EXTRA_WORK_YEAR = "work_year"
+        const val EXTRA_WORK_TYPE = "work_type"
         const val EXTRA_EPISODE_NUMBERS = "episode_numbers"
         const val EXTRA_CHILD_TIMER = "child_timer_minutes"
         const val CMD_TOGGLE = "toggle"
@@ -176,6 +179,9 @@ class PlayerActivity : EdgeSwipeBackActivity() {
 
     private var urls: List<String> = emptyList()
     private var episodeNumbers = IntArray(0)
+    private var historyOnly = false
+    private var workYear = ""
+    private var workType = ""
 
     /**
      * 上一次 [buildMediaItems] 的结果：万集长剧重建一次要读几万次 SharedPreferences，
@@ -454,6 +460,9 @@ class PlayerActivity : EdgeSwipeBackActivity() {
         urls = intent.getStringArrayListExtra(EXTRA_URLS)?.toList().orEmpty()
         if (adoptedPlayer != null) urls = BackgroundPlayback.urls
         episodeNumbers = intent.getIntArrayExtra(EXTRA_EPISODE_NUMBERS) ?: IntArray(0)
+        historyOnly = intent.getBooleanExtra(EXTRA_FROM_HISTORY, false) && urls.size == 1
+        workYear = intent.getStringExtra(EXTRA_WORK_YEAR).orEmpty()
+        workType = intent.getStringExtra(EXTRA_WORK_TYPE).orEmpty()
         currentIndex = intent.getIntExtra(EXTRA_INDEX, 0).coerceIn(0, (urls.size - 1).coerceAtLeast(0))
         adoptedPlayer?.let { currentIndex = it.currentMediaItemIndex.coerceIn(0, (urls.size - 1).coerceAtLeast(0)) }
         singleLabel = intent.getStringExtra(EXTRA_TITLE).orEmpty()
@@ -1350,8 +1359,13 @@ class PlayerActivity : EdgeSwipeBackActivity() {
         if (!prefs.resumeEnabled) return 0L
         val byUrl = prefs.progressOf(url)
         if (byUrl > 0L) return byUrl
-        return prefs.episodeProgressOf(skipKey(), index)
+        return prefs.episodeProgressOf(workProgressSeries(skipKey(), workYear), savedEpisodeIndex(index))
     }
+
+    private fun savedEpisodeIndex(index: Int): Int = playbackEpisodeIndex(
+        index, episodeNumbers.getOrElse(index) { 0 }, historyOnly,
+        intent.getIntExtra(EXTRA_HISTORY_EPISODE_INDEX, -1), singleLabel,
+    )
 
     /**
      * 起播 / 切集后自动跳片头。
@@ -2539,9 +2553,14 @@ class PlayerActivity : EdgeSwipeBackActivity() {
         BackgroundPlayback.sourceUrl = sourceUrl
         BackgroundPlayback.sourceName = sourceName
         BackgroundPlayback.cover = coverUrl
+        BackgroundPlayback.episodeIndexes = IntArray(urls.size, ::savedEpisodeIndex)
+        BackgroundPlayback.year = workYear
+        BackgroundPlayback.typeName = workType
         BackgroundPlayback.returnIntent = Intent(intent).setClass(this, PlayerActivity::class.java)
             .putStringArrayListExtra(EXTRA_URLS, ArrayList(urls))
             .putExtra(EXTRA_INDEX, p.currentMediaItemIndex)
+            .putExtra(EXTRA_FROM_HISTORY, historyOnly)
+            .putExtra(EXTRA_EPISODE_NUMBERS, episodeNumbers)
             .putExtra(BackgroundPlayback.SESSION_EXTRA, BackgroundPlayback.token)
             .addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or Intent.FLAG_ACTIVITY_SINGLE_TOP)
     }
@@ -2989,7 +3008,9 @@ class PlayerActivity : EdgeSwipeBackActivity() {
     private class EpisodeCandidate(val vodId: String, val conf: SourceConfig, val label: String)
 
     /** 查到的一份分集列表：current = 当前播放地址在里面的下标 */
-    private class EpisodeList(val episodes: List<String>, val current: Int, val cand: EpisodeCandidate)
+    private class EpisodeList(val detail: Detail, val current: Int, val cand: EpisodeCandidate) {
+        val episodes get() = detail.episodes
+    }
 
     /** 详情：能直连就直连，拿不到再回退服务端 —— 选集回查也走这条，比绕服务端快 */
     private fun detailOf(id: String, conf: SourceConfig, api: Api): Detail {
@@ -3028,6 +3049,7 @@ class PlayerActivity : EdgeSwipeBackActivity() {
                 adoptSeriesList(
                     cached.urls, idx, vodId, conf,
                     keepPosition = true, inPlace = true, quiet = silent,
+                    labels = cached.labels,
                 )
                 onDone(true)
                 refreshEpisodesInBackground(server, conf, vodId, playing, cached)
@@ -3040,7 +3062,8 @@ class PlayerActivity : EdgeSwipeBackActivity() {
             val api = Api(prefs.serverUrl.ifEmpty { BuildConfig.DEFAULT_URL })
                 .apply { restoreCookie(prefs.cookie) }
             val sources = prefs.sources()
-            val enabled = sources.filter { it.enabled }
+            val child = intent.getBooleanExtra("children_daily_content", false)
+            val enabled = enabledSearchSources(sources, child)
             fun confOf(url: String, fallbackName: String): SourceConfig =
                 sources.firstOrNull { it.url == url } ?: SourceConfig(fallbackName, url)
 
@@ -3053,14 +3076,16 @@ class PlayerActivity : EdgeSwipeBackActivity() {
             var near: EpisodeList? = null       // 只是同名且集数够：换源要问用户
             if (vodId.isNotEmpty() && sourceUrl.isNotEmpty()) {
                 val conf = confOf(sourceUrl, sourceName.ifEmpty { "已知源" })
-                val eps = runCatching { detailOf(vodId, conf, api).episodes }.getOrDefault(emptyList())
-                if (eps.size > 1) cache.put(server, conf.url, vodId, eps)
+                val detail = runCatching { detailOf(vodId, conf, api) }.getOrNull()
+                val eps = detail?.episodes.orEmpty()
+                if (eps.size > 1) cache.put(server, conf.url, vodId, eps, detail?.episodeLabels.orEmpty())
                 val i = eps.indexOfFirst { it == playing }
                 if (i >= 0) {
                     runOnUiThread {
                         resolvingEpisodes = false
                         val stillCurrent = !isFinishing && !isDestroyed && sourceSwitchJob == null && currentUrl() == playing
-                        if (stillCurrent) adoptSeriesList(eps, i, vodId, conf, keepPosition = true, inPlace = silent)
+                        if (stillCurrent) adoptSeriesList(eps, i, vodId, conf, keepPosition = true,
+                            inPlace = silent, labels = detail?.episodeLabels.orEmpty())
                         onDone(stillCurrent)
                         if (pendingEpisodeCallbacks.isNotEmpty()) {
                             val waiting = pendingEpisodeCallbacks.toList()
@@ -3070,8 +3095,8 @@ class PlayerActivity : EdgeSwipeBackActivity() {
                     }
                     return@Thread
                 }
-                if (eps.isNotEmpty() && epNo > 0 && eps.size >= epNo) {
-                    near = EpisodeList(eps, epNo - 1, EpisodeCandidate(vodId, conf, "已知源"))
+                if (detail != null && epNo > 0) matchingSourceEpisode(detail, epNo)?.let {
+                    near = EpisodeList(detail, it, EpisodeCandidate(vodId, conf, "已知源"))
                 }
             }
 
@@ -3083,7 +3108,7 @@ class PlayerActivity : EdgeSwipeBackActivity() {
             }
             if (name.isNotEmpty() && enabled.isNotEmpty()) {
                 val hits = runCatching { api.search(name, enabled) }.getOrNull()?.items.orEmpty()
-                hits.filter { it.name.trim() == name }
+                hits.filter { workMatch(name, workYear, workType, it) != WorkMatch.DIFFERENT }
                     .distinctBy { it.sourceUrl }
                     .take(5)
                     .forEach { h ->
@@ -3096,17 +3121,18 @@ class PlayerActivity : EdgeSwipeBackActivity() {
             }
 
             for (c in candidates) {
-                val eps = runCatching { detailOf(c.vodId, c.conf, api).episodes }.getOrDefault(emptyList())
+                val detail = runCatching { detailOf(c.vodId, c.conf, api) }.getOrNull() ?: continue
+                val eps = detail.episodes
                 if (eps.isEmpty()) continue
-                if (eps.size > 1) cache.put(server, c.conf.url, c.vodId, eps)
+                if (eps.size > 1) cache.put(server, c.conf.url, c.vodId, eps, detail.episodeLabels)
                 val i = eps.indexOfFirst { it == playing }
                 if (i >= 0) {
-                    hit = EpisodeList(eps, i, c)
+                    hit = EpisodeList(detail, i, c)
                     break                       // 精确命中，立刻停手
                 }
                 // 没命中：只有"集数装得下当前集号"的源，才可能是同一部剧
-                if (near == null && epNo > 0 && eps.size >= epNo) {
-                    near = EpisodeList(eps, epNo - 1, c)
+                if (near == null && epNo > 0) matchingSourceEpisode(detail, epNo)?.let {
+                    near = EpisodeList(detail, it, c)
                 }
             }
 
@@ -3122,6 +3148,7 @@ class PlayerActivity : EdgeSwipeBackActivity() {
                             exact.episodes, exact.current, exact.cand.vodId, exact.cand.conf,
                             keepPosition = true,
                             inPlace = silent,
+                            labels = exact.detail.episodeLabels,
                         )
                         ok = true
                     }
@@ -3143,6 +3170,7 @@ class PlayerActivity : EdgeSwipeBackActivity() {
                                     adoptSeriesList(
                                         loose.episodes, loose.current, loose.cand.vodId, loose.cand.conf,
                                         keepPosition = false,
+                                        labels = loose.detail.episodeLabels,
                                     )
                                     showEpisodePicker()
                                 }
@@ -3186,19 +3214,23 @@ class PlayerActivity : EdgeSwipeBackActivity() {
     ) {
         Thread {
             val api = Api(server).apply { restoreCookie(prefs.cookie) }
-            val eps = runCatching { detailOf(id, conf, api).episodes }.getOrDefault(emptyList())
+            val detail = runCatching { detailOf(id, conf, api) }.getOrNull() ?: return@Thread
+            val eps = detail.episodes
             if (eps.size <= 1) return@Thread
             if (!eps.contains(playing)) return@Thread
-            EpisodeCache(this).put(server, conf.url, id, eps)
-            if (eps == cached.urls) return@Thread
+            EpisodeCache(this).put(server, conf.url, id, eps, detail.episodeLabels)
+            if (eps == cached.urls && detail.episodeLabels == cached.labels) return@Thread
             runOnUiThread {
                 val p = player ?: return@runOnUiThread
                 if (isFinishing || isDestroyed || sourceSwitchJob != null) return@runOnUiThread
                 val cur = urls
                 // 老列表必须整体是新列表的前缀：否则集号可能错位，宁可不追加
-                if (eps.size > cur.size && eps.take(cur.size) == cur) {
+                if (conf.url == sourceUrl && id == vodId && eps.size >= cur.size && eps.take(cur.size) == cur) {
                     val tail = eps.subList(cur.size, eps.size).map { mediaItemOf(it) }
                     urls = eps
+                    if (detail.episodeLabels.any { sourceEpisodeNumber(it) > 0 }) {
+                        episodeNumbers = detail.episodeLabels.map(::sourceEpisodeNumber).toIntArray()
+                    }
                     if (tail.isNotEmpty()) p.addMediaItems(cur.size, tail)
                 }
             }
@@ -3219,6 +3251,7 @@ class PlayerActivity : EdgeSwipeBackActivity() {
         keepPosition: Boolean,
         inPlace: Boolean = false,
         quiet: Boolean = false,
+        labels: List<String> = emptyList(),
     ) {
         val p = player ?: return
         val pos = if (keepPosition) p.currentPosition.coerceAtLeast(0L) else 0L
@@ -3227,8 +3260,14 @@ class PlayerActivity : EdgeSwipeBackActivity() {
         // 否则换的是别的源，播放内容都不一样了，必须老老实实重建
         val splice = inPlace && keepPosition && urls.size == 1 &&
             list.getOrNull(idx) == urls.firstOrNull() && p.mediaItemCount == 1
+        val previousEpisode = if (keepPosition && historyOnly) savedEpisodeIndex(currentIndex) else -1
         urls = list
-        episodeNumbers = IntArray(0)
+        historyOnly = false
+        episodeNumbers = IntArray(list.size) { labels.getOrNull(it)?.let(::sourceEpisodeNumber) ?: 0 }
+        if (previousEpisode >= 0 && episodeNumbers[idx] == 0) {
+            if (episodeNumbers.none { it > 0 } && previousEpisode != idx) episodeNumbers.fill(-1)
+            episodeNumbers[idx] = previousEpisode + 1
+        }
         currentIndex = idx
         if (newVodId.isNotEmpty()) vodId = newVodId
         if (conf.url.isNotEmpty()) {
@@ -3745,6 +3784,7 @@ class PlayerActivity : EdgeSwipeBackActivity() {
             val url = currentUrl()
             if (url.isEmpty()) return
             val position = p.currentPosition.coerceAtLeast(0L)
+            val episode = savedEpisodeIndex(currentIndex)
             val entry = if (position > 5_000L) HistoryEntry(
                 title = labelFor(currentIndex),
                 playUrl = url,
@@ -3756,9 +3796,11 @@ class PlayerActivity : EdgeSwipeBackActivity() {
                 vodId = vodId,
                 sourceUrl = sourceUrl,
                 sourceName = sourceName,
-                episodeIndex = currentIndex,
+                episodeIndex = episode,
+                year = workYear,
+                typeName = workType,
             ) else null
-            prefs.savePlaybackSnapshot(url, skipKey(), currentIndex, position, entry)
+            prefs.savePlaybackSnapshot(url, workProgressSeries(skipKey(), workYear), episode, position, entry)
         }
     }
 
@@ -3922,33 +3964,45 @@ class PlayerActivity : EdgeSwipeBackActivity() {
         val vodId: String,
         val detail: Detail,
         val index: Int,
+        val item: SearchItem,
+        val match: WorkMatch,
     )
 
     private fun findPlaybackAlternative(
         api: Api,
         source: SourceConfig,
         title: String,
+        year: String,
+        type: String,
         episode: Int,
         playing: String,
     ): PlaybackAlternative? {
         val titleKey = sourceTitleKey(title)
         val keyword = sourceSearchKeyword(title).ifEmpty { title }
-        fun matches(items: List<SearchItem>) = items.filter { sourceTitleKey(it.name) == titleKey }
+        fun matches(items: List<SearchItem>) = items.filter { workMatch(title, year, type, it) != WorkMatch.DIFFERENT }
         val directMatches = if (DirectCms.shouldTryDirect(source)) {
             matches(runCatching { DirectCms.search(source, keyword) }.getOrDefault(emptyList()))
         } else emptyList()
         val hits = directMatches.ifEmpty { matches(api.search(keyword, listOf(source), 8_000).items) }
+        var uncertain: PlaybackAlternative? = null
         for (hit in hits.distinctBy { it.vodId }) {
             if (SearchConnections.currentCancelled()) return null
             val detail = runCatching { detailOf(hit.vodId, source, api) }.getOrNull() ?: continue
             if (detail.info.title.isNotBlank() && sourceTitleKey(detail.info.title) != titleKey) continue
+            val item = hit.copy(year = detail.info.year.ifBlank { hit.year })
+            val identityMatch = workMatch(title, year, type, item)
+            if (identityMatch == WorkMatch.DIFFERENT) continue
             val index = matchingSourceEpisode(detail, episode) ?: continue
             val url = detail.episodes.getOrNull(index) ?: continue
             if (url != playing && (url.startsWith("https://", true) || url.startsWith("http://", true))) {
-                return PlaybackAlternative(source, hit.vodId, detail, index)
+                val hasEpisodeLabel = detail.episodeLabels.getOrNull(index)?.let(::sourceEpisodeNumber) == episode
+                val match = if (hasEpisodeLabel || detail.episodes.size == 1) identityMatch else WorkMatch.UNCERTAIN
+                val alternative = PlaybackAlternative(source, hit.vodId, detail, index, item, match)
+                if (match == WorkMatch.VERIFIED) return alternative
+                if (uncertain == null) uncertain = alternative
             }
         }
-        return null
+        return uncertain
     }
 
     private var switchFirstFrameUrl: String? = null
@@ -3980,15 +4034,14 @@ class PlayerActivity : EdgeSwipeBackActivity() {
         val playing = currentUrl()
         val index = currentIndex
         val originalUrls = urls
-        val originalHistoryUrl = intent.getStringArrayListExtra(EXTRA_URLS)?.singleOrNull()
-        val historyEpisode = parseEpisodeNumber(singleLabel.substringAfterLast('·', ""))
-        val episode = episodeNumbers.getOrNull(index)?.takeIf { it > 0 }
-            ?: historyEpisode.takeIf { it > 0 && playing == originalHistoryUrl }
-            ?: (index + 1).takeIf { urls.size > 1 }
-            ?: (intent.getIntExtra(EXTRA_HISTORY_EPISODE_INDEX, -1) + 1).coerceAtLeast(1)
+        val episode = savedEpisodeIndex(index) + 1
         val sources = prefs.sources().filter { it.enabled && !it.isAdult && it.url != sourceUrl }.distinctBy { it.url }
         if (title.isBlank() || playing.isBlank() || p.isCurrentMediaItemLive || sources.isEmpty()) {
             toast("没有可切换的其他播放源")
+            return
+        }
+        if (episode <= 0) {
+            toast("当前集号未知，请先从详情页选集")
             return
         }
         if (!hasActiveNetwork(this)) {
@@ -4026,6 +4079,8 @@ class PlayerActivity : EdgeSwipeBackActivity() {
         val requestConnections = SearchConnections()
         val server = prefs.serverUrl.ifEmpty { BuildConfig.DEFAULT_URL }
         val cookie = prefs.cookie
+        val year = workYear
+        val type = workType
         val candidates = Channel<PlaybackAlternative>(sources.size)
         val cooledCandidates = Channel<PlaybackAlternative>(sources.size)
         val preferredCandidate = CompletableDeferred<PlaybackAlternative?>()
@@ -4037,7 +4092,7 @@ class PlayerActivity : EdgeSwipeBackActivity() {
                         val alternative = withContext(Dispatchers.IO) { runCatching {
                             requestConnections.run {
                                 val api = Api(server).apply { restoreCookie(cookie) }
-                                findPlaybackAlternative(api, source, title, episode, playing)
+                                findPlaybackAlternative(api, source, title, year, type, episode, playing)
                             }
                         }.getOrNull() }
                         if (source.url == preferred && channel === candidates) preferredCandidate.complete(alternative)
@@ -4061,8 +4116,12 @@ class PlayerActivity : EdgeSwipeBackActivity() {
             var attempted = false
             var switched = false
             try {
-                val replacement = withTimeoutOrNull(24_000L) {
-                    suspend fun tryAlternative(alternative: PlaybackAlternative): Boolean {
+                val uncertain = mutableListOf<PlaybackAlternative>()
+                suspend fun tryAlternative(alternative: PlaybackAlternative, confirmed: Boolean = false): Boolean {
+                        if (alternative.match == WorkMatch.UNCERTAIN && !confirmed) {
+                            if (alternative !in uncertain) uncertain.add(alternative)
+                            return false
+                        }
                         val url = alternative.detail.episodes[alternative.index]
                         if (quotaDialogShown || !tested.add(url)) return false
                         dialog.setMessage("正在尝试「${alternative.source.name}」，续播位置 ${formatTime(position)}。")
@@ -4079,11 +4138,18 @@ class PlayerActivity : EdgeSwipeBackActivity() {
                             return false
                         }
                         return true
-                    }
+                }
+                var replacement = withTimeoutOrNull(24_000L) {
                     val first = if (favorites.isEmpty()) null else withTimeoutOrNull(preferredWaitMs) { preferredCandidate.await() }
                     if (first != null && tryAlternative(first)) return@withTimeoutOrNull first
                     firstPlayableSource(candidates, cooledCandidates,
-                        (priorityUntil - SystemClock.elapsedRealtime()).coerceAtLeast(0L), ::tryAlternative)
+                        (priorityUntil - SystemClock.elapsedRealtime()).coerceAtLeast(0L)) { tryAlternative(it) }
+                }
+                if (replacement == null && uncertain.isNotEmpty() && !quotaDialogShown) {
+                    requestConnections.cancel()
+                    workers.forEach { it.cancel() }
+                    val chosen = confirmUncertainSource(uncertain)
+                    if (chosen != null && tryAlternative(chosen, confirmed = true)) replacement = chosen
                 }
                 if (replacement == null) {
                     toast("暂无能从 ${formatTime(position)} 续播的其他来源")
@@ -4099,6 +4165,7 @@ class PlayerActivity : EdgeSwipeBackActivity() {
                     }
                     clearSkipUndo()
                     urls = replacement.detail.episodes
+                    historyOnly = false
                     episodeNumbers = replacement.detail.episodeLabels.map(::sourceEpisodeNumber).toIntArray()
                     currentIndex = replacement.index
                     vodId = replacement.vodId
@@ -4106,6 +4173,8 @@ class PlayerActivity : EdgeSwipeBackActivity() {
                     sourceName = replacement.source.name
                     seriesTitle = title
                     seriesName = title
+                    workYear = replacement.item.year.ifBlank { year }
+                    workType = replacement.item.typeName.ifBlank { type }
                     rememberCurrentPlaybackSource()
                     if (originalUrls.size > 1) singleLabel = "$title · 第 $episode 集"
                     intent.putStringArrayListExtra(EXTRA_URLS, ArrayList(urls))
@@ -4116,6 +4185,9 @@ class PlayerActivity : EdgeSwipeBackActivity() {
                         .putExtra(EXTRA_SOURCE_NAME, sourceName)
                         .putExtra(EXTRA_SERIES_NAME, seriesName)
                         .putExtra(EXTRA_EPISODE_NUMBERS, episodeNumbers)
+                        .putExtra(EXTRA_FROM_HISTORY, false)
+                        .putExtra(EXTRA_WORK_YEAR, workYear)
+                        .putExtra(EXTRA_WORK_TYPE, workType)
                     loadSubtitleForCurrent()
                     switched = true
                     val message = "已切换到「$sourceName」，从 ${formatTime(position)} 继续播放"
@@ -4160,6 +4232,24 @@ class PlayerActivity : EdgeSwipeBackActivity() {
         dialog.show()
         sourceSwitchJob?.start()
     }
+
+    private suspend fun confirmUncertainSource(candidates: List<PlaybackAlternative>): PlaybackAlternative? =
+        kotlinx.coroutines.suspendCancellableCoroutine { continuation ->
+            val labels = candidates.map {
+                listOf(it.source.name, it.item.year.ifBlank { "年份未知" }, it.item.typeName.ifBlank { "类型未知" })
+                    .joinToString(" · ")
+            }
+            val dialog = AlertDialog.Builder(this).setTitle("请选择可确认的同一作品来源")
+                .setItems(labels.toTypedArray()) { _, index ->
+                    if (continuation.isActive) continuation.resumeWith(Result.success(candidates[index]))
+                }
+                .setNegativeButton("取消", null).create()
+            dialog.setOnDismissListener {
+                if (continuation.isActive) continuation.resumeWith(Result.success(null))
+            }
+            continuation.invokeOnCancellation { dialog.dismiss() }
+            dialog.show()
+        }
 
     private var quotaDialogShown = false
     private val quotaWatch = object : Runnable {

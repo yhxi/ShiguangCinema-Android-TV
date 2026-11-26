@@ -25,7 +25,7 @@ class EpisodeCache(context: Context) {
     private val sp = context.applicationContext
         .getSharedPreferences("episode_cache", Context.MODE_PRIVATE)
 
-    data class Entry(val urls: List<String>, val savedAt: Long) {
+    data class Entry(val urls: List<String>, val savedAt: Long, val labels: List<String>) {
         val first: String? get() = urls.firstOrNull()
         val last: String? get() = urls.lastOrNull()
         fun isFresh(now: Long = System.currentTimeMillis()): Boolean = now - savedAt < TTL_MS
@@ -54,11 +54,12 @@ class EpisodeCache(context: Context) {
             if (u.isNotEmpty()) urls.add(u)
         }
         if (urls.isEmpty()) return null
-        val entry = Entry(urls, o.optLong("ts", 0L))
+        val labels = o.optJSONArray("labels")?.takeIf { it.length() == urls.size }
+        val entry = Entry(urls, o.optLong("ts", 0L), labels?.let { List(it.length(), it::optString) }.orEmpty())
         return if (entry.isFresh()) entry else null
     }
 
-    fun put(server: String, sourceUrl: String, vodId: String, urls: List<String>) {
+    fun put(server: String, sourceUrl: String, vodId: String, urls: List<String>, labels: List<String>) {
         if (vodId.isEmpty() || urls.isEmpty()) return
         // 空地址、或单集（多半是详情接口只回了半截）不写，别把坏数据固化下来
         if (urls.size <= 1) return
@@ -68,6 +69,7 @@ class EpisodeCache(context: Context) {
             keyOf(server, sourceUrl, vodId),
             JSONObject().apply {
                 put("urls", JSONArray(urls))
+                put("labels", JSONArray(labels))
                 put("ts", now)
                 put("first", urls.first())
                 put("last", urls.last())

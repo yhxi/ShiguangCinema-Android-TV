@@ -65,6 +65,9 @@ data class SourceConfig(
     }
 }
 
+internal fun enabledSearchSources(sources: List<SourceConfig>, child: Boolean): List<SourceConfig> =
+    sources.filter { it.enabled && (!child || !it.isAdult) }.distinctBy { it.url }
+
 data class SearchItem(
     val sourceName: String,
     val vodId: String,

@@ -29,6 +29,8 @@ data class HistoryEntry(
     val sourceName: String = "",
     /** 在整季里的下标（从 0 开始）；-1 表示不知道 */
     val episodeIndex: Int = -1,
+    val year: String = "",
+    val typeName: String = "",
 )
 
 /** 本地配置：服务器、会话 Cookie、片源列表。全部存在应用私有 SharedPreferences。 */
@@ -272,12 +274,13 @@ class Prefs(ctx: Context) {
     }
 
     /** 详情页批量标记已看集数：剧名只归一化一次，长剧不必每集重新跑正则。 */
-    fun watchedEpisodes(series: String, urls: List<String>, thresholdMs: Long): BooleanArray {
+    fun watchedEpisodes(series: String, urls: List<String>, thresholdMs: Long, episodeNumbers: IntArray = IntArray(0)): BooleanArray {
         val normalized = normalizeSeries(series)
         return BooleanArray(urls.size) { index ->
             val byUrl = sp.getLong(stableKey("pos:", urls[index]), 0L)
+            val episode = playbackEpisodeIndex(index, episodeNumbers.getOrElse(index) { 0 }, false, -1, "")
             val byEpisode = if (normalized.isEmpty()) 0L else
-                sp.getLong(stableKey("ep:", normalized + "#" + index), 0L)
+                sp.getLong(stableKey("ep:", normalized + "#" + episode), 0L)
             maxOf(byUrl, byEpisode) > thresholdMs
         }
     }
@@ -332,6 +335,10 @@ class Prefs(ctx: Context) {
 
     private fun writeLiveFile(id: String, text: String) {
         val file = localLiveFile(id)
+        writeLiveFile(file, text)
+    }
+
+    private fun writeLiveFile(file: android.util.AtomicFile, text: String) {
         val output = file.startWrite()
         try {
             output.write(text.toByteArray(Charsets.UTF_8))
@@ -341,10 +348,15 @@ class Prefs(ctx: Context) {
             throw e
         }
     }
-    fun saveLocalLivePlaylist(name: String, channels: List<Channel>): String {
+
+    private fun encodeLiveChannels(channels: List<Channel>): String {
         val json = JSONArray()
         channels.forEach { json.put(JSONObject().put("name", it.name).put("url", it.url).put("group", it.group).put("logo", it.logo).put("headers", JSONObject(it.headers))) }
-        val text = json.toString()
+        return json.toString()
+    }
+
+    fun saveLocalLivePlaylist(name: String, channels: List<Channel>): String {
+        val text = encodeLiveChannels(channels)
         val id = "local-live:" + stableDigest(text)
         writeLiveFile(id, text)
         sp.edit().putString(scoped("label:$id"), name).apply()
@@ -364,18 +376,41 @@ class Prefs(ctx: Context) {
                 legacy
             } else "[]"
         }
+        return decodeLiveChannels(text)
+    }
+
+    private fun decodeLiveChannels(text: String): List<Channel> {
         val json = JSONArray(text)
         return (0 until json.length()).map { i ->
             val o = json.getJSONObject(i)
             Channel(o.optString("name"), o.optString("url"), o.optString("group", "其他"), o.optString("logo"), readLiveHeaders(o))
         }
     }
+
+    internal data class CachedLiveChannels(val channels: List<Channel>, val updatedAt: Long)
+
+    internal fun cachedLiveChannels(id: String, server: String): CachedLiveChannels? = runCatching {
+        val file = remoteLiveFile(id, server)
+        val bytes = file.openRead().use { readBounded(it, 16 * 1024 * 1024) }
+        val channels = decodeLiveChannels(bytes.toString(Charsets.UTF_8))
+        channels.takeIf { it.isNotEmpty() }?.let { CachedLiveChannels(it, file.baseFile.lastModified()) }
+    }.getOrNull()
+
+    internal fun saveRemoteLiveChannels(id: String, server: String, channels: List<Channel>) {
+        if (channels.isEmpty()) return
+        val text = encodeLiveChannels(channels)
+        if (text.toByteArray(Charsets.UTF_8).size <= 16 * 1024 * 1024) writeLiveFile(remoteLiveFile(id, server), text)
+    }
+
+    private fun remoteLiveFile(id: String, server: String) =
+        android.util.AtomicFile(java.io.File(appContext.filesDir, "live-remote-" + stableDigest("$server|$id") + ".json"))
     fun removeLiveSource(id: String) {
         saveLiveUrls(liveUrls().filterNot { it == id })
         if (id.startsWith("local-live:")) {
             localLiveFile(id).delete()
             sp.edit().remove(scoped(id)).remove(scoped("label:$id")).apply()
         }
+        remoteLiveFile(id, serverUrl).delete()
     }
     fun liveSourceLabel(id: String): String = when {
         id == "builtin-live:cctv" -> "内置 · 三网央卫视"
@@ -431,7 +466,7 @@ class Prefs(ctx: Context) {
         val name = e.seriesTitle.ifEmpty {
             e.title.substringBefore(" · 第").substringBefore("·第")
         }.trim()
-        return if (name.isEmpty()) "" else normalizeSeries(name)
+        return normalizeSeries(workProgressSeries(name, e.year))
     }
 
     fun history(): MutableList<HistoryEntry> = synchronized(playbackLock) {
@@ -481,6 +516,8 @@ class Prefs(ctx: Context) {
                         sourceUrl = o.optString("sourceUrl", ""),
                         sourceName = o.optString("sourceName", ""),
                         episodeIndex = o.optInt("episodeIndex", -1),
+                        year = o.optString("year"),
+                        typeName = o.optString("typeName"),
                     ),
                 )
             }
@@ -504,6 +541,8 @@ class Prefs(ctx: Context) {
         .put("sourceUrl", e.sourceUrl)
         .put("sourceName", e.sourceName)
         .put("episodeIndex", e.episodeIndex)
+        .put("year", e.year)
+        .put("typeName", e.typeName)
 
     /**
      * 写入/更新一条历史。
@@ -530,6 +569,8 @@ class Prefs(ctx: Context) {
                 sourceUrl = entry.sourceUrl.ifEmpty { existing.sourceUrl },
                 sourceName = entry.sourceName.ifEmpty { existing.sourceName },
                 episodeIndex = if (entry.episodeIndex >= 0) entry.episodeIndex else existing.episodeIndex,
+                year = entry.year.ifEmpty { existing.year },
+                typeName = entry.typeName.ifEmpty { existing.typeName },
             )
         } else {
             entry
@@ -1027,12 +1068,7 @@ class Prefs(ctx: Context) {
             }
         }
 
-        val mergedHistory = (history().map(::historyJson) + importedHistory)
-            .sortedByDescending { it.optLong("updatedAt") }
-            .distinctBy {
-                val title = it.optString("seriesTitle").ifBlank { it.optString("title").substringBefore(" · 第").substringBefore("·第") }
-                normalizeSeries(title).ifBlank { it.optString("playUrl") }
-            }.take(20)
+        val mergedHistory = mergeViewingHistory(history().map(::historyJson), importedHistory)
         val mergedFavorites = (favorites().map(::favoriteJson) + importedFavorites).distinctBy { it.optString("title") }
         val mergedSources = (importedSources + sources()).distinctBy { it.url }
         val editor = sp.edit()
@@ -1047,6 +1083,18 @@ class Prefs(ctx: Context) {
                     is String -> editor.putString(key, value)
                 }
             }
+        }
+        // The winning history and its resume position must be restored as one record.
+        for (entry in mergedHistory) {
+            if (entry !in importedHistory) continue
+            val url = entry.getString("playUrl")
+            val position = entry.optLong("positionMs").coerceAtLeast(0L)
+            editor.putLong(stableKey("pos:", url), position)
+            val title = entry.optString("title")
+            val series = entry.optString("seriesTitle").ifBlank { title.substringBefore(" · 第") }
+            val episode = playbackEpisodeIndex(0, 0, true, entry.optInt("episodeIndex", -1), title)
+            val key = episodeKey(workProgressSeries(series, entry.optString("year")), episode)
+            if (key.isNotEmpty()) editor.putLong(key, position)
         }
         editor.apply()
     }

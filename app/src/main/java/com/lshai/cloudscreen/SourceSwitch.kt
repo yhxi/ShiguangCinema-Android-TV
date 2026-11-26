@@ -68,3 +68,52 @@ internal fun matchingSourceEpisode(detail: Detail, episode: Int): Int? {
     if (numbers.any { it > 0 }) return numbers.indices.singleOrNull { numbers[it] == episode }
     return (episode - 1).takeIf { it in detail.episodes.indices }
 }
+
+private val historyEpisodeLabel = Regex("""[·・]\s*第\s*(\d+)(?:/\d+)?\s*[集话話期]""")
+
+/** Playlist indexes are local to a source. History may hold only a single URL. */
+internal fun playbackEpisodeIndex(index: Int, explicitNumber: Int, fromHistory: Boolean, savedIndex: Int, title: String): Int {
+    if (explicitNumber > 0) return explicitNumber - 1
+    if (explicitNumber < 0) return -1
+    if (!fromHistory) return index
+    return historyEpisodeLabel.find(title)?.groupValues?.get(1)?.toIntOrNull()?.takeIf { it > 0 }
+        ?.minus(1) ?: savedIndex
+}
+
+internal fun workYear(year: String): String = Regex("""(?<!\d)(?:18|19|20|21)\d{2}(?!\d)""").find(year)?.value.orEmpty()
+
+internal fun workKind(type: String): String = when {
+    type.contains("动画") || type.contains("动漫") -> "动画"
+    type.contains("纪录") -> "纪录"
+    type.contains("综艺") -> "综艺"
+    type.contains("电影") || type.endsWith("片") -> "电影"
+    type.contains("电视剧") || type.endsWith("剧") || type == "剧集" -> "剧集"
+    else -> ""
+}
+
+internal fun SearchItem.workKey(): String {
+    val yearKey = workYear(year)
+    val kind = workKind(typeName)
+    return if (yearKey.isEmpty() || kind.isEmpty()) "${sourceTitleKey(name)}|$sourceUrl|$vodId"
+    else "${sourceTitleKey(name)}|$yearKey|$kind"
+}
+
+internal fun workProgressSeries(title: String, year: String): String {
+    val key = workYear(year)
+    return if (key.isEmpty() || title.isBlank()) title else "$title|$key"
+}
+
+internal enum class WorkMatch { VERIFIED, UNCERTAIN, DIFFERENT }
+
+internal fun workMatch(title: String, year: String, kind: String, candidate: SearchItem): WorkMatch {
+    if (sourceTitleKey(title) != sourceTitleKey(candidate.name)) return WorkMatch.DIFFERENT
+    val leftYear = workYear(year)
+    val rightYear = workYear(candidate.year)
+    val leftKind = workKind(kind).ifEmpty { kind }
+    val rightKind = workKind(candidate.typeName)
+    if (leftYear.isNotEmpty() && rightYear.isNotEmpty() && leftYear != rightYear) return WorkMatch.DIFFERENT
+    if (leftKind.isNotEmpty() && rightKind.isNotEmpty() && leftKind != rightKind) return WorkMatch.DIFFERENT
+    return if (leftYear.isNotEmpty() && rightYear == leftYear && leftKind.isNotEmpty() && rightKind == leftKind) {
+        WorkMatch.VERIFIED
+    } else WorkMatch.UNCERTAIN
+}
